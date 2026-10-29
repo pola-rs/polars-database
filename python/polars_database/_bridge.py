@@ -632,6 +632,16 @@ class _AdbcSession:
             )
             raise ModuleNotFoundError(msg)
 
+        # the driver manager's own arguments: as options they would load another driver
+        reserved = {"driver", "entrypoint", "load_flags", "init_func"} & dict(
+            options
+        ).keys()
+        if reserved:
+            msg = (
+                f"connect option(s) {sorted(reserved)} can't be used with "
+                "POLARS_DATABASE_ADBC_LOADER=python"
+            )
+            raise ValueError(msg)
         kwargs: dict[str, Any] = {"driver": driver, **dict(options)}
         if entrypoint:
             kwargs["entrypoint"] = entrypoint
@@ -643,6 +653,10 @@ class _AdbcSession:
             raise
         self._execute_options = dict(execute_options)
         self._lock = threading.Lock()
+        # held while a statement or the connection is cancelled or closed: the driver
+        # manager calls the driver for both without a lock of its own, and a cancel must
+        # never run on a handle being released
+        self._handle_lock = threading.Lock()
         # statements whose result streams Rust still reads; the connection closes after
         # the last one
         self._open: list[Any] = []
@@ -692,22 +706,33 @@ class _AdbcSession:
             with contextlib.suppress(ValueError):
                 self._open.remove(stmt)
             close_conn = self._closed and not self._open
-        stmt.close()
-        if close_conn:
-            self._close_connection()
+        try:
+            with self._handle_lock:
+                stmt.close()
+        finally:
+            if close_conn:
+                self._close_connection()
 
     def cancel(self) -> None:
         from adbc_driver_manager import AdbcStatusCode, NotSupportedError
 
         with self._lock:
             stmt = self._open[-1] if self._open else None
+        if stmt is None:
+            return
         try:
-            if stmt is None:
-                return
-            try:
-                stmt.cancel()
-            except NotSupportedError:
-                self._conn.cancel()
+            with self._handle_lock:
+                # released meanwhile: nothing to cancel
+                if stmt not in self._open:
+                    return
+                try:
+                    stmt.cancel()
+                except NotSupportedError:
+                    try:
+                        self._conn.cancel()
+                    except NotSupportedError:
+                        # an ADBC 1.0 driver: it can't cancel, as with the Rust loader
+                        return
         except Exception as e:
             # nothing running: nothing to cancel
             if getattr(e, "status_code", None) != AdbcStatusCode.INVALID_STATE:
@@ -721,10 +746,11 @@ class _AdbcSession:
         self._close_connection()
 
     def _close_connection(self) -> None:
-        try:
-            self._conn.close()
-        finally:
-            self._db.close()
+        with self._handle_lock:
+            try:
+                self._conn.close()
+            finally:
+                self._db.close()
 
 
 def adbc_connect(

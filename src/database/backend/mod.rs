@@ -313,6 +313,10 @@ fn align_null_columns(mut a: DataFrame, mut b: DataFrame) -> PolarsResult<(DataF
 /// servers and listeners, timeouts. Authentication, permission and SQL errors fail the same
 /// way again, and retrying a failed login can lock the account.
 pub fn is_transient(error: &polars_error::PolarsError) -> bool {
+    // The plugin's own errors (bad arguments, values it can't read): never the server's.
+    if matches!(error, polars_error::PolarsError::InvalidOperation(_)) {
+        return false;
+    }
     let msg = error.to_string().to_ascii_lowercase();
     const PERMANENT: &[&str] = &[
         "password",

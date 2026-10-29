@@ -343,8 +343,19 @@ impl Manifest {
 fn parse_toml_subset(text: &str) -> Result<Vec<(Vec<String>, Value)>, String> {
     let mut out = vec![];
     let mut table: Vec<String> = vec![];
-    for (lineno, raw) in text.lines().enumerate() {
+    let mut lines = text.lines().enumerate();
+    while let Some((lineno, first)) = lines.next() {
         let err = |msg: &str| format!("line {}: {msg}", lineno + 1);
+        // A value that is an array may continue on the next lines.
+        let mut raw = first.to_string();
+        if starts_array_value(first) {
+            while matches!(skip_value(&raw), Err(e) if e == "unterminated array") {
+                let Some((_, next)) = lines.next() else { break };
+                raw.push('\n');
+                raw.push_str(next);
+            }
+        }
+        let raw = raw.as_str();
         let mut p = Parser::new(raw);
         p.skip_ws();
         if p.at_end_of_line() {
@@ -383,6 +394,32 @@ fn parse_toml_subset(text: &str) -> Result<Vec<(Vec<String>, Value)>, String> {
         }
     }
     Ok(out)
+}
+
+/// Whether a line is `key = [...`.
+fn starts_array_value(line: &str) -> bool {
+    let mut p = Parser::new(line);
+    p.skip_ws();
+    if p.peek() == Some('[') || p.parse_key().is_err() {
+        return false;
+    }
+    p.skip_ws();
+    if !p.eat('=') {
+        return false;
+    }
+    p.skip_ws();
+    p.peek() == Some('[')
+}
+
+/// Parses the `key = value` of `text`, to see whether the value is complete.
+fn skip_value(text: &str) -> Result<(), String> {
+    let mut p = Parser::new(text);
+    p.skip_ws();
+    let key = p.parse_key()?;
+    p.skip_ws();
+    p.eat('=');
+    p.skip_ws();
+    p.parse_value_into(key, &mut vec![])
 }
 
 struct Parser<'a> {
@@ -504,7 +541,11 @@ impl<'a> Parser<'a> {
                     }
                 }
             },
-            Some('[') => return Err("arrays are not supported".into()),
+            Some('[') => {
+                // Arrays (e.g. `[ADBC.features] supported = [...]`) aren't read: skipped.
+                self.skip_array()?;
+                out.push((key, Value::Other));
+            },
             Some(_) => {
                 let mut s = String::new();
                 while let Some(c) = self.peek() {
@@ -523,6 +564,41 @@ impl<'a> Parser<'a> {
             None => return Err("expected a value".into()),
         }
         Ok(())
+    }
+
+    /// Skips an array value, which may span lines and nest, with strings and comments inside.
+    fn skip_array(&mut self) -> Result<(), String> {
+        let mut depth = 0usize;
+        loop {
+            match self.chars.next() {
+                None => return Err("unterminated array".into()),
+                Some('[') => depth += 1,
+                Some(']') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(());
+                    }
+                },
+                Some('"') => {
+                    if self.eat('"') {
+                        if self.eat('"') {
+                            return Err("multi-line strings are not supported".into());
+                        }
+                    } else {
+                        self.parse_basic_string()?;
+                    }
+                },
+                Some('\'') => {
+                    self.parse_literal_string()?;
+                },
+                Some('#') => {
+                    while self.peek().is_some_and(|c| c != '\n') {
+                        self.chars.next();
+                    }
+                },
+                Some(_) => {},
+            }
+        }
     }
 
     /// After the opening `"`.
@@ -603,6 +679,25 @@ linux_amd64 = "/opt/a \"b\"\\libpg.so"
         assert_eq!(m.library_for("linux_amd64"), Some("/opt/a \"b\"\\libpg.so"));
         assert_eq!(m.library_for("macos_arm64"), Some("/opt/c\\libpg.dylib"));
         assert_eq!(m.library_for("windows_amd64"), None);
+    }
+
+    #[test]
+    fn skips_arrays() {
+        let m = Manifest::parse(
+            r#"
+name = "SQLite"
+[ADBC.features]
+supported = []
+unsupported = ["bulk ingest", 'a ] b', [1, 2],  # comment ]
+  "x"]
+[Driver]
+shared = "/x/lib.so"
+"#,
+        )
+        .unwrap();
+        assert_eq!(m.name.as_deref(), Some("SQLite"));
+        assert_eq!(m.library_for("linux_arm64"), Some("/x/lib.so"));
+        assert!(Manifest::parse("a = [1, 2").is_err());
     }
 
     #[test]

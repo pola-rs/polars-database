@@ -330,17 +330,61 @@ impl AdbcBackend {
             .iter()
             .map(|(k, v)| Ok((cstring(k, "option key")?, cstring(v, k)?)))
             .collect::<PolarsResult<Vec<_>>>()?;
-        match &self.loader {
-            Loader::Rust(driver) => Ok(Box::new(AdbcSession {
-                conn: Arc::new(Conn::open(driver.clone(), &options)?),
-                dialect,
-                execute_options,
-            })),
+        let session: PolarsResult<Box<dyn DatabaseSession>> = match &self.loader {
+            Loader::Rust(driver) => Conn::open(driver.clone(), &options).map(|conn| {
+                Box::new(AdbcSession {
+                    conn: Arc::new(conn),
+                    dialect,
+                    execute_options,
+                }) as _
+            }),
             Loader::Python(bridge) => {
                 bridge.adbc_connect(&self.found, &options, dialect, &execute_options)
             },
+        };
+        // Some drivers quote the URI or rejected options, credentials included.
+        session.map_err(|e| {
+            let secrets = secrets(&options);
+            e.wrap_msg(|m| redact(m, &secrets))
+        })
+    }
+}
+
+/// The credentials among the options of a connection: password-like options, and the
+/// password of the URI as written and decoded.
+fn secrets(options: &[(CString, CString)]) -> Vec<String> {
+    let mut out = vec![];
+    for (k, v) in options {
+        let (k, v) = (
+            k.to_string_lossy().to_ascii_lowercase(),
+            v.to_string_lossy(),
+        );
+        if ["password", "passwd", "pwd", "secret", "token"]
+            .iter()
+            .any(|s| k.contains(s))
+        {
+            out.push(v.into_owned());
+        } else if k == ADBC_OPTION_URI.to_string_lossy()
+            && let Some((_, rest)) = v.split_once("://")
+            // Up to the last `@`: a password may hold `@`, `/`, `?` or `#`, a host doesn't.
+            && let Some((userinfo, _)) = rest.rsplit_once('@')
+            && let Some((_, password)) = userinfo.split_once(':')
+        {
+            out.push(password.to_string());
+            out.push(percent_decode(password));
         }
     }
+    out.retain(|s| !s.is_empty());
+    // Longest first, so that one secret containing another is replaced whole.
+    out.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    out.dedup();
+    out
+}
+
+fn redact(message: &str, secrets: &[String]) -> String {
+    secrets
+        .iter()
+        .fold(message.to_string(), |m, s| m.replace(s.as_str(), "***"))
 }
 
 /// The database options for a connection, `uri` first. The same for every loader.
@@ -349,7 +393,8 @@ pub fn connect_options(
     dialect: DialectName,
 ) -> PolarsResult<Vec<(CString, CString)>> {
     let mut uri = adbc_uri(spec, dialect)?;
-    if matches!(dialect, DialectName::Postgresql | DialectName::Redshift)
+    // Redshift's ADBC driver isn't libpq.
+    if dialect == DialectName::Postgresql
         && let Some(u) = &mut uri
         && !u.contains("connect_timeout=")
     {
@@ -512,15 +557,17 @@ fn clickhouse_http_uri(uri: &str) -> Option<ClickhouseHttp> {
 }
 
 fn percent_decode(s: &str) -> String {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        // Bytes, not `&s[..]`: the byte after `%` may start a multi-byte character.
         if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            && let Some(hi) = bytes.get(i + 1).copied().and_then(hex)
+            && let Some(lo) = bytes.get(i + 2).copied().and_then(hex)
         {
-            out.push(b);
+            out.push(hi << 4 | lo);
             i += 3;
         } else {
             out.push(bytes[i]);
@@ -836,7 +883,8 @@ impl DatabaseSession for AdbcSession {
         let stream = unsafe { Box::from_raw(stream) };
         result?;
         // SAFETY: the driver returned a valid C stream.
-        unsafe { import_stream(stream, stmt) }
+        let batches = unsafe { import_stream(stream, stmt) }?;
+        Ok(check_batches(self.dialect, batches))
     }
 
     fn execute_update(&mut self, sql: &str) -> PolarsResult<()> {
@@ -956,6 +1004,79 @@ impl<O: StreamOwner> Iterator for AdbcBatches<O> {
     }
 }
 
+/// Checks the batches of a result for values the driver could not convert.
+pub fn check_batches(dialect: DialectName, batches: BatchIter) -> BatchIter {
+    if dialect != DialectName::Postgresql {
+        return batches;
+    }
+    Box::new(batches.map(|df| df.and_then(|df| check_postgres_infinity(&df).map(|_| df))))
+}
+
+/// The earliest Postgres date and timestamp, 4714-11-24 BC (Julian day 0), from the Unix epoch.
+const PG_MIN_DAYS: i32 = -2_440_588;
+const PG_MIN_US: i64 = PG_MIN_DAYS as i64 * 86_400_000_000;
+
+/// An error for a Postgres date or timestamp the ADBC Postgres driver could not convert.
+///
+/// The driver shifts the server's values (µs or days since 2000) to the Unix epoch, and the
+/// shift wraps for `infinity` / `-infinity` (`i64::MAX` / `i64::MIN`, `i32::MAX` / `i32::MIN`)
+/// and for timestamps after about year 294 000. Wrapped, they read as values before the
+/// earliest Postgres value, so anything earlier than that is an error, also nested in lists
+/// and structs.
+fn check_postgres_infinity(df: &DataFrame) -> PolarsResult<()> {
+    for c in df.columns() {
+        if wraps_postgres_temporal(c.as_materialized_series())? {
+            polars_bail!(
+                InvalidOperation:
+                "column '{}' holds a Postgres 'infinity', '-infinity' or a timestamp after year \
+                294 000, which Polars can't represent; filter it out or replace it in a query, \
+                e.g. CASE WHEN isfinite(\"{}\") THEN \"{}\" END",
+                c.name(), c.name(), c.name()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn wraps_postgres_temporal(s: &polars_core::series::Series) -> PolarsResult<bool> {
+    use polars_core::prelude::{ChunkAgg, DataType, TimeUnit};
+
+    Ok(match s.dtype() {
+        DataType::Datetime(TimeUnit::Microseconds, _) => s
+            .to_physical_repr()
+            .i64()?
+            .min()
+            .is_some_and(|v| v < PG_MIN_US),
+        DataType::Date => s
+            .to_physical_repr()
+            .i32()?
+            .min()
+            .is_some_and(|v| v < PG_MIN_DAYS),
+        DataType::List(inner) if has_temporal(inner) => {
+            wraps_postgres_temporal(&s.list()?.get_inner())?
+        },
+        DataType::Struct(_) => {
+            for f in s.struct_()?.fields_as_series() {
+                if wraps_postgres_temporal(&f)? {
+                    return Ok(true);
+                }
+            }
+            false
+        },
+        _ => false,
+    })
+}
+
+fn has_temporal(dtype: &polars_core::prelude::DataType) -> bool {
+    use polars_core::prelude::DataType;
+    match dtype {
+        DataType::Date | DataType::Datetime(_, _) => true,
+        DataType::List(inner) => has_temporal(inner),
+        DataType::Struct(_) => true,
+        _ => false,
+    }
+}
+
 /// Arrow types Polars has no dtype for (importing them would panic).
 fn unsupported_arrow_type(dtype: &ArrowDataType) -> bool {
     match dtype {
@@ -979,7 +1100,7 @@ fn check_arrow_types(dtype: &ArrowDataType) -> PolarsResult<()> {
     };
     if let Some(f) = fields.iter().find(|f| unsupported_arrow_type(f.dtype())) {
         polars_bail!(
-            ComputeError:
+            InvalidOperation:
             "column '{}' has Arrow type {:?}, which Polars can't read; convert it in a query, \
             e.g. CAST(\"{}\" AS TEXT)",
             f.name, f.dtype(), f.name
@@ -1003,6 +1124,71 @@ fn batch_to_df(array: Box<dyn Array>) -> PolarsResult<DataFrame> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redacts_credentials() {
+        let opts = |kv: &[(&str, &str)]| {
+            kv.iter()
+                .map(|(k, v)| (CString::new(*k).unwrap(), CString::new(*v).unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let s = secrets(&opts(&[
+            ("uri", "mysql://u:p%40ss@w/rd@h:3306/db?x=1"),
+            ("password", "hunter2"),
+            ("adbc.snowflake.sql.client_option.auth_token", "tok"),
+            ("username", "u"),
+        ]));
+        let m = redact(
+            "bad uri mysql://u:p%40ss@w/rd@h:3306/db: password='hunter2' p@ss@w/rd tok u",
+            &s,
+        );
+        assert_eq!(
+            m,
+            "bad uri mysql://u:***@h:3306/db: password='***' *** *** u"
+        );
+        assert!(secrets(&opts(&[("uri", "postgresql://u@h/db")])).is_empty());
+    }
+
+    #[test]
+    fn percent_decoding() {
+        assert_eq!(percent_decode("p%40ss%2F"), "p@ss/");
+        assert_eq!(percent_decode("%41"), "A");
+        // not a hex escape: kept as is, also before a multi-byte character
+        assert_eq!(percent_decode("%aé"), "%aé");
+        assert_eq!(percent_decode("%é1"), "%é1");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%4"), "%4");
+    }
+
+    #[test]
+    fn postgres_infinity() {
+        use polars_core::prelude::*;
+
+        // what the ADBC Postgres driver reads for ±infinity
+        let ts = |v: i64| {
+            Series::new("t".into(), [Some(0i64), Some(v)])
+                .cast(&DataType::Datetime(TimeUnit::Microseconds, None))
+                .unwrap()
+        };
+        let date = |v: i32| {
+            Series::new("d".into(), [Some(0i32), Some(v)])
+                .cast(&DataType::Date)
+                .unwrap()
+        };
+        let df = |s: Series| DataFrame::new(s.len(), vec![s.into()]).unwrap();
+        for v in [-9222425352054775809, -9222425352054775808] {
+            assert!(check_postgres_infinity(&df(ts(v))).is_err());
+        }
+        for v in [-2147472692, -2147472691] {
+            assert!(check_postgres_infinity(&df(date(v))).is_err());
+        }
+        // the earliest Postgres values are fine
+        assert!(check_postgres_infinity(&df(ts(PG_MIN_US))).is_ok());
+        assert!(check_postgres_infinity(&df(date(PG_MIN_DAYS))).is_ok());
+        // nested
+        let list = ts(-9222425352054775809).implode().unwrap().into_series();
+        assert!(check_postgres_infinity(&df(list)).is_err());
+    }
 
     #[test]
     fn entrypoints() {

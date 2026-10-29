@@ -347,8 +347,10 @@ impl DatabaseSession for PyAdbcSession {
             session: self.session.clone(),
             stmt: Some(stmt),
         };
-        // SAFETY: the driver's own C stream, which the driver manager doesn't wrap in Python.
-        unsafe { adbc::import_stream(stream, owner) }
+        // SAFETY: a C stream, from the driver or the driver manager's wrapper around it (for
+        // ADBC 1.1 errors), never a Python object.
+        let batches = unsafe { adbc::import_stream(stream, owner) }?;
+        Ok(adbc::check_batches(self.dialect, batches))
     }
 
     fn execute_update(&mut self, sql: &str) -> PolarsResult<()> {

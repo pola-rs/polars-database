@@ -132,6 +132,29 @@ def test_loader_setting_errors(edge_db: str, monkeypatch: pytest.MonkeyPatch) ->
         pl.scan_database("t", edge_db, driver="adbc").collect()
 
 
+@pytest.mark.parametrize("loader", LOADERS)
+def test_loaders_redact_rejected_credentials(
+    edge_db: str, loader: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the SQLite driver quotes a rejected option, value included
+    monkeypatch.setenv("POLARS_DATABASE_ADBC_LOADER", loader)
+    with pytest.raises(pl.exceptions.ComputeError) as e:
+        pl.scan_database(
+            "t", edge_db, driver="adbc", connect_options={"password": "s3cr3t-pw"}
+        ).collect()
+    assert "s3cr3t-pw" not in str(e.value)
+
+
+def test_python_loader_rejects_driver_manager_arguments(
+    edge_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARS_DATABASE_ADBC_LOADER", "python")
+    with pytest.raises(pl.exceptions.ComputeError, match="can't be used with"):
+        pl.scan_database(
+            "t", edge_db, driver="adbc", connect_options={"entrypoint": "x"}
+        ).collect()
+
+
 SERVERS = {
     "postgres": ("POLARS_TEST_POSTGRES_URI", "adbc_driver_postgresql"),
     "mysql": ("POLARS_TEST_MYSQL_URI", None),
@@ -173,3 +196,37 @@ def test_loaders_read_the_same_servers(
             ).collect(),
         )
     )
+
+
+@pytest.mark.parametrize("loader", LOADERS)
+@pytest.mark.xdist_group("adbc_loaders")
+def test_loaders_reject_postgres_infinity(
+    loader: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the ADBC Postgres driver wraps ±infinity to dates around 290 000 BC
+    uri = os.environ.get("POLARS_TEST_POSTGRES_URI")
+    if uri is None:
+        pytest.skip("needs POLARS_TEST_POSTGRES_URI")
+    pytest.importorskip("adbc_driver_postgresql")
+    monkeypatch.setenv("POLARS_DATABASE_ADBC_LOADER", loader)
+    for value in [
+        "'infinity'::timestamp",
+        "'-infinity'::timestamptz",
+        "'infinity'::date",
+        "'294276-12-31 23:59:59'::timestamp",  # past what the driver's shift can hold
+        "ARRAY['2020-01-01'::timestamp, 'infinity']",
+        "ARRAY['-infinity'::date]",
+    ]:
+        query = f"SELECT 1 AS id, {value} AS v"
+        with pytest.raises(
+            pl.exceptions.InvalidOperationError, match="'v' holds a Postgres"
+        ):
+            pl.scan_database(query, uri, driver="adbc").collect()
+    # the earliest and latest Postgres values read as they are
+    finite = (
+        "SELECT 1 AS id, '4714-11-24 00:00:00 BC'::timestamp AS lo, "
+        "'4714-11-24 BC'::date AS dlo, '200000-12-31'::date AS dhi"
+    )
+    df = pl.scan_database(finite, uri, driver="adbc").collect()
+    assert df["dlo"].dt.year().item() == -4713
+    assert df["dhi"].dt.year().item() == 200000

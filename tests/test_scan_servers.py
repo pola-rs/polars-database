@@ -925,6 +925,14 @@ UNUSUAL_TYPES: dict[str, tuple[list[str], str, list[str]]] = {
 }
 
 
+def _installed(module: str) -> bool:
+    # `find_spec("a.b")` imports `a`, and raises when `a` is missing
+    try:
+        return importlib.util.find_spec(module) is not None
+    except ModuleNotFoundError:
+        return False
+
+
 @pytest.mark.parametrize(
     "name", [pytest.param(n, marks=_server_marks(n)) for n in sorted(UNUSUAL_TYPES)]
 )
@@ -934,7 +942,7 @@ def test_unusual_types_read_the_same_by_every_driver(name: str) -> None:
     frames = {}
     for driver in drivers:
         module = DRIVER_MODULES.get(driver, driver)
-        if module is not None and importlib.util.find_spec(module) is None:
+        if module is not None and not _installed(module):
             continue
         frames[driver] = _scan(name, driver, table).collect()
     assert len(frames) >= 2, frames.keys()
