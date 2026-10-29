@@ -1,0 +1,59 @@
+*.iml
+*.ipynb
+*.pdb
+*.pyd
+*.so
+.ENV
+.env*
+.ipynb_checkpoints/
+.python-version
+coverage.lcov
+coverage.xml
+profile.json
+
+# OS
+.DS_Store
+
+# IDE
+.emacs*
+.idea/
+.vim
+.vs
+.vscode/
+
+# Python
+*.egg-info
+.coverage
+.hypothesis/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv*/
+__pycache__/
+
+# Rust
+debug/
+target/
+.cargo/config.generated.toml
+.cargo/config.local.toml
+*.rs.bk
+
+# Data
+*.csv
+*.feather
+*.parquet
+*.tbl
+*.db
+*.duckdb
+*.sqlite
+
+# User specific source setups
+# You can put anything here that needs to be done to prepare your env.
+.user_env.*
+
+# Misc AI
+.ai/
+.claude/
+.codex/
+AGENTS.md
+CLAUDE.md
