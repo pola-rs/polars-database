@@ -44,7 +44,7 @@ pub struct CompiledPartition {
     pub count_sql: String,
 }
 
-/// The output of the `compile_database_scans` optimizer pass.
+/// The output of [`compile_scan`](super::compile_scan), one per resolution.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CompiledScan {
     /// e.g. `"sqlglot 30.24.0"`.
@@ -65,7 +65,7 @@ pub struct CompiledScan {
     pub pushdown_disabled: Option<PlSmallStr>,
 }
 
-/// A database scan, as held by `FileScanIR::Database`.
+/// A database scan, as held by the resolver and its reader builders.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DatabaseScanConfig {
     pub options: Arc<DatabaseScanOptions>,
@@ -75,7 +75,7 @@ pub struct DatabaseScanConfig {
     pub schema: SchemaRef,
     pub columns: Arc<[ColumnMeta]>,
     pub stats: TableStats,
-    /// Set by the `compile_database_scans` optimizer pass.
+    /// Set by each resolution ([`compile_scan`](super::compile_scan)).
     pub compiled: Option<Arc<CompiledScan>>,
     /// Per-worker connection budget, set by the distributed planner.
     pub connection_share: Option<usize>,

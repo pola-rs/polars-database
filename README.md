@@ -26,8 +26,12 @@ The plugin's own tests are in `tests/` and run against that venv, from this dire
 ../../.venv/bin/pytest tests -n auto
 ```
 
-Tests against database servers skip unless their `POLARS_TEST_*_URI` variables are set; the
-Docker stack that provides them is described in the Polars branch's `agent-docs/scan-database/local-db`.
+Tests against database servers skip unless their `POLARS_TEST_*_URI` variables are set (for
+example `POLARS_TEST_POSTGRES_URI=postgresql://user:password@host:5432/db`; MySQL, MariaDB,
+Oracle and ClickHouse have their own). A Docker stack that provides every server is kept with the
+development notes of the `nxs/scan-database` branch of
+[nameexhaustion/qolars](https://github.com/nameexhaustion/qolars/tree/nxs/scan-database/agent-docs/scan-database/local-db).
+The load tests also need `POLARS_TEST_DATABASE_LOAD=1` and run with `-m slow`.
 
 ## Branches and CI
 

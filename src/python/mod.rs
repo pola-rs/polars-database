@@ -10,14 +10,14 @@
 mod bridge;
 mod sqlglot;
 
-use std::ffi::c_void;
+use std::ffi::{CStr, c_void};
 use std::ptr::NonNull;
 use std::sync::{Arc, Once};
 
 use polars_arrow::ffi::ArrowArrayStreamReader;
 use polars_core::prelude::*;
 use polars_core::scalar::Scalar;
-use polars_io_ext_ffi::PluginId;
+use polars_io_ext_ffi::file_reader_v1;
 use polars_io_ext_ffi::lazyframe_resolver_v1::{self, ResolverHandle};
 use polars_utils::python_function::PythonObject;
 use pyo3::exceptions::PyValueError;
@@ -36,7 +36,7 @@ use crate::ffi::struct_field_to_schema;
 use crate::resolver::{Resolver, into_resolver_handle, resolver_release};
 
 /// Plugin IDs exported by this module, oldest first.
-const PLUGIN_IDS: &[PluginId] = &[PluginId::FileReaderV1, PluginId::LazyFrameResolverV1];
+const PLUGIN_IDS: &[&CStr] = &[file_reader_v1::ID, lazyframe_resolver_v1::ID];
 
 /// Registers the sqlglot renderer and the Python driver bridge. Idempotent.
 fn register() {
@@ -76,18 +76,18 @@ fn polars_err_to_py(e: polars_error::PolarsError) -> PyErr {
 /// Returns the PyCapsule of the contract with the given plugin ID.
 #[pyfunction]
 fn _capsule<'py>(py: Python<'py>, id: &str) -> PyResult<Bound<'py, PyCapsule>> {
-    let Some(plugin_id) = PluginId::from_id_str(id).filter(|id| PLUGIN_IDS.contains(id)) else {
+    let Some(&plugin_id) = PLUGIN_IDS.iter().find(|i| i.to_str() == Ok(id)) else {
         return Err(value_err(format!(
             "{} does not provide plugin ID {id:?}",
             crate::PACKAGE_NAME
         )));
     };
     let plugin: NonNull<c_void> = match plugin_id {
-        PluginId::FileReaderV1 => NonNull::from(&crate::reader::PLUGIN_V1).cast(),
-        PluginId::LazyFrameResolverV1 => NonNull::from(&crate::resolver::PLUGIN_V1).cast(),
+        id if id == file_reader_v1::ID => NonNull::from(&crate::reader::PLUGIN_V1).cast(),
+        _ => NonNull::from(&crate::resolver::PLUGIN_V1).cast(),
     };
     // SAFETY: The struct is a static; the extension module is never unloaded.
-    unsafe { PyCapsule::new_with_pointer(py, plugin, plugin_id.name()) }
+    unsafe { PyCapsule::new_with_pointer(py, plugin, plugin_id) }
 }
 
 /// The schema of an object with an Arrow C stream (an empty Polars DataFrame).
@@ -320,7 +320,7 @@ fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add(
         "_polars_io_plugin_ids",
-        PyTuple::new(m.py(), PLUGIN_IDS.iter().map(|id| id.as_str()))?,
+        PyTuple::new(m.py(), PLUGIN_IDS.iter().map(|id| id.to_str().unwrap()))?,
     )?;
     m.add_function(wrap_pyfunction!(_capsule, m)?)?;
     m.add_function(wrap_pyfunction!(scan_resolver, m)?)?;

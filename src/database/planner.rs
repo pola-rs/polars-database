@@ -1,7 +1,8 @@
-//! Planning-time work: resolving a scan (DSL to IR) and compiling its SQL (optimizer pass).
+//! Planning-time work: resolving a scan (connection, schema, catalog) and compiling its SQL.
 //!
-//! Both run on the planning machine: the client for local runs, the scheduler for distributed
-//! runs. Workers only receive the finished SQL.
+//! Both run in the resolver (`crate::resolver`), which Polars calls on the planning machine: the
+//! client for local runs, the scheduler for distributed runs. Workers only receive the finished
+//! SQL.
 
 use std::sync::Arc;
 
@@ -128,8 +129,8 @@ fn wrap_blocker(facts: &QueryFacts, dialect: DialectName) -> Option<&'static str
     None
 }
 
-/// Resolves a scan: dialect, backend, schema and catalog metadata. Runs during DSL to IR
-/// conversion. Partitions and SQL are left to [`compile_scan`].
+/// Resolves a scan: dialect, backend, schema and catalog metadata. Runs once per resolver, when
+/// Polars first needs the schema. Partitions and SQL are left to [`compile_scan`].
 pub fn resolve_scan(
     options: Arc<DatabaseScanOptions>,
     user_schema: Option<SchemaRef>,
@@ -513,7 +514,7 @@ pub struct PushedFilter {
     pub exact: bool,
 }
 
-/// What the optimizer pushed into a scan.
+/// What Polars pushed into a scan (the resolver's projection, filters and limit).
 #[derive(Clone, Debug, Default)]
 pub struct ScanPushdown {
     /// Columns to read, in schema order. `None` reads every column.
@@ -525,8 +526,8 @@ pub struct ScanPushdown {
     pub limit: Option<u64>,
 }
 
-/// Resolves partitions and renders the SQL of every partition. Runs in the last optimizer
-/// pass, after predicate, projection and slice pushdown.
+/// Resolves partitions and renders the SQL of every partition. Runs on every resolution, which
+/// Polars does after predicate, projection and slice pushdown.
 ///
 /// `target_partitions` is the distributed planner's target, which overrides automatic counts.
 pub fn compile_scan(
