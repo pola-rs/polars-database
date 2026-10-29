@@ -1,0 +1,476 @@
+//! Backends turn SQL into batches. One dialect can be served by several backends; the SQL is
+//! the same whichever backend runs it.
+
+pub mod adbc;
+pub mod resolve;
+
+use std::ffi::CString;
+use std::fmt;
+use std::sync::{Arc, OnceLock};
+
+use polars_core::frame::DataFrame;
+use polars_error::{PolarsResult, polars_bail, polars_err};
+use polars_utils::pl_str::PlSmallStr;
+use serde::{Deserialize, Serialize};
+
+use super::connection::ConnectionSpec;
+use super::dialect::DialectName;
+
+/// Which backend moves the bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BackendKind {
+    /// An ADBC driver, loaded from Rust.
+    Adbc { driver: PlSmallStr },
+    /// ConnectorX (Python package).
+    ConnectorX,
+    /// A Python DB-API (or vendor) driver module, e.g. `psycopg`, `oracledb`, `duckdb`.
+    Python { module: PlSmallStr },
+    /// SQLAlchemy, using the URL's dialect and driver.
+    Sqlalchemy,
+    /// A Python ODBC module: `arrow_odbc`, `turbodbc` or `pyodbc`.
+    Odbc { module: PlSmallStr },
+}
+
+impl BackendKind {
+    pub fn parse(s: &str) -> PolarsResult<Self> {
+        let (head, tail) = s.split_once(':').unwrap_or((s, ""));
+        Ok(match (head, tail) {
+            ("adbc", d) if !d.is_empty() => Self::Adbc { driver: d.into() },
+            ("connectorx", "") => Self::ConnectorX,
+            ("sqlalchemy", "") => Self::Sqlalchemy,
+            ("odbc", m) if !m.is_empty() => Self::Odbc { module: m.into() },
+            ("python", m) if !m.is_empty() => Self::Python { module: m.into() },
+            _ => polars_bail!(InvalidOperation: "invalid database backend: '{s}'"),
+        })
+    }
+
+    pub fn needs_python(&self) -> bool {
+        !matches!(self, Self::Adbc { .. })
+    }
+}
+
+impl fmt::Display for BackendKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Adbc { driver } => write!(f, "adbc:{driver}"),
+            Self::ConnectorX => f.write_str("connectorx"),
+            Self::Python { module } => write!(f, "python:{module}"),
+            Self::Sqlalchemy => f.write_str("sqlalchemy"),
+            Self::Odbc { module } => write!(f, "odbc:{module}"),
+        }
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct BackendCapabilities: u16 {
+        /// Produces Arrow, not rows.
+        const ARROW_NATIVE = 1 << 0;
+        /// Bounded-memory batches, not fetch-all.
+        const STREAMING = 1 << 1;
+        /// Batches are pulled without holding the GIL.
+        const NO_GIL = 1 << 2;
+        const CANCEL = 1 << 3;
+        /// Needs a Python interpreter and a module on the machine that reads.
+        const NEEDS_PYTHON = 1 << 4;
+        /// Can run the per-session setup statements.
+        const SESSION_SETUP = 1 << 5;
+    }
+}
+
+/// The backend chosen during planning. Recorded in the plan and re-checked wherever a
+/// connection is opened.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BackendChoice {
+    pub kind: BackendKind,
+    /// Informational; a different version on a worker is allowed.
+    pub version: Option<PlSmallStr>,
+    /// Where the driver was found (ADBC library or manifest), as a hint for other machines.
+    pub location: Option<PlSmallStr>,
+    /// Why this backend was chosen, for verbose output.
+    pub reason: PlSmallStr,
+}
+
+impl fmt::Display for BackendChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.kind)?;
+        if let Some(v) = &self.version {
+            write!(f, " {v}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Batches from one query. Blocking: pull it from a blocking thread.
+pub type BatchIter = Box<dyn Iterator<Item = PolarsResult<DataFrame>> + Send>;
+
+/// Cancels the running statement of a session, from another thread.
+pub type CancelHandle = Arc<dyn Fn() -> PolarsResult<()> + Send + Sync>;
+
+pub trait DatabaseBackend: Send + Sync {
+    fn choice(&self) -> &BackendChoice;
+    fn capabilities(&self) -> BackendCapabilities;
+    /// Opens a session. Blocking.
+    fn connect(
+        &self,
+        spec: &ConnectionSpec,
+        dialect: DialectName,
+    ) -> PolarsResult<Box<dyn DatabaseSession>>;
+}
+
+pub trait DatabaseSession: Send {
+    /// Runs a statement and returns its batches. Blocking.
+    fn execute(&mut self, sql: &str, batch_size: Option<usize>) -> PolarsResult<BatchIter>;
+
+    /// Runs a statement whose result is ignored (session setup).
+    fn execute_update(&mut self, sql: &str) -> PolarsResult<()> {
+        for batch in self.execute(sql, None)? {
+            batch?;
+        }
+        Ok(())
+    }
+
+    /// Runs a query and collects its result.
+    fn query(&mut self, sql: &str) -> PolarsResult<DataFrame> {
+        let mut out: Option<DataFrame> = None;
+        for batch in self.execute(sql, None)? {
+            let batch = batch?;
+            match &mut out {
+                None => out = Some(batch),
+                Some(acc) => {
+                    // Python drivers type each batch on its own: a column that is all NULL in
+                    // one batch has the Null dtype there.
+                    let (acc_df, batch) = align_null_columns(std::mem::take(acc), batch)?;
+                    *acc = acc_df;
+                    acc.vstack_mut_owned(batch)?;
+                },
+            }
+        }
+        out.ok_or_else(|| polars_err!(ComputeError: "database query returned no result: {sql}"))
+    }
+
+    fn cancel_handle(&self) -> Option<CancelHandle> {
+        None
+    }
+}
+
+/// Availability of a Python-side backend.
+#[derive(Clone, Debug)]
+pub struct ProbeResult {
+    pub version: Option<PlSmallStr>,
+    /// For ADBC pip packages: the driver library path.
+    pub location: Option<PlSmallStr>,
+}
+
+/// Python-side drivers, provided by `polars-python`. Absent when Polars runs without Python.
+pub trait PythonDriverBridge: Send + Sync {
+    /// Whether a Python-side backend is installed. For [`BackendKind::Adbc`], whether an
+    /// `adbc_driver_<name>` pip package is installed, with its library path.
+    fn probe(&self, kind: &BackendKind) -> Option<ProbeResult>;
+
+    /// The dialect of a factory or live connection object.
+    fn connection_dialect(&self, spec: &ConnectionSpec) -> PolarsResult<DialectName>;
+
+    /// The Python module that implements a factory or live connection object.
+    fn connection_module(&self, spec: &ConnectionSpec) -> PolarsResult<PlSmallStr>;
+
+    /// Opens a session with a Python-side backend.
+    fn connect(
+        &self,
+        kind: &BackendKind,
+        spec: &ConnectionSpec,
+        dialect: DialectName,
+        batch_size: Option<usize>,
+    ) -> PolarsResult<Box<dyn DatabaseSession>>;
+
+    /// Opens an ADBC connection through Python's `adbc_driver_manager`
+    /// (`POLARS_DATABASE_ADBC_LOADER=python`). `options` are the database options, `uri`
+    /// first; `execute_options` are set on every statement.
+    fn adbc_connect(
+        &self,
+        driver: &adbc::FoundDriver,
+        options: &[(CString, CString)],
+        dialect: DialectName,
+        execute_options: &[(CString, CString)],
+    ) -> PolarsResult<Box<dyn DatabaseSession>>;
+
+    /// Evaluates the connection's credential provider, if any: `(user, password)`.
+    fn credentials(
+        &self,
+        spec: &ConnectionSpec,
+    ) -> PolarsResult<Option<(Option<String>, Option<String>)>>;
+}
+
+static PYTHON_BRIDGE: OnceLock<Arc<dyn PythonDriverBridge>> = OnceLock::new();
+
+pub fn register_python_bridge(bridge: Arc<dyn PythonDriverBridge>) {
+    let _ = PYTHON_BRIDGE.set(bridge);
+}
+
+pub fn python_bridge() -> Option<&'static Arc<dyn PythonDriverBridge>> {
+    PYTHON_BRIDGE.get()
+}
+
+/// A backend served by the Python bridge.
+pub struct PythonBackend {
+    choice: BackendChoice,
+    bridge: Arc<dyn PythonDriverBridge>,
+    batch_size: Option<usize>,
+}
+
+impl DatabaseBackend for PythonBackend {
+    fn choice(&self) -> &BackendChoice {
+        &self.choice
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        let mut caps = BackendCapabilities::NEEDS_PYTHON | BackendCapabilities::SESSION_SETUP;
+        match &self.choice.kind {
+            BackendKind::ConnectorX => caps |= BackendCapabilities::ARROW_NATIVE,
+            BackendKind::Python { module }
+                if matches!(
+                    module.as_str(),
+                    "duckdb" | "oracledb" | "mssql_python" | "snowflake" | "databricks"
+                ) =>
+            {
+                caps |= BackendCapabilities::ARROW_NATIVE
+                    | BackendCapabilities::STREAMING
+                    | BackendCapabilities::CANCEL
+            },
+            BackendKind::Odbc { module } if module != "pyodbc" => {
+                caps |= BackendCapabilities::ARROW_NATIVE | BackendCapabilities::STREAMING
+            },
+            _ => caps |= BackendCapabilities::STREAMING | BackendCapabilities::CANCEL,
+        }
+        if matches!(self.choice.kind, BackendKind::ConnectorX) {
+            // ConnectorX has no sessions: setup statements can't apply to later queries.
+            caps.remove(BackendCapabilities::SESSION_SETUP);
+        }
+        caps
+    }
+
+    fn connect(
+        &self,
+        spec: &ConnectionSpec,
+        dialect: DialectName,
+    ) -> PolarsResult<Box<dyn DatabaseSession>> {
+        self.bridge
+            .connect(&self.choice.kind, spec, dialect, self.batch_size)
+    }
+}
+
+/// Opens a session and runs the dialect's session setup (read-only transactions, UTC, the
+/// application name). A setup statement the server rejects is skipped: it only tightens
+/// session hygiene, it never changes results.
+pub fn open_session(
+    backend: &dyn DatabaseBackend,
+    spec: &ConnectionSpec,
+    dialect: DialectName,
+) -> PolarsResult<Box<dyn DatabaseSession>> {
+    let mut session = backend.connect(spec, dialect)?;
+    if backend
+        .capabilities()
+        .contains(BackendCapabilities::SESSION_SETUP)
+    {
+        for stmt in dialect.session_setup() {
+            if let Err(e) = session.execute_update(stmt) {
+                if polars_core::config::verbose() {
+                    eprintln!("[scan_database]: session setup '{stmt}' failed, skipped: {e}");
+                }
+            }
+        }
+    }
+    Ok(session)
+}
+
+/// Casts columns that are `Null` on one side to the other side's dtype, so the frames stack.
+fn align_null_columns(mut a: DataFrame, mut b: DataFrame) -> PolarsResult<(DataFrame, DataFrame)> {
+    use polars_core::prelude::DataType;
+
+    if a.width() != b.width() {
+        return Ok((a, b));
+    }
+    for i in 0..a.width() {
+        let (da, db) = (
+            a.columns()[i].dtype().clone(),
+            b.columns()[i].dtype().clone(),
+        );
+        if da == db {
+            continue;
+        }
+        if da == DataType::Null {
+            let c = a.columns()[i].cast(&db)?;
+            a.replace_column(i, c)?;
+        } else if db == DataType::Null {
+            let c = b.columns()[i].cast(&da)?;
+            b.replace_column(i, c)?;
+        }
+    }
+    Ok((a, b))
+}
+
+/// Whether a failed connect or query is worth retrying: lost or refused connections, busy
+/// servers and listeners, timeouts. Authentication, permission and SQL errors fail the same
+/// way again, and retrying a failed login can lock the account.
+pub fn is_transient(error: &polars_error::PolarsError) -> bool {
+    let msg = error.to_string().to_ascii_lowercase();
+    const PERMANENT: &[&str] = &[
+        "password",
+        "authenticat",
+        "access denied",
+        "permission denied",
+        "login failed",
+        "ora-01017",
+        "ora-28000",
+        "28000",
+        "28p01",
+        "syntax error",
+        "does not exist",
+        "unknown database",
+        // ConnectorX's own pool already waited ~30s, retrying each connect itself
+        "timed out waiting for connection",
+    ];
+    const TRANSIENT: &[&str] = &[
+        "connection refused",
+        "connection reset",
+        "connection aborted",
+        "broken pipe",
+        "could not connect",
+        "can't connect",
+        "cannot connect",
+        "lost connection",
+        "server closed the connection",
+        "server has gone away",
+        "too many connections",
+        "too many clients",
+        "the database system is starting up",
+        "the database system is shutting down",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "ora-12514",
+        "ora-12516",
+        "ora-12519",
+        "ora-12520",
+        "ora-12528",
+        "ora-12541",
+        "dpy-6000",
+        "dpy-6005",
+        // Python's ConnectionError family (refused, reset, aborted)
+        "connectionerror",
+        "connectionrefusederror",
+        "connectionreseterror",
+        "database is locked",
+    ];
+    !PERMANENT.iter().any(|p| msg.contains(p)) && TRANSIENT.iter().any(|t| msg.contains(t))
+}
+
+/// Backoff before each retry of a failed connect, or of a query that failed before its first
+/// batch. Connect storms (many partitions, a server spawning a process per session) are
+/// often transient.
+pub const RETRY_BACKOFF_MS: [u64; 3] = [100, 500, 2000];
+
+/// Sleeps before retry number `attempt` (0-based).
+pub fn retry_wait(attempt: usize, error: &polars_error::PolarsError) {
+    if polars_core::config::verbose() {
+        eprintln!(
+            "[scan_database]: retrying in {}ms after: {error}",
+            RETRY_BACKOFF_MS[attempt]
+        );
+    }
+    std::thread::sleep(std::time::Duration::from_millis(RETRY_BACKOFF_MS[attempt]));
+}
+
+/// [`open_session`], retried with backoff.
+pub fn open_session_with_retries(
+    backend: &dyn DatabaseBackend,
+    spec: &ConnectionSpec,
+    dialect: DialectName,
+) -> PolarsResult<Box<dyn DatabaseSession>> {
+    let mut attempt = 0;
+    loop {
+        match open_session(backend, spec, dialect) {
+            Ok(s) => return Ok(s),
+            Err(e) if attempt < RETRY_BACKOFF_MS.len() && is_transient(&e) => {
+                retry_wait(attempt, &e);
+                attempt += 1;
+            },
+            Err(e) => {
+                return Err(e.context(
+                    format!(
+                        "connecting to {} via {} ({} attempts)",
+                        spec.target,
+                        backend.choice().kind,
+                        attempt + 1
+                    )
+                    .into(),
+                ));
+            },
+        }
+    }
+}
+
+/// Instantiates the chosen backend on this machine. Re-checks availability: a worker without
+/// the planned backend fails here, before any query runs.
+pub fn open_backend(
+    choice: &BackendChoice,
+    batch_size: Option<usize>,
+) -> PolarsResult<Arc<dyn DatabaseBackend>> {
+    match &choice.kind {
+        BackendKind::Adbc { driver } => Ok(Arc::new(adbc::AdbcBackend::load(
+            driver,
+            choice.location.as_deref(),
+            choice.clone(),
+        )?)),
+        kind => {
+            let Some(bridge) = python_bridge() else {
+                polars_bail!(
+                    ComputeError:
+                    "database backend '{kind}' needs Python, which is not available on this machine"
+                )
+            };
+            if bridge.probe(kind).is_none() {
+                polars_bail!(
+                    ComputeError:
+                    "database backend '{kind}' was chosen during planning but is not installed \
+                    on this machine; install it, or pin another driver with `driver=`"
+                )
+            }
+            Ok(Arc::new(PythonBackend {
+                choice: choice.clone(),
+                bridge: bridge.clone(),
+                batch_size,
+            }))
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use polars_error::polars_err;
+
+    use super::is_transient;
+
+    #[test]
+    fn transient_errors() {
+        let e = |m: &str| polars_err!(ComputeError: "{m}");
+        for m in [
+            "connection to server at \"10.0.0.1\", port 5432 failed: timeout expired",
+            "ORA-12520: TNS:listener could not find available handler",
+            "ConnectionRefusedError: [Errno 111] Connection refused",
+            "FATAL: sorry, too many clients already",
+        ] {
+            assert!(is_transient(&e(m)), "{m}");
+        }
+        for m in [
+            "FATAL: password authentication failed for user \"polars\"",
+            "ORA-01017: invalid username/password; logon denied",
+            "(1045, \"Access denied for user 'polars'@'localhost'\")",
+            "syntax error at end of input",
+            "division by zero",
+            "timed out waiting for connection: password authentication failed",
+        ] {
+            assert!(!is_transient(&e(m)), "{m}");
+        }
+    }
+}

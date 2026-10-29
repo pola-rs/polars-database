@@ -20,6 +20,15 @@ make -C py-polars build-polars-database  # build and install into the Polars ven
 make -C py-polars test                   # also builds the plugin
 ```
 
+The plugin's own tests are in `tests/` and run against that venv, from this directory:
+
+```bash
+../../.venv/bin/pytest tests -n auto
+```
+
+Tests against database servers skip unless their `POLARS_TEST_*_URI` variables are set; the
+Docker stack that provides them is described in the Polars branch's `agent-docs/scan-database/local-db`.
+
 ## Branches and CI
 
 - `dev`: development branch. Polars pull request and push CI clones it.

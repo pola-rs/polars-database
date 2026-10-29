@@ -1,0 +1,50 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "polars-database"
+description = "Native database scan plugin for Polars (dependency of the polars package)"
+readme = "README.pypi.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+version = "0.1.0"
+dependencies = ["sqlglot >= 25"]
+
+[project.urls]
+Homepage = "https://www.pola.rs/"
+Polars = "https://pypi.org/project/polars/"
+Repository = "https://github.com/nameexhaustion/polars-database"
+
+[tool.maturin]
+features = ["python"]
+module-name = "polars_database._lib"
+python-source = "python"
+
+[tool.pytest.ini_options]
+# Run from this directory against the Polars development venv: `pytest tests`. The same settings
+# as the Polars test suite, which these tests were part of.
+addopts = [
+  "--tb=short",
+  "--strict-config",
+  "--strict-markers",
+  "--dist=loadgroup",
+  "--max-worker-restart=0",
+  # The load tests are slow and need `POLARS_TEST_DATABASE_LOAD=1`; run them with -m slow.
+  "-m not slow and not release and not benchmark and not docs",
+]
+markers = [
+  "benchmark: Tests used to benchmark with.",
+  "docs: Documentation code snippets",
+  "release: Tests that should be run on a Polars release build.",
+  "slow: Tests with a longer than average runtime.",
+]
+filterwarnings = [
+  # Fail on warnings
+  "error",
+  # Ignore invalid warnings when running earlier versions of SQLAlchemy
+  "ignore:Deprecated API features detected.*:DeprecationWarning",
+  # numpy import can generate this warning in Python 3.13 on certain runners
+  "ignore:.*numpy\\.longdouble.*:UserWarning",
+]
+xfail_strict = true
