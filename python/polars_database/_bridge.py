@@ -378,8 +378,10 @@ def _connectorx_uri(uri: str, dialect: str) -> str:
     uri = _strip_driver(uri)
     if dialect != "sqlite":
         return uri
-    # ConnectorX joins the host and path of `sqlite://…` (lowercasing the host) and
-    # can't open `file:` URIs: hand it the same file as the other backends, absolute
+    # ConnectorX opens the percent-decoded rest of its parsed `sqlite://…` URL, and
+    # can't open `file:` URIs: hand it the same file as the other backends, absolute.
+    # Fully encoded, the path is an opaque host the URL parser keeps as it is: as
+    # written, it turns `C:\Users` into `C/\Users` on Windows
     path, params = _file_target(uri)
     if params or path.startswith("file:"):
         msg = (
@@ -389,7 +391,7 @@ def _connectorx_uri(uri: str, dialect: str) -> str:
         raise ValueError(msg)
     if path == ":memory:":
         return "sqlite://:memory:"
-    return "sqlite://" + quote(os.path.abspath(path), safe="/:\\")
+    return "sqlite://" + quote(os.path.abspath(path), safe="")
 
 
 def _url_parts(uri: str) -> dict[str, Any]:

@@ -1598,6 +1598,11 @@ def test_mysql_engine_connections_dont_keep_the_session_setup() -> None:
         engine.dispose()
 
 
+def _postgres_in_transaction(conn: Any) -> bool:
+    # libpq's transaction status, in psycopg and psycopg2: 2 is INTRANS
+    return int(conn.info.transaction_status) == 2
+
+
 @needs_postgres
 @pytest.mark.parametrize("module", ["psycopg", "psycopg2"])
 @pytest.mark.parametrize("in_transaction", [False, True])
@@ -1605,7 +1610,8 @@ def test_postgres_live_connection_after_an_early_stop(
     module: str, in_transaction: bool
 ) -> None:
     # Polars may release an early-stopped read after `collect()` returned: nothing
-    # the scan sends then may hit the user's next statements. In a transaction of the
+    # the scan sends then may hit the user's next statements. A transaction the scan
+    # opened is rolled back before `collect()` returns; in a transaction of the
     # user's, it reads in that transaction.
     import importlib
 
@@ -1628,6 +1634,7 @@ def test_postgres_live_connection_after_an_early_stop(
                 cur.execute("SELECT 1")
             lf = pl.scan_database(q, conn, batch_size=1000)
             lf.filter((pl.col("id").hash() % 7) == 0).head(2).collect()
+            assert _postgres_in_transaction(conn) is in_transaction
             cur.execute(f"INSERT INTO {table} VALUES (%s)", (k,))
             cur.close()
             conn.commit()
@@ -1638,6 +1645,64 @@ def test_postgres_live_connection_after_an_early_stop(
         conn.commit()
     finally:
         conn.close()
+
+
+@needs_postgres
+@pytest.mark.parametrize("module", ["psycopg", "psycopg2"])
+@pytest.mark.parametrize("in_transaction", [False, True])
+@pytest.mark.parametrize("how", ["batches", "dropped_batches", "polars_error"])
+def test_postgres_live_connection_keeps_the_users_writes(
+    module: str, in_transaction: bool, how: str
+) -> None:
+    # The user's statements between batches, after an iterator dropped early, or after
+    # a query that failed in Polars mid-read are theirs: the scan never rolls them back
+    # (nor aborts their transaction) with one of its own.
+    import importlib
+
+    driver = importlib.import_module(module)
+    table = f"review_writes_{module}_{in_transaction}_{how}"
+    assert POSTGRES is not None
+    _execute(
+        "postgres17", [f"DROP TABLE IF EXISTS {table}", f"CREATE TABLE {table} (k int)"]
+    )
+    conn = driver.connect(POSTGRES)
+    try:
+        q = "SELECT g AS id FROM generate_series(1, 200000) g"
+        lf = pl.scan_database(q, conn, batch_size=1000)
+        for k in range(5):
+            cur = conn.cursor()
+            if in_transaction:
+                cur.execute("SELECT 1")
+            insert = f"INSERT INTO {table} VALUES ({k})"
+            if how == "batches":
+                for i, _ in enumerate(lf.collect_batches(chunk_size=1000)):
+                    if i == 1:
+                        cur.execute(insert)
+            elif how == "dropped_batches":
+                batches = lf.collect_batches(chunk_size=1000)
+                next(batches)
+                del batches
+                cur.execute(insert)
+            else:
+                with pytest.raises(pl.exceptions.PolarsError):
+                    lf.select(pl.col("id").cast(pl.Int16, strict=True)).collect()
+                cur.execute(insert)
+            if in_transaction or how != "batches":
+                cur.execute(
+                    "SELECT count(*) FROM pg_catalog.pg_cursors "
+                    "WHERE name LIKE 'polars_scan_%'"
+                )
+                assert cur.fetchone()[0] == 0
+            cur.close()
+            conn.commit()
+        cur = conn.cursor()
+        cur.execute(f"SELECT count(*) FROM {table}")
+        assert cur.fetchone()[0] == 5
+        cur.close()
+        conn.commit()
+    finally:
+        conn.close()
+        _execute("postgres17", [f"DROP TABLE IF EXISTS {table}"])
 
 
 @needs_postgres

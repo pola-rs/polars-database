@@ -7,6 +7,7 @@ from contextlib import closing
 from datetime import date
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote, unquote
 
 import pytest
 
@@ -1072,9 +1073,20 @@ def test_sqlite_uri_paths_mean_one_file_for_every_driver(
     assert sorted(p.name for p in tmp_path.iterdir()) == ["a b.db", "rel.db"]
 
 
+def _skip_without_duckdb_adbc() -> None:
+    try:
+        pl.scan_database("SELECT 1 AS x", "duckdb://", driver="adbc").collect()
+    except pl.exceptions.ComputeError as e:
+        if "is not installed" in str(e):
+            pytest.skip("no DuckDB ADBC driver")
+        raise
+
+
 @pytest.mark.parametrize("driver", ["duckdb", "adbc"])
 def test_scan_duckdb_string_literal_with_nul(tmp_path: Path, driver: str) -> None:
     duckdb = pytest.importorskip("duckdb")
+    if driver == "adbc":
+        _skip_without_duckdb_adbc()
     path = str(tmp_path / "t.duckdb")
     with duckdb.connect(path) as conn:
         conn.execute(
@@ -1137,6 +1149,33 @@ def test_connectorx_missing_sqlite_file(tmp_path: Path) -> None:
     assert not path.exists()
 
 
+def test_connectorx_sqlite_windows_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ConnectorX parses the URI as a URL: `sqlite://C:\\Users\\a` would come out as
+    # `C/\\Users\\a`. Fully encoded, nothing in the path is a URL delimiter
+    import ntpath
+
+    from polars_database import _bridge
+
+    monkeypatch.setattr(_bridge.os.path, "abspath", ntpath.abspath)
+    path = "C:\\Users\\A b#1\\t.db"
+    uri = _bridge._connectorx_uri(f"sqlite:///{path}", "sqlite")
+    rest = uri.removeprefix("sqlite://")
+    assert not set(rest) & set(":/\\?# "), uri
+    assert unquote(rest) == path
+
+
+def test_connectorx_sqlite_path_with_url_characters(tmp_path: Path) -> None:
+    pytest.importorskip("connectorx")
+    path = tmp_path / "A b#1%2F" / "t.db"
+    path.parent.mkdir()
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t AS SELECT 1 AS id")
+        conn.commit()
+    uri = f"sqlite:///{quote(str(path))}"
+    lf = pl.scan_database("t", uri, driver="connectorx")
+    assert lf.collect()["id"].to_list() == [1]
+
+
 @pytest.mark.parametrize("driver", ["adbc", "sqlite3"])
 def test_scan_empty_sqlite_table_is_typed_by_affinity(
     tmp_path: Path, driver: str
@@ -1196,6 +1235,7 @@ def test_scan_duckdb_names_resolve_case_insensitively(tmp_path: Path) -> None:
 
 def test_scan_duckdb_uri_paths_via_adbc(tmp_path: Path) -> None:
     duckdb = pytest.importorskip("duckdb")
+    _skip_without_duckdb_adbc()
     with duckdb.connect(str(tmp_path / "d.db")) as conn:
         conn.execute("CREATE TABLE t AS SELECT 1 AS id")
     cwd = os.getcwd()
@@ -1203,13 +1243,8 @@ def test_scan_duckdb_uri_paths_via_adbc(tmp_path: Path) -> None:
     try:
         # relative, as the Python backends (and SQLAlchemy) read it
         for uri in ["duckdb:///d.db", "duckdb:///d.db?read_only=true"]:
-            try:
-                lf = pl.scan_database("t", uri, driver="adbc")
-                assert lf.collect()["id"].to_list() == [1], uri
-            except pl.exceptions.PolarsError as e:
-                if "driver" in str(e) and "not found" in str(e).lower():
-                    pytest.skip("no DuckDB ADBC driver")
-                raise
+            lf = pl.scan_database("t", uri, driver="adbc")
+            assert lf.collect()["id"].to_list() == [1], uri
     finally:
         os.chdir(cwd)
 
