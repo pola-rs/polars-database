@@ -361,7 +361,7 @@ pub fn resolve_scan(
                 DatabaseRelation::Query { .. } => CatalogInfo::default(),
             };
             let select_list = converted_select_list(dialect, &backend.kind, &info);
-            let discovered = discover_schema(
+            let (discovered, sampled) = discover_schema(
                 session,
                 options,
                 dialect,
@@ -370,9 +370,9 @@ pub fn resolve_scan(
                 select_list.as_deref(),
                 &info,
             )?;
-            PolarsResult::Ok((info, discovered))
+            PolarsResult::Ok((info, discovered, sampled))
         };
-        let (mut info, mut discovered) = match discover(session.as_mut(), &options) {
+        let (mut info, mut discovered, sampled) = match discover(session.as_mut(), &options) {
             Ok(found) => found,
             // No table by the folded name: the name as written, on a new session (a failed
             // statement can abort the session's transaction).
@@ -393,18 +393,39 @@ pub fn resolve_scan(
             },
         };
         stats = info.stats;
-        // A query's result types decide how the database compares its columns. Without
-        // pushdown nothing is compared.
-        if matches!(options.relation, DatabaseRelation::Query { .. }) && pushdown_disabled.is_none()
+        // A query's result types decide how the database compares its columns, and fix
+        // their dtypes as a table's declared types do: the same column reads the same
+        // from a table and a query, whichever driver reads it. They are looked up where
+        // the query is wrapped to read columns through their conversions; also without
+        // pushdown, so that the values don't depend on it. (MariaDB would drop the
+        // `ORDER BY` of a wrapped query.)
+        if matches!(options.relation, DatabaseRelation::Query { .. })
+            && read_wrapped(&options, &pushdown_disabled, &query)
         {
             let names = discovered.iter_names().cloned().collect::<Vec<_>>();
             let from = quoted_relation(dialect, &options.relation);
             // Python drivers refuse DDL, ConnectorX runs each statement on its own connection.
             let temp_tables = matches!(backend.kind, BackendKind::Adbc { .. });
             info = catalog::query_info(session.as_mut(), dialect, &from, &names, temp_tables);
+            // Only where a table's types are declared ones too: SQLite and DuckDB tables
+            // are typed by their values.
+            if matches!(
+                dialect,
+                DialectName::Postgresql
+                    | DialectName::Mysql
+                    | DialectName::Mssql
+                    | DialectName::Oracle
+                    | DialectName::Clickhouse
+            ) {
+                info.types = names
+                    .iter()
+                    .filter_map(|n| Some((n.clone(), info.compare_types.get(n)?.clone())))
+                    .collect();
+            }
         }
 
         // A declared type fixes the dtype, whichever driver read it.
+        let is_query = matches!(options.relation, DatabaseRelation::Query { .. });
         for (name, dtype) in discovered.iter_mut() {
             let Some(t) = info.declared_type(name) else {
                 continue;
@@ -413,7 +434,18 @@ pub fn resolve_scan(
                 // read as text by the dialect rules; the value stays text
                 *dtype = DataType::String;
             } else if let Some(declared) = declared_dtype(dialect, t) {
-                *dtype = declared;
+                // A query's Postgres `numeric` shows no precision (`pg_typeof` has no type
+                // modifier): psycopg's result description has it, other drivers' don't.
+                let precision_from_driver = is_query
+                    && dialect == DialectName::Postgresql
+                    && t == "numeric"
+                    && !sampled.contains(name.as_str())
+                    && matches!(&backend.kind, BackendKind::Python { module }
+                        if module == "psycopg" || module == "psycopg2")
+                    && matches!(dtype, DataType::Decimal(p, _) if *p <= 38);
+                if !precision_from_driver {
+                    *dtype = declared;
+                }
             }
         }
         columns = discovered
@@ -427,14 +459,14 @@ pub fn resolve_scan(
                     info.compare_types
                         .get(name.as_str())
                         .filter(|t| {
-                            info.types_required
-                                && column_conversion(
-                                    dialect,
-                                    &backend.kind,
-                                    t,
-                                    &dialect.quote_ident(name),
-                                )
-                                .is_none()
+                            let converted = column_conversion(
+                                dialect,
+                                &backend.kind,
+                                t,
+                                &dialect.quote_ident(name),
+                            )
+                            .is_some();
+                            info.types_required && !converted
                         })
                         .map(|t| t.as_str().into())
                 }),
@@ -455,20 +487,9 @@ pub fn resolve_scan(
                     }),
             })
             .collect();
-        if let DatabaseRelation::Query { sql } = &options.relation
+        if matches!(options.relation, DatabaseRelation::Query { .. })
             && dialect == DialectName::Oracle
         {
-            // With pushdown=False the query is still wrapped to read its time zone
-            // columns as UTC, so the values don't depend on pushdown: that takes its types.
-            if !options.pushdown
-                && sql_renderer()
-                    .and_then(|r| r.inspect_query(sql, dialect))
-                    .is_ok_and(|f| wrap_blocker(&f, dialect).is_none())
-            {
-                let names = discovered.iter_names().cloned().collect::<Vec<_>>();
-                let from = quoted_relation(dialect, &options.relation);
-                info = catalog::query_info(session.as_mut(), dialect, &from, &names, false);
-            }
             oracle_query_timestamps(&info, &mut columns, &mut discovered);
         }
         schema = Arc::new(discovered);
@@ -480,9 +501,10 @@ pub fn resolve_scan(
     if matches!(backend.kind, BackendKind::ConnectorX)
         && matches!(options.relation, DatabaseRelation::Query { .. })
     {
+        let wrapped = read_wrapped(&options, &pushdown_disabled, &query);
         for c in columns.iter_mut().filter(|c| c.dtype.is_decimal()) {
             polars_ensure!(
-                pushdown_disabled.is_none(),
+                wrapped,
                 InvalidOperation:
                 "ConnectorX cuts decimals to 10 decimal places, and this query can't be \
                 wrapped to read column '{}' exactly ({}); pin another driver, or CAST the \
@@ -544,6 +566,23 @@ pub fn resolve_scan(
         pushdown_disabled,
         bounds_cache: Default::default(),
     })
+}
+
+/// Whether the source is read with conversions in its select list: a table, or a query that
+/// is wrapped for them (with pushdown, or without it where it can be: see
+/// `compile_unwrapped`).
+fn read_wrapped(
+    options: &DatabaseScanOptions,
+    pushdown_disabled: &Option<PlSmallStr>,
+    query: &QueryDiscovery,
+) -> bool {
+    match options.relation {
+        DatabaseRelation::Table { .. } => true,
+        DatabaseRelation::Query { .. } => {
+            pushdown_disabled.is_none()
+                || (!options.pushdown && query.wrappable && !query.mariadb_order_by)
+        },
+    }
 }
 
 /// An Oracle query's `TIMESTAMP WITH [LOCAL] TIME ZONE` columns, by its result types
@@ -821,7 +860,8 @@ fn fixed_select_list(dialect: DialectName, items: &[SqlSelectItem]) -> String {
         .join(", ")
 }
 
-/// The result schema of the relation, without reading rows.
+/// The result schema of the relation, without reading rows, and the columns typed from a
+/// sample of their values (not by the result's types).
 fn discover_schema(
     session: &mut dyn DatabaseSession,
     options: &DatabaseScanOptions,
@@ -830,7 +870,7 @@ fn discover_schema(
     query: &QueryDiscovery,
     select_list: Option<&[SqlSelectItem]>,
     info: &CatalogInfo,
-) -> PolarsResult<Schema> {
+) -> PolarsResult<(Schema, PlHashSet<PlSmallStr>)> {
     let is_query = matches!(options.relation, DatabaseRelation::Query { .. });
     let probe = format!(
         "SELECT {} FROM {} WHERE 1 = 0",
@@ -888,7 +928,12 @@ fn discover_schema(
     // sample, which runs a query: not one known to be volatile (`nextval`). SQLite's
     // functions can't write.
     let sample_types = dialect == DialectName::Sqlite;
-    let untyped = sample_types || schema.iter().any(|(_, dt)| dt.is_null());
+    let sampled = schema
+        .iter()
+        .filter(|(_, dt)| sample_types || dt.is_null())
+        .map(|(name, _)| name.clone())
+        .collect::<PlHashSet<_>>();
+    let untyped = !sampled.is_empty();
     let may_sample = !is_query || !query.volatile || sample_types;
     if untyped && !ran_query && may_sample && dialect.supports_limit() {
         let renderer = sql_renderer()?;
@@ -903,8 +948,29 @@ fn discover_schema(
                     alias: c.clone(),
                 })
                 .collect()
-        } else {
+        } else if sample_types {
             select_list.map_or_else(|| vec![SqlSelectItem::Star], <[_]>::to_vec)
+        } else {
+            // Only the untyped columns: the others may hold values a row driver can't
+            // build a frame of (psycopg's JSON arrays), which the read converts.
+            match select_list {
+                Some(list) => list
+                    .iter()
+                    .filter(|item| match item {
+                        SqlSelectItem::Column(c) | SqlSelectItem::Expr { alias: c, .. } => {
+                            sampled.contains(c)
+                        },
+                        _ => false,
+                    })
+                    .cloned()
+                    .collect(),
+                None => schema
+                    .iter_names()
+                    .filter(|c| sampled.contains(*c))
+                    .cloned()
+                    .map(SqlSelectItem::Column)
+                    .collect(),
+            }
         };
         let mut sample_query = SqlQuery::select(items, from_clause(options));
         sample_query.limit = Some(TYPE_SAMPLE_ROWS);
@@ -940,7 +1006,7 @@ fn discover_schema(
             *dtype = DataType::String;
         }
     }
-    Ok(schema)
+    Ok((schema, sampled))
 }
 
 /// The dtype of a SQLite column by the storage classes (`typeof`) of its sampled values, as

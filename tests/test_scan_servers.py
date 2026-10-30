@@ -2543,3 +2543,39 @@ def test_mysql_query_ending_in_comments(name: str) -> None:
     ]:
         lf = _scan(name, "pymysql", query)
         assert sorted(lf.filter(pl.col("id") >= 1).collect()["id"].to_list()) == [1, 2]
+
+
+@pytest.mark.skipif(SERVERS["mysql"].uri is None, reason="no MySQL URI")
+@pytest.mark.parametrize("driver", ["adbc", "pymysql", "mysql.connector"])
+def test_mysql_query_dtypes_are_the_tables(driver: str) -> None:
+    # row drivers read every integer as Int64, FLOAT as a Float64, TIME as a duration
+    # and TIMESTAMP naive; ADBC read a query's YEAR and BIT as text and binary
+    table = f"rvb_my_qtypes_{driver.replace('.', '_')}"
+    _execute(
+        "mysql",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id int, t tinyint, tu tinyint unsigned, sm smallint, "
+            "f float, tm time(3), ts timestamp(6) NULL, y year, b bit(10))",
+            f"INSERT INTO {table} VALUES (1, -5, 200, 7, 1.5, '12:34:56.789', "
+            "'2024-01-02 03:04:05', 2024, b'1010101010'), "
+            "(2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+        ],
+    )
+    try:
+        tables = _scan("mysql", driver, table)
+        # a row driver's query has no types: BIT's text form needs the width
+        bit = [] if driver == "adbc" else ["b"]
+        expected = tables.collect().drop(bit).schema
+        for source in [
+            f"SELECT * FROM {table}",
+            f"SELECT * FROM {table} WHERE id > 10",
+        ]:
+            lf = _scan("mysql", driver, source)
+            df = lf.collect()
+            assert lf.collect_schema() == df.schema
+            assert df.drop(bit).schema == expected
+        df = _scan("mysql", driver, f"SELECT * FROM {table}").collect().sort("id")
+        assert_frame_equal(df.drop(bit), tables.collect().sort("id").drop(bit))
+    finally:
+        _execute("mysql", [f"DROP TABLE IF EXISTS {table}"])

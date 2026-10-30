@@ -380,6 +380,26 @@ pub fn query_info(
                     info.compare_types.insert(name.into(), t);
                 }
             }
+        } else if dialect == DialectName::Clickhouse && !columns.is_empty() {
+            // ConnectorX runs only `SELECT`s: the types of an aggregate over no rows (one
+            // row; `LIMIT 0` doesn't run the query). It drops `LowCardinality`, which
+            // doesn't change the values.
+            let sql = format!(
+                "SELECT {} FROM (SELECT * FROM {from} LIMIT 0) pl_q",
+                columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| format!("toTypeName(any({})) AS c{i}", q(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if let Some(df) = run(session, "types", &sql) {
+                for (i, c) in columns.iter().enumerate() {
+                    if let Some(t) = cell_str(&df, i, 0) {
+                        info.compare_types.insert(c.clone(), t);
+                    }
+                }
+            }
         }
     } else if dialect == DialectName::Mysql && temp_tables {
         // A temporary table of the query's columns: `LIMIT 0` plans the query without
@@ -509,10 +529,12 @@ fn oracle_type_name(code: &str, precision: &str, scale: &str) -> Option<String> 
         match code.trim().parse::<u32>().ok()? {
             1 => "varchar2",
             96 => "char",
-            // `NUMBER` without precision has scale -127; `FLOAT` has a precision too
+            // `NUMBER` without precision has scale -127, and an expression (`n * 1`, `SUM`)
+            // precision 0 and scale 0; `FLOAT` has a precision (`NUMBER(*, s)` columns show
+            // precision 38)
             2 if s == "-127" && p == "0" => "number",
             2 if s == "-127" => "float",
-            2 if p == "0" => return Some(format!("number(38,{s})")),
+            2 if p == "0" => "number",
             2 => return Some(format!("number({p},{s})")),
             8 => "long",
             12 => "date",
@@ -969,7 +991,9 @@ mod tests {
         let t = |c, p, s| oracle_type_name(c, p, s).unwrap();
         assert_eq!(t("2", "0", "-127"), "number");
         assert_eq!(t("2", "38", "0"), "number(38,0)");
-        assert_eq!(t("2", "0", "2"), "number(38,2)");
+        assert_eq!(t("2", "38", "2"), "number(38,2)");
+        // an expression's type: its values have any scale
+        assert_eq!(t("2", "0", "0"), "number");
         assert_eq!(t("2", "126", "-127"), "float");
         assert_eq!(t("181", "0", "6"), "timestamp with time zone");
         assert!(compares_as_text(DialectName::Oracle, &t("96", "0", "0")));

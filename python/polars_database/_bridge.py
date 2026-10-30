@@ -1294,7 +1294,7 @@ def _shutdown_socket(conn: Any) -> None:
             sock.shutdown(socket.SHUT_RDWR)
 
 
-def _empty_frame(result: Any) -> DataFrame:
+def _empty_frame(result: Any, *, utc: bool) -> DataFrame:
     import polars as pl
 
     names: list[str] = []
@@ -1302,14 +1302,14 @@ def _empty_frame(result: Any) -> DataFrame:
     with contextlib.suppress(Exception):
         if (description := getattr(result, "description", None)) is not None:
             names = [d[0] for d in description]
-            dtypes = _description_dtypes(result, description)
+            dtypes = _description_dtypes(result, description, utc=utc)
         elif callable(keys := getattr(result, "keys", None)):
             names = [str(k) for k in cast("Any", keys())]
             # a SQLAlchemy result: the DB-API cursor has the types
             if (cursor := getattr(result, "cursor", None)) is not None and (
                 description := getattr(cursor, "description", None)
             ) is not None:
-                dtypes = _description_dtypes(cursor, description)
+                dtypes = _description_dtypes(cursor, description, utc=utc)
     if len(dtypes) != len(names):
         dtypes = [pl.Null] * len(names)
     return pl.DataFrame(schema=dict(zip(names, dtypes, strict=True)))
@@ -1335,6 +1335,8 @@ _POSTGRES_OID_DTYPES = {
     1114: "Datetime",  # timestamp
     1184: "Datetime[UTC]",  # timestamptz (the session time zone is UTC)
     2950: "String",  # uuid, as a table's is read (as text)
+    114: "String",  # json, as a table's is read (as text)
+    3802: "String",  # jsonb
 }
 
 # Postgres array OIDs, by their element's OID: lists of the element dtype.
@@ -1358,22 +1360,24 @@ _POSTGRES_ARRAY_OIDS = {
     2951: 2950,
 }
 
-# MySQL field types (`cursor.description` of PyMySQL, MySQLdb and mysql.connector), as
-# these drivers read a non-empty result: every integer as Int64, `FLOAT` as a Python
-# float, `TIMESTAMP` naive (`BIGINT UNSIGNED` as UInt64, see `_mysql_unsigned`). Others (strings, which may be binary; decimals; `TIME`,
-# read as a duration) are typed from values.
+# MySQL field types (`cursor.description` of PyMySQL, MySQLdb and mysql.connector), as a
+# table's declared types are read (`declared_dtype`): a query's columns read the same.
+# These drivers read every integer as an Int64, `FLOAT` as a Python float, `TIME` as a
+# duration: the values are cast. Integers are `(signed, unsigned)` (see `_mysql_unsigned`).
+# Others (strings, which may be binary; decimals; `BIT`) are typed from values.
 _MYSQL_FIELD_DTYPES = {
-    1: "Int64",  # TINY
-    2: "Int64",  # SHORT
-    3: "Int64",  # LONG
-    4: "Float64",  # FLOAT
+    1: ("Int8", "UInt8"),  # TINY
+    2: ("Int16", "UInt16"),  # SHORT
+    3: ("Int32", "UInt32"),  # LONG
+    4: "Float32",  # FLOAT
     5: "Float64",  # DOUBLE
-    7: "Datetime",  # TIMESTAMP
-    8: "Int64",  # LONGLONG
-    9: "Int64",  # INT24
+    7: "Datetime[UTC]",  # TIMESTAMP (the session time zone is UTC)
+    8: ("Int64", "UInt64"),  # LONGLONG
+    9: ("Int32", "UInt32"),  # INT24
     10: "Date",  # DATE
+    11: "Time",  # TIME
     12: "Datetime",  # DATETIME
-    13: "Int64",  # YEAR
+    13: "Int16",  # YEAR
     14: "Date",  # NEWDATE
 }
 
@@ -1390,10 +1394,10 @@ def _mysql_unsigned(cursor: Any, description: Any, i: int) -> bool | None:
     return None
 
 
-def _description_dtypes(cursor: Any, description: Any) -> list[Any]:
+def _description_dtypes(cursor: Any, description: Any, *, utc: bool) -> list[Any]:
     """Dtypes of a Postgres- or MySQL-family result's columns, from their type codes,
     which an empty result has too; `Null` (typed later from a sample) for other types
-    and other drivers."""
+    and other drivers. `utc`: the session time zone is UTC (the session setup ran)."""
     import polars as pl
 
     def named(name: str) -> Any:
@@ -1417,12 +1421,14 @@ def _description_dtypes(cursor: Any, description: Any) -> list[Any]:
 
     def mysql(i: int, d: Any) -> Any:
         name = _MYSQL_FIELD_DTYPES.get(d[1]) if type(d[1]) is int else None
-        if d[1] == 8:  # LONGLONG: `BIGINT UNSIGNED` goes past Int64
+        if isinstance(name, tuple):
             unsigned = _mysql_unsigned(cursor, description, i)
             if unsigned is None:
                 return pl.Null  # typed from values
-            if unsigned:
-                return pl.UInt64
+            name = name[unsigned]
+        if name == "Datetime[UTC]" and not utc:
+            # in the session's time zone, which is unknown: as read
+            name = "Datetime"
         return pl.Null if name is None else named(name)
 
     module = _module_of(cursor)
@@ -1595,7 +1601,7 @@ class _Session:
                 )
                 # some drivers yield no batch for an empty result, and close the
                 # cursor when done: take the column names first
-                empty_frame = _empty_frame(cx.result)
+                empty_frame = _empty_frame(cx.result, utc=self.owned)
                 if idle and _transaction_idle(self.conn) is False:
                     frames = iter(list(frames))
                     if _module_of(cx.result) == "sqlalchemy":
