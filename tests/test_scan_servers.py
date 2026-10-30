@@ -2284,3 +2284,96 @@ def test_postgres_psycopg2_bytea(kind: str) -> None:
         else:
             df = pl.scan_database(source, lambda: psycopg2.connect(POSTGRES)).collect()
         assert df.sort("id")["b"].to_list() == [b"\x00\xff", None]
+
+
+@needs_postgres
+def test_postgres_unparseable_write_runs_nowhere_and_queries_run_once() -> None:
+    # sqlglot can't parse `USING <`: a WITH it can't check is refused where sessions
+    # aren't read-only, and a query is never run whole to find its schema
+    import psycopg
+
+    assert POSTGRES is not None
+    _execute(
+        "postgres17",
+        [
+            "DROP TABLE IF EXISTS fix_once_w",
+            "DROP SEQUENCE IF EXISTS fix_once_s",
+            "CREATE TABLE fix_once_w (id serial, v int)",
+            "CREATE SEQUENCE fix_once_s",
+        ],
+    )
+    write = (
+        "WITH d AS (INSERT INTO fix_once_w (v) VALUES (1) RETURNING id, v) "
+        "SELECT * FROM d WHERE id IS NOT NULL ORDER BY id USING <"
+    )
+    live = psycopg.connect(POSTGRES, autocommit=True)
+    try:
+        for source in [POSTGRES, live]:
+            kw = {"driver": "connectorx"} if source is POSTGRES else {}
+            for pushdown in [True, False]:
+                lf = pl.scan_database(
+                    write, source, source_type="query", pushdown=pushdown, **kw
+                )
+                with pytest.raises(
+                    pl.exceptions.InvalidOperationError, match="can't be parsed"
+                ):
+                    lf.collect()
+        # these sessions are read-only: the database refuses the write itself
+        for driver in ["adbc", "psycopg"]:
+            with pytest.raises(pl.exceptions.ComputeError):
+                pl.scan_database(write, POSTGRES, driver=driver).collect()
+        assert live.execute("SELECT count(*) FROM fix_once_w").fetchone() == (0,)
+
+        nextval = "SELECT nextval('fix_once_s') AS n"
+        expected = 0
+        for source in [POSTGRES, live]:
+            kw = {"driver": "connectorx"} if source is POSTGRES else {}
+            for pushdown in [False, True]:
+                n = pl.scan_database(nextval, source, pushdown=pushdown, **kw).collect()
+                expected += 1
+                assert n.item() == expected
+                last = live.execute("SELECT last_value FROM fix_once_s").fetchone()
+                assert last == (expected,)
+    finally:
+        live.close()
+        _execute(
+            "postgres17",
+            ["DROP TABLE IF EXISTS fix_once_w", "DROP SEQUENCE IF EXISTS fix_once_s"],
+        )
+
+
+@pytest.mark.parametrize("name", ["mysql", "mariadb"])
+def test_mysql_query_order_by_is_kept(name: str) -> None:
+    # MariaDB drops the ORDER BY of a derived table without LIMIT: such a query isn't
+    # wrapped there
+    _execute(
+        name,
+        [
+            "DROP TABLE IF EXISTS fix_order",
+            "CREATE TABLE fix_order (id int PRIMARY KEY, x int, KEY (x))",
+            "INSERT INTO fix_order VALUES "
+            + ", ".join(f"({i}, {(i * 31) % 100 + 1})" for i in range(100)),
+        ],
+    )
+    try:
+        for driver in ["pymysql", "factory"]:
+            lf = _scan(name, driver, "SELECT id, x FROM fix_order ORDER BY x DESC")
+            assert lf.head(3).collect()["x"].to_list() == [100, 99, 98]
+            assert lf.collect()["x"].to_list() == list(range(100, 0, -1))
+            out = lf.filter(pl.col("x") < 50).head(2).collect()
+            assert out["x"].to_list() == [49, 48]
+            pushed = "pushdown: off" not in lf.explain()
+            assert pushed is (name == "mysql")
+    finally:
+        _execute(name, ["DROP TABLE IF EXISTS fix_order"])
+
+
+@pytest.mark.parametrize("name", ["mysql", "mariadb"])
+def test_mysql_query_ending_in_comments(name: str) -> None:
+    for query in [
+        "SELECT id FROM edge WHERE id < 3 # a comment",
+        "SELECT id FROM edge WHERE id < 3; -- done",
+        "SELECT id FROM edge WHERE id < 3; # done",
+    ]:
+        lf = _scan(name, "pymysql", query)
+        assert sorted(lf.filter(pl.col("id") >= 1).collect()["id"].to_list()) == [1, 2]

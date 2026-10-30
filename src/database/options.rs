@@ -226,6 +226,14 @@ impl DatabaseScanOptions {
         }
     }
 
+    /// The options with a query source's SQL replaced.
+    pub fn with_query_sql(self: Arc<Self>, sql: PlSmallStr) -> Arc<Self> {
+        Arc::new(Self {
+            relation: DatabaseRelation::Query { sql },
+            ..(*self).clone()
+        })
+    }
+
     /// A stable hash of the scan, for deduplication. It covers secrets too (see
     /// [`ConnectionSpec::fingerprint`]) and is never shown.
     pub fn fingerprint(&self) -> u64 {

@@ -285,6 +285,8 @@ pub struct QueryFacts {
     /// Returns the same rows each time it runs on the same data: no `LIMIT` / `OFFSET` /
     /// `FETCH` / `TOP` (which pick rows), no `TABLESAMPLE`, no random functions.
     pub repeatable: bool,
+    /// The query without the semicolons and comments after its last token, if it parses.
+    pub body: Option<PlSmallStr>,
 }
 
 /// Turns [`SqlQuery`] into SQL text for a dialect.

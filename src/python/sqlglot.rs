@@ -70,6 +70,10 @@ impl SqlRenderer for SqlglotRenderer {
                 Some(v) if !v.is_none() => Some(v.extract()?),
                 _ => None,
             };
+            let body: Option<String> = match d.get_item("body")? {
+                Some(v) if !v.is_none() => Some(v.extract()?),
+                _ => None,
+            };
             PyResult::Ok(QueryFacts {
                 parses: get("parses")?,
                 single_select: get("single_select")?,
@@ -78,6 +82,7 @@ impl SqlRenderer for SqlglotRenderer {
                 output_columns: output_columns.map(|v| v.into_iter().map(Into::into).collect()),
                 read_only: get("read_only")?,
                 repeatable: get("repeatable")?,
+                body: body.map(Into::into),
             })
         })
         .map_err(|e| polars_err!(ComputeError: "sqlglot could not inspect the query: {e}"))

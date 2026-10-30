@@ -8,6 +8,7 @@ that imports sqlglot, and it only runs on the machine that plans the query.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import secrets
 from typing import Any
@@ -272,8 +273,8 @@ def render(query_json: str, dialect: str | None) -> str:
     from_ = query["from"]
     if "Subquery" in from_:
         sub = from_["Subquery"]
-        # a newline ends a trailing `--` comment of the user's query
-        end = "\n" if "--" in sub else ""
+        # a newline ends a trailing `--` (or MySQL `#`) comment of the user's query
+        end = "\n" if "--" in sub or "#" in sub else ""
         sql = sql.replace(_SUBQUERY_PLACEHOLDER, f"({sub}{end})", 1)
     return sql
 
@@ -318,11 +319,16 @@ _VOLATILE_FUNCTIONS = frozenset(
         "uuidv4",
         "uuidv7",
         "nextval",
-        # the time of the call or statement; `now()` / `CURRENT_TIMESTAMP` are the
-        # transaction's (and SQL Server's `SYSDATETIME()` its statement's), so not listed
+        # the time of the call, statement or transaction: partitions, and a count and
+        # its read, run in transactions of their own (typed nodes: `_VOLATILE_NODES`)
         "clock_timestamp",
         "statement_timestamp",
+        "transaction_timestamp",
         "timeofday",
+        "now",
+        "current_timestamp",
+        "get_current_timestamp",
+        "today",
         # SQLite
         "randomblob",
         # SQL Server
@@ -339,6 +345,17 @@ _VOLATILE_FUNCTIONS = frozenset(
         "uuid_v7",
         "random_bytes",
         "sysdate",
+        "curdate",
+        "curtime",
+        "unix_timestamp",
+        "utc_timestamp",
+        "localtimestamp",
+        # SQL Server
+        "getdate",
+        "getutcdate",
+        "sysdatetime",
+        "sysutcdatetime",
+        "sysdatetimeoffset",
         # ClickHouse (and its `rand*` family, see `_is_volatile`)
         "generateuuidv4",
         "generateuuidv7",
@@ -346,6 +363,8 @@ _VOLATILE_FUNCTIONS = frozenset(
         "generateserialid",
         "generatesnowflakeid",
         "fuzzbits",
+        "now64",
+        "yesterday",
         # Snowflake
         "uuid_string",
         "seq1",
@@ -359,7 +378,27 @@ _VOLATILE_NODES = tuple(
     node
     for node in (
         getattr(exp, name, None)
-        for name in ("Rand", "Randn", "Uuid", "Seq1", "Seq2", "Seq4", "Seq8")
+        for name in (
+            "Rand",
+            "Randn",
+            "Uuid",
+            "Seq1",
+            "Seq2",
+            "Seq4",
+            "Seq8",
+            # `now()`, `CURRENT_TIMESTAMP`, `SYSDATE`, `GETDATE()`, ...
+            "CurrentDate",
+            "CurrentDatetime",
+            "CurrentTime",
+            "CurrentTimestamp",
+            "CurrentTimestampLTZ",
+            "Localtime",
+            "Localtimestamp",
+            "Systimestamp",
+            "UtcDate",
+            "UtcTime",
+            "UtcTimestamp",
+        )
     )
     if node is not None
 )
@@ -372,6 +411,11 @@ def _is_volatile(node: Any, dialect: str | None, relations: set[str]) -> bool:
         name = node.name.lower()
         return name in _VOLATILE_FUNCTIONS or (
             dialect == "clickhouse" and name.startswith("rand")
+        )
+    if isinstance(node, exp.Literal) and node.is_string:
+        # SQLite's `datetime('now')`, Postgres' `'now'::timestamp`
+        return node.name.strip().lower() in ("now", "today") and isinstance(
+            node.parent, (exp.Func, exp.Cast)
         )
     if isinstance(node, exp.Dot):
         # Oracle `DBMS_RANDOM.RANDOM()`, `DBMS_CRYPTO.RANDOMBYTES(…)`
@@ -410,12 +454,29 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
         "output_columns": None,
         "read_only": False,
         "repeatable": False,
+        "body": None,
     }
     try:
-        statements = [s for s in sqlglot.parse(sql, read=dialect) if s is not None]
+        # a comment after the last `;` parses as a statement of its own
+        statements = [
+            s
+            for s in sqlglot.parse(sql, read=dialect)
+            if s is not None and not isinstance(s, exp.Semicolon)
+        ]
+        tokens = sqlglot.Dialect.get_or_raise(dialect).tokenize(sql)
     except sqlglot.errors.SqlglotError:
         return facts
     facts["parses"] = True
+    # the query without the semicolons and comments after its last token, which can't
+    # go inside `(...)` (MySQL's `#` comment would comment out the parenthesis)
+    while tokens and tokens[-1].token_type == sqlglot.TokenType.SEMICOLON:
+        tokens.pop()
+    if tokens and len(statements) == 1:
+        body = sql[: tokens[-1].end + 1]
+        with contextlib.suppress(sqlglot.errors.SqlglotError):
+            # only what the tokens say is the same query
+            if sqlglot.parse(body, read=dialect) == statements:
+                facts["body"] = body
     facts["read_only"] = len(statements) == 1 and _is_read_only(statements[0])
     if len(statements) != 1 or not isinstance(statements[0], exp.Query):
         return facts
@@ -436,7 +497,7 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
         exp.Limit, exp.Fetch, exp.Offset, exp.TableSample
     ) is None and not any(
         _is_volatile(node, dialect, relations)
-        for node in stmt.find_all(exp.Func, exp.Dot, exp.Column)
+        for node in stmt.find_all(exp.Func, exp.Dot, exp.Column, exp.Literal)
     )
     selects = stmt.selects
     if selects and not any(isinstance(s, exp.Star) or s.is_star for s in selects):

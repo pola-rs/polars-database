@@ -1280,3 +1280,40 @@ def test_restored_setting_literals() -> None:
     # independent of `standard_conforming_strings`
     assert _sql_str("a\\b'c", dialect="postgresql") == "E'a\\\\b''c'"
     assert _sql_str("a\\b", dialect="mysql") == "'a\\\\b'"
+
+
+def test_scan_query_ending_in_a_semicolon_and_comments(shop_uri: str) -> None:
+    pytest.importorskip("adbc_driver_sqlite")
+    for query in [
+        "SELECT id FROM orders WHERE id < 5; -- done",
+        "SELECT id FROM orders WHERE id < 5 /* done */ ;;",
+        "SELECT id FROM orders WHERE id < 5 -- done",
+    ]:
+        lf = pl.scan_database(query, shop_uri).filter(pl.col("id") > 2)
+        assert "(1 exact)" in lf.explain(), query
+        assert sorted(lf.collect()["id"].to_list()) == [3, 4], query
+
+
+def test_scan_unparseable_query_must_be_a_plain_select(shop_uri: str) -> None:
+    # sqlglot can't parse `USING <`; SQLite sessions aren't read-only, so only a
+    # plain SELECT is taken
+    for query in [
+        "WITH d AS (SELECT id FROM orders) SELECT * FROM d ORDER BY id USING <",
+        "SELECT id INTO t2 FROM orders ORDER BY id USING <",
+    ]:
+        lf = pl.scan_database(query, shop_uri, source_type="query")
+        with pytest.raises(
+            pl.exceptions.InvalidOperationError, match="can't be parsed"
+        ):
+            lf.collect_schema()
+
+
+def test_scan_now_dependent_query_isnt_partitioned(shop_uri: str) -> None:
+    lf = pl.scan_database(
+        "SELECT * FROM orders WHERE day < date('now')",
+        shop_uri,
+        partition_on="id",
+        partition_num=4,
+    )
+    with pytest.raises(pl.exceptions.InvalidOperationError, match="current time"):
+        lf.collect()

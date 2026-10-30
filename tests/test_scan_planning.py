@@ -894,11 +894,20 @@ def test_mysql_tls_check_rejects_a_plain_connection() -> None:
         ("mysql", "SELECT UUID(), SYSDATE()", False),
         ("clickhouse", "SELECT rand64()", False),
         ("snowflake", "SELECT seq4()", False),
-        # a column named nextval; the transaction's time
+        # the transaction's time: a count and its read run in two transactions
+        ("postgres", "SELECT * FROM t WHERE ts > now() - interval '1 hour'", False),
+        ("postgres", "SELECT id, CURRENT_TIMESTAMP, CURRENT_DATE FROM t", False),
+        ("postgres", "SELECT 'now'::timestamp", False),
+        ("mysql", "SELECT NOW()", False),
+        ("mysql", "SELECT * FROM t WHERE d > CURDATE()", False),
+        ("sqlite", "SELECT datetime('now')", False),
+        ("tsql", "SELECT GETDATE()", False),
+        ("oracle", "SELECT SYSTIMESTAMP FROM dual", False),
+        ("clickhouse", "SELECT today()", False),
+        # a column named nextval; a string 'now'
         ("postgres", "SELECT t.nextval FROM t", True),
         ("oracle", "SELECT x.nextval FROM t x", True),
-        ("postgres", "SELECT id, now() FROM t", True),
-        ("mysql", "SELECT NOW()", True),
+        ("postgres", "SELECT id FROM t WHERE s = 'now'", True),
     ],
 )
 def test_volatile_functions_make_a_query_not_repeatable(

@@ -50,10 +50,11 @@ fn strip_statement_end(sql: &str) -> &str {
     sql.trim().trim_end_matches(';').trim_end()
 }
 
-/// The query as it goes inside `(...)`: a newline ends a trailing `--` comment.
+/// The query as it goes inside `(...)`: a newline ends a trailing `--` (or MySQL `#`)
+/// comment.
 fn wrappable(sql: &str) -> String {
     let sql = strip_statement_end(sql);
-    if sql.contains("--") {
+    if sql.contains("--") || sql.contains('#') {
         format!("{sql}\n")
     } else {
         sql.to_string()
@@ -69,7 +70,15 @@ const WRITE_KEYWORDS: &[&str] = &[
 
 /// `scan_database` only reads. A query source that writes is rejected, whichever driver runs
 /// it; sessions are read-only too where the dialect allows it.
-fn check_read_only(sql: &str, facts: Option<&QueryFacts>) -> PolarsResult<()> {
+///
+/// A query that can't be parsed (`facts` is `None` then, or doesn't parse) can't be checked:
+/// it must be plainly one `SELECT`, unless every session is read-only
+/// ([`read_only_session`]), so the database refuses a write itself.
+fn check_read_only(
+    sql: &str,
+    facts: Option<&QueryFacts>,
+    read_only_session: bool,
+) -> PolarsResult<()> {
     if let Some(facts) = facts.filter(|f| f.parses) {
         polars_ensure!(
             facts.read_only,
@@ -84,7 +93,37 @@ fn check_read_only(sql: &str, facts: Option<&QueryFacts>) -> PolarsResult<()> {
         !WRITE_KEYWORDS.contains(&first.as_str()),
         InvalidOperation: "{first} statements are not valid read queries for scan_database"
     );
+    polars_ensure!(
+        read_only_session || plain_select(sql),
+        InvalidOperation:
+        "scan_database only runs read queries, and this query can't be parsed to check that \
+        it is one (a WITH may hold a write); write it as one plain SELECT (no INTO, no `;` \
+        inside), or connect with a URI of a driver whose sessions are read-only"
+    );
     Ok(())
+}
+
+/// A query that is one `SELECT` without `INTO` (`SELECT … INTO t` creates a table), as far as
+/// its words show: a statement that can't be parsed is taken as a write otherwise.
+fn plain_select(sql: &str) -> bool {
+    let sql = strip_statement_end(sql);
+    first_keyword(sql).eq_ignore_ascii_case("SELECT")
+        && !sql.contains(';')
+        && !sql
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .any(|w| w.eq_ignore_ascii_case("INTO"))
+}
+
+/// Whether every session of a scan is read-only, so that the database refuses a write: the
+/// session setup makes it so (Postgres, MySQL), where it runs (not on a live connection,
+/// nor on ConnectorX or arrow-odbc, which have no sessions).
+fn read_only_session(dialect: DialectName, backend: &BackendKind, live: bool) -> bool {
+    !live
+        && backend.has_sessions()
+        && dialect
+            .session_setup()
+            .iter()
+            .any(|s| s.sql.contains("READ ONLY"))
 }
 
 /// The first word of a statement, after comments.
@@ -130,6 +169,39 @@ fn wrap_blocker(facts: &QueryFacts, dialect: DialectName) -> Option<&'static str
     None
 }
 
+/// What schema discovery may do with a query source.
+#[derive(Default)]
+struct QueryDiscovery {
+    /// It can go inside `SELECT … FROM (…) WHERE 1 = 0`, which returns its columns without
+    /// running it (`wrap_blocker`).
+    wrappable: bool,
+    parses: bool,
+    /// Running it can't write, nor give other rows each time (it parses as a read without
+    /// volatile functions, or every session is read-only).
+    pure_read: bool,
+    /// It parses, and has volatile functions (`nextval`, `random()`): it may return other
+    /// rows, or change something, each time it runs.
+    volatile: bool,
+    /// A MySQL-dialect query with a top-level `ORDER BY` and no `LIMIT`.
+    mariadb_order_by: bool,
+}
+
+const MARIADB_ORDER_BY: &str = "MariaDB ignores the ORDER BY of a query inside a derived table";
+
+/// Whether the MySQL-dialect server is a MariaDB.
+fn is_mariadb(session: &mut dyn DatabaseSession) -> bool {
+    match session.query("SELECT VERSION()") {
+        Ok(df) => df.columns().first().is_some_and(|c| {
+            c.cast(&DataType::String)
+                .ok()
+                .and_then(|c| c.str().ok()?.get(0).map(|v| v.to_ascii_lowercase()))
+                .is_some_and(|v| v.contains("mariadb"))
+        }),
+        // unknown: taken as a MariaDB, whose order would be lost
+        Err(_) => true,
+    }
+}
+
 /// Resolves a scan: dialect, backend, schema and catalog metadata. Runs once per resolver, when
 /// Polars first needs the schema. Partitions and SQL are left to [`compile_scan`].
 pub fn resolve_scan(
@@ -172,9 +244,16 @@ pub fn resolve_scan(
     // A query that can't be wrapped runs as given, without pushdown.
     let mut pushdown_disabled: Option<PlSmallStr> =
         (!options.pushdown).then(|| "pushdown=False".into());
+    let mut query = QueryDiscovery {
+        wrappable: true,
+        ..Default::default()
+    };
     if let DatabaseRelation::Query { sql } = &options.relation {
-        let facts = sql_renderer().and_then(|r| r.inspect_query(sql, dialect));
-        check_read_only(sql, facts.as_ref().ok())?;
+        let sql = sql.clone();
+        let facts = sql_renderer().and_then(|r| r.inspect_query(&sql, dialect));
+        let read_only_session =
+            read_only_session(dialect, &backend.kind, options.connection.is_live());
+        check_read_only(&sql, facts.as_ref().ok(), read_only_session)?;
         // Each partition runs the query again: it must pick the same rows every time.
         if let Ok(facts) = &facts
             && facts.parses
@@ -187,20 +266,49 @@ pub fn resolve_scan(
             polars_bail!(
                 InvalidOperation:
                 "this query can't be partitioned: each partition runs it again, and with \
-                LIMIT, OFFSET, TABLESAMPLE or a random function it may return other rows \
-                each time; pass partition_on=None, or partition a table"
+                LIMIT, OFFSET, TABLESAMPLE, a random function or the current time it may \
+                return other rows each time; pass partition_on=None, or partition a table"
             );
         }
+        // `SELECT …; -- done`: the trailing `;` and comments can't go inside `(...)`.
+        if let Ok(QueryFacts {
+            body: Some(body), ..
+        }) = &facts
+            && *body != sql
+        {
+            options = options.with_query_sql(body.clone());
+        }
         let blocker = match &facts {
-            _ if pushdown_disabled.is_some() => None,
             Ok(facts) => wrap_blocker(facts, dialect).map(PlSmallStr::from),
             Err(e) => Some(format!("the query could not be inspected: {e}").into()),
         };
-        if let Some(reason) = blocker {
-            if verbose() {
-                eprintln!("[scan_database]: pushdown disabled: {reason}");
-            }
+        query = QueryDiscovery {
+            wrappable: blocker.is_none(),
+            parses: facts.as_ref().is_ok_and(|f| f.parses),
+            // running it can't change anything, nor give other rows
+            pure_read: read_only_session
+                || facts
+                    .as_ref()
+                    .is_ok_and(|f| f.parses && f.read_only && f.repeatable),
+            volatile: facts.as_ref().is_ok_and(|f| f.parses && !f.repeatable),
+            mariadb_order_by: dialect == DialectName::Mysql
+                && facts
+                    .as_ref()
+                    .is_ok_and(|f| f.top_level_order_by_without_limit),
+        };
+        if let Some(reason) = blocker
+            && pushdown_disabled.is_none()
+        {
             pushdown_disabled = Some(reason);
+        }
+        if query.mariadb_order_by && user_schema.is_some() && pushdown_disabled.is_none() {
+            // Without I/O, the server may be a MariaDB (see below).
+            pushdown_disabled = Some(MARIADB_ORDER_BY.into());
+        }
+        if verbose()
+            && let Some(reason) = &pushdown_disabled
+        {
+            eprintln!("[scan_database]: pushdown disabled: {reason}");
         }
     }
 
@@ -234,6 +342,15 @@ pub fn resolve_scan(
         let backend_impl = open_backend(&backend, options.fetch.batch_size)?;
         let mut session =
             open_session_with_retries(backend_impl.as_ref(), &options.connection, dialect)?;
+        // MariaDB drops the `ORDER BY` of a derived table without `LIMIT`: the wrapped
+        // query would return its rows in another order (and `head` other rows).
+        // (Its schema is still found wrapped: the order doesn't matter there.)
+        if query.mariadb_order_by && pushdown_disabled.is_none() && is_mariadb(session.as_mut()) {
+            if verbose() {
+                eprintln!("[scan_database]: pushdown disabled: {MARIADB_ORDER_BY}");
+            }
+            pushdown_disabled = Some(MARIADB_ORDER_BY.into());
+        }
         // The catalog first: some declared types are read as text (`text_conversion`), and
         // discovery must select them the same way the scan will.
         let discover = |session: &mut dyn DatabaseSession, options: &DatabaseScanOptions| {
@@ -248,7 +365,7 @@ pub fn resolve_scan(
                 session,
                 options,
                 dialect,
-                pushdown_disabled.is_some(),
+                &query,
                 select_list.as_deref(),
                 &info,
             )?;
@@ -684,28 +801,54 @@ fn discover_schema(
     session: &mut dyn DatabaseSession,
     options: &DatabaseScanOptions,
     dialect: DialectName,
-    unwrapped: bool,
+    query: &QueryDiscovery,
     select_list: Option<&[SqlSelectItem]>,
     info: &CatalogInfo,
 ) -> PolarsResult<Schema> {
-    let sql = match (&options.relation, unwrapped) {
-        // A query that can't be wrapped is run as is; only its first batch is read.
-        (DatabaseRelation::Query { sql }, true) => strip_statement_end(sql).to_string(),
-        (relation, _) => format!(
-            "SELECT {} FROM {} WHERE 1 = 0",
-            select_list.map_or_else(|| "*".to_string(), |s| fixed_select_list(dialect, s)),
-            quoted_relation(dialect, relation)
-        ),
+    let is_query = matches!(options.relation, DatabaseRelation::Query { .. });
+    let probe = format!(
+        "SELECT {} FROM {} WHERE 1 = 0",
+        select_list.map_or_else(|| "*".to_string(), |s| fixed_select_list(dialect, s)),
+        quoted_relation(dialect, &options.relation)
+    );
+    let first_batch = |session: &mut dyn DatabaseSession, sql: &str| {
+        if verbose() {
+            eprintln!("[scan_database]: schema from: {sql}");
+        }
+        let mut batches = session.execute(sql, Some(1))?;
+        match batches.next().transpose()? {
+            Some(first) => Ok(first),
+            None => polars_bail!(
+                ComputeError: "database returned no result for the schema query: {sql}"
+            ),
+        }
     };
-    if verbose() {
-        eprintln!("[scan_database]: schema from: {sql}");
-    }
-    let first = {
-        let mut batches = session.execute(&sql, Some(1))?;
-        batches.next().transpose()?
-    };
-    let Some(first) = first else {
-        polars_bail!(ComputeError: "database returned no result for the schema query: {sql}");
+    // A query is never run whole to find its schema: the read runs it, and running it
+    // twice could write twice (`nextval`). One that can't be wrapped is probed wrapped
+    // all the same if it doesn't parse (the database may take it); else it is run, for
+    // its first batch, only if that can't change anything.
+    let mut ran_query = false;
+    let first = match &options.relation {
+        DatabaseRelation::Query { sql } if !query.wrappable => {
+            let probed = match query.parses {
+                false => first_batch(session, &probe),
+                true => Err(polars_err!(ComputeError: "the query can't be wrapped")),
+            };
+            match probed {
+                Ok(first) => first,
+                Err(_) if query.pure_read => {
+                    ran_query = true;
+                    first_batch(session, strip_statement_end(sql))?
+                },
+                Err(e) => polars_bail!(
+                    InvalidOperation:
+                    "the schema of this query can't be found without running it, which the \
+                    read would then do again; pass schema=..., or write the query so that \
+                    it can go inside a derived table: {e}"
+                ),
+            }
+        },
+        _ => first_batch(session, &probe)?,
     };
 
     let mut schema: Schema = first
@@ -716,12 +859,12 @@ fn discover_schema(
 
     // Row-wise drivers can't type columns of an empty result, and SQLite has no column
     // types at all (ADBC calls every column of an empty result Int64). Type them from a
-    // sample.
+    // sample, which runs a query: not one known to be volatile (`nextval`). SQLite's
+    // functions can't write.
     let sample_types = dialect == DialectName::Sqlite;
     let untyped = sample_types || schema.iter().any(|(_, dt)| dt.is_null());
-    // An unwrapped query was typed from its first batch already.
-    let ran_query = unwrapped && matches!(options.relation, DatabaseRelation::Query { .. });
-    if untyped && !ran_query && dialect.supports_limit() {
+    let may_sample = !is_query || !query.volatile || sample_types;
+    if untyped && !ran_query && may_sample && dialect.supports_limit() {
         let renderer = sql_renderer()?;
         let items = select_list.map_or_else(|| vec![SqlSelectItem::Star], <[_]>::to_vec);
         let mut query = SqlQuery::select(items, from_clause(options));
@@ -1245,14 +1388,60 @@ mod tests {
     #[test]
     fn keyword_guard() {
         assert_eq!(first_keyword("  -- x\n /* y */ (SELECT 1)"), "SELECT");
-        assert!(check_read_only("DELETE FROM t", None).is_err());
-        assert!(check_read_only("/* c */ insert into t values (1)", None).is_err());
-        assert!(check_read_only("SELECT * FROM t", None).is_ok());
+        assert!(check_read_only("DELETE FROM t", None, true).is_err());
+        assert!(check_read_only("/* c */ insert into t values (1)", None, true).is_err());
+        assert!(check_read_only("SELECT * FROM t", None, false).is_ok());
         let facts = QueryFacts {
             parses: true,
             read_only: false,
             ..Default::default()
         };
-        assert!(check_read_only("WITH d AS (DELETE FROM t) SELECT 1", Some(&facts)).is_err());
+        let cte = "WITH d AS (DELETE FROM t) SELECT 1";
+        assert!(check_read_only(cte, Some(&facts), true).is_err());
+        // a query that doesn't parse: only plainly a SELECT, unless the session refuses
+        // writes itself
+        for sql in [
+            cte,
+            "SELECT * INTO t2 FROM t",
+            "SELECT 1; DELETE FROM t",
+            "WITH d AS (SELECT 1) SELECT * FROM d",
+        ] {
+            assert!(check_read_only(sql, None, false).is_err(), "{sql}");
+            assert!(check_read_only(sql, None, true).is_ok(), "{sql}");
+        }
+        assert!(check_read_only("(SELECT a FROM t USING <);", None, false).is_ok());
+        assert!(read_only_session(
+            DialectName::Postgresql,
+            &BackendKind::Python {
+                module: "psycopg".into()
+            },
+            false
+        ));
+        assert!(!read_only_session(
+            DialectName::Postgresql,
+            &BackendKind::ConnectorX,
+            false
+        ));
+        assert!(!read_only_session(
+            DialectName::Mysql,
+            &BackendKind::Adbc {
+                driver: "mysql".into()
+            },
+            true
+        ));
+        assert!(!read_only_session(
+            DialectName::Sqlite,
+            &BackendKind::Adbc {
+                driver: "sqlite".into()
+            },
+            false
+        ));
+    }
+
+    #[test]
+    fn wrapped_comments_end_with_a_newline() {
+        assert_eq!(wrappable("SELECT 1 -- x"), "SELECT 1 -- x\n");
+        assert_eq!(wrappable("SELECT 1 # x"), "SELECT 1 # x\n");
+        assert_eq!(wrappable("SELECT 1;"), "SELECT 1");
     }
 }
