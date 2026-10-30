@@ -353,7 +353,12 @@ def test_pin_is_final(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_no_driver_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from polars_database import _bridge
+
     _hide_modules(monkeypatch, "connectorx", "trino", "sqlalchemy", "adbc_driver_trino")
+    # the hint is the same whether or not adbc_driver_manager is installed (it isn't on
+    # Windows CI)
+    monkeypatch.setattr(_bridge, "has_adbc_driver_manager", lambda: True)
     lf = pl.scan_database("t", "trino://u@h/c", schema={"x": pl.Int64})
     with pytest.raises(pl.exceptions.ComputeError) as exc:
         lf.collect_schema()

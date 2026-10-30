@@ -895,8 +895,19 @@ def test_scan_duckdb_session_default_collation() -> None:
     assert "(0 exact)" in lf.filter(pl.col("v") == "abc").explain()
 
 
+def _importorskip_sqlite_driver(driver: str) -> None:
+    pytest.importorskip(
+        {"adbc": "adbc_driver_sqlite", "sqlite3": "sqlite3"}.get(driver, driver)
+    )
+
+
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
 @pytest.mark.parametrize("source", ["t", "SELECT * FROM t"])
-def test_scan_sqlite_strings_without_text_affinity(tmp_path: Path, source: str) -> None:
+def test_scan_sqlite_strings_without_text_affinity(
+    tmp_path: Path, source: str, driver: str
+) -> None:
+    # a column whose values have several storage classes (ConnectorX reads it as text)
+    _importorskip_sqlite_driver(driver)
     path = tmp_path / "t.db"
     with closing(sqlite3.connect(path)) as conn:
         conn.execute("CREATE TABLE t (id INTEGER, n NUMERIC, x, s TEXT COLLATE NOCASE)")
@@ -911,8 +922,9 @@ def test_scan_sqlite_strings_without_text_affinity(tmp_path: Path, source: str) 
             ],
         )
         conn.commit()
-    lf = pl.scan_database(source, f"sqlite:///{path}")
+    lf = pl.scan_database(source, f"sqlite:///{path}", driver=driver)
     assert lf.collect_schema()["n"] == pl.String
+    assert lf.collect()["n"].to_list() == ["abc", "1", "10", "9", "x"]
     _assert_filters_match(
         lf,
         [
@@ -1020,7 +1032,6 @@ def test_connectorx_checks_the_connection_once(
 ) -> None:
     # a failed login fails `connect`, rather than every catalog lookup in turn
     from polars.io.database import _utils
-
     from polars_database import _bridge
 
     calls: list[str] = []
@@ -1202,7 +1213,11 @@ def test_scan_empty_sqlite_table_is_typed_by_affinity(
     assert lf.collect().rows() == [(1, "x", 1.5, b"\x00", "2020-01-02")]
 
 
-def test_scan_sqlite_user_schema_string_isnt_taken_as_text(tmp_path: Path) -> None:
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
+def test_scan_sqlite_user_schema_string_isnt_taken_as_text(
+    tmp_path: Path, driver: str
+) -> None:
+    _importorskip_sqlite_driver(driver)
     path = tmp_path / "t.db"
     with closing(sqlite3.connect(path)) as conn:
         conn.execute("CREATE TABLE t (id INTEGER, x, c CHAR(3))")
@@ -1211,10 +1226,11 @@ def test_scan_sqlite_user_schema_string_isnt_taken_as_text(tmp_path: Path) -> No
         )
         conn.commit()
     schema = {"id": pl.Int64, "x": pl.String, "c": pl.String}
-    lf = pl.scan_database("t", f"sqlite:///{path}", schema=schema)
+    lf = pl.scan_database("t", f"sqlite:///{path}", schema=schema, driver=driver)
     _assert_filters_match(lf, [pl.col("x") == "10", pl.col("x") != "10"])
     # SQLite doesn't pad CHAR(n): its strings compare exactly
-    exact = pl.scan_database("t", f"sqlite:///{path}").filter(pl.col("c") == "a")
+    exact = pl.scan_database("t", f"sqlite:///{path}", driver=driver)
+    exact = exact.filter(pl.col("c") == "a")
     assert "(1 exact)" in exact.explain()
     assert exact.collect()["id"].to_list() == [1]
 
@@ -1280,6 +1296,25 @@ def test_restored_setting_literals() -> None:
     # independent of `standard_conforming_strings`
     assert _sql_str("a\\b'c", dialect="postgresql") == "E'a\\\\b''c'"
     assert _sql_str("a\\b", dialect="mysql") == "'a\\\\b'"
+
+
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
+def test_scan_sqlite_numbers_of_two_storage_classes(
+    tmp_path: Path, driver: str
+) -> None:
+    # integers and reals in a NUMERIC column (ConnectorX reads them as reals)
+    _importorskip_sqlite_driver(driver)
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, n NUMERIC, b)")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?, ?)",
+            [(1, 1, b"\x01"), (2, 1.5, b"\x02"), (3, None, None)],
+        )
+        conn.commit()
+    df = pl.scan_database("t", f"sqlite:///{path}", driver=driver).collect()
+    assert df.schema == pl.Schema({"id": pl.Int64, "n": pl.Float64, "b": pl.Binary})
+    assert df["n"].to_list() == [1.0, 1.5, None]
 
 
 @pytest.mark.parametrize("driver", ["adbc", "sqlite3"])

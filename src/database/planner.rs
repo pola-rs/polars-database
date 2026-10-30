@@ -365,6 +365,7 @@ pub fn resolve_scan(
                 session,
                 options,
                 dialect,
+                &backend.kind,
                 &query,
                 select_list.as_deref(),
                 &info,
@@ -493,6 +494,18 @@ pub fn resolve_scan(
         }
     }
 
+    // ConnectorX can't read a SQLite column whose values have several storage classes
+    // (`'abc'` and `1`), which a String (or a Float64: `1` and `1.5`) column may hold.
+    if matches!(backend.kind, BackendKind::ConnectorX) && dialect == DialectName::Sqlite {
+        for c in columns.iter_mut() {
+            match c.dtype {
+                DataType::String => c.db_type = Some(CONNECTORX_SQLITE_TEXT.into()),
+                DataType::Float64 => c.db_type = Some(CONNECTORX_SQLITE_REAL.into()),
+                _ => {},
+            }
+        }
+    }
+
     let schema = match &options.schema_overrides {
         Some(overrides) if !overrides.is_empty() => {
             let mut schema = (*schema).clone();
@@ -573,6 +586,10 @@ fn alias_shadows_column(dialect: DialectName) -> bool {
 
 /// The `db_type` of a query's decimal column read through ConnectorX: selected as text.
 const CONNECTORX_DECIMAL: &str = "<connectorx decimal>";
+/// The `db_type` of a SQLite String / Float64 column read through ConnectorX: its values
+/// converted to text / reals, as the other drivers read them.
+const CONNECTORX_SQLITE_TEXT: &str = "<connectorx sqlite text>";
+const CONNECTORX_SQLITE_REAL: &str = "<connectorx sqlite real>";
 
 /// SQL that converts a column of a declared type where the backend can't read it as is, or
 /// `None` to select it as it is.
@@ -582,8 +599,14 @@ fn column_conversion(
     db_type: &str,
     column: &str,
 ) -> Option<String> {
-    if db_type == CONNECTORX_DECIMAL {
+    if db_type == CONNECTORX_DECIMAL || db_type == CONNECTORX_SQLITE_TEXT {
         return Some(dialect.cast_to_text(column));
+    }
+    if db_type == CONNECTORX_SQLITE_REAL {
+        // a text value stays text, and fails the read as it does with other drivers
+        return Some(format!(
+            "CASE WHEN typeof({column}) = 'integer' THEN CAST({column} AS REAL) ELSE {column} END"
+        ));
     }
     if let Some(sql) = dialect.text_conversion(db_type, column) {
         return Some(sql);
@@ -803,6 +826,7 @@ fn discover_schema(
     session: &mut dyn DatabaseSession,
     options: &DatabaseScanOptions,
     dialect: DialectName,
+    backend: &BackendKind,
     query: &QueryDiscovery,
     select_list: Option<&[SqlSelectItem]>,
     info: &CatalogInfo,
@@ -868,10 +892,23 @@ fn discover_schema(
     let may_sample = !is_query || !query.volatile || sample_types;
     if untyped && !ran_query && may_sample && dialect.supports_limit() {
         let renderer = sql_renderer()?;
-        let items = select_list.map_or_else(|| vec![SqlSelectItem::Star], <[_]>::to_vec);
-        let mut query = SqlQuery::select(items, from_clause(options));
-        query.limit = Some(TYPE_SAMPLE_ROWS);
-        let sample_sql = renderer.render(&query, dialect)?;
+        // ConnectorX can't read a SQLite column whose values have several storage classes:
+        // their classes are sampled instead (see `sqlite_class_dtype`).
+        let classes = sample_types && matches!(backend, BackendKind::ConnectorX);
+        let items = if classes {
+            schema
+                .iter_names()
+                .map(|c| SqlSelectItem::Expr {
+                    sql: format!("typeof({})", dialect.quote_ident(c)),
+                    alias: c.clone(),
+                })
+                .collect()
+        } else {
+            select_list.map_or_else(|| vec![SqlSelectItem::Star], <[_]>::to_vec)
+        };
+        let mut sample_query = SqlQuery::select(items, from_clause(options));
+        sample_query.limit = Some(TYPE_SAMPLE_ROWS);
+        let sample_sql = renderer.render(&sample_query, dialect)?;
         if verbose() {
             eprintln!("[scan_database]: typing columns from a sample: {sample_sql}");
         }
@@ -880,7 +917,11 @@ fn discover_schema(
             if (dtype.is_null() || (sample_types && sample.height() > 0))
                 && let Ok(col) = sample.column(name)
             {
-                *dtype = normalize_dtype(col.dtype());
+                *dtype = if classes {
+                    sqlite_class_dtype(col)
+                } else {
+                    normalize_dtype(col.dtype())
+                };
             }
             // No values to type by (ADBC types an empty result's columns Int64): the
             // declared type's affinity tells what values the column holds.
@@ -900,6 +941,23 @@ fn discover_schema(
         }
     }
     Ok(schema)
+}
+
+/// The dtype of a SQLite column by the storage classes (`typeof`) of its sampled values, as
+/// the other drivers type them; `Null` without values.
+fn sqlite_class_dtype(classes: &Column) -> DataType {
+    let mut seen = PlHashSet::new();
+    if let Ok(ca) = classes.str() {
+        seen.extend(ca.iter().flatten().filter(|c| *c != "null"));
+    }
+    let only = |allowed: &[&str]| seen.iter().all(|c| allowed.contains(c));
+    match () {
+        _ if seen.is_empty() => DataType::Null,
+        _ if only(&["integer"]) => DataType::Int64,
+        _ if only(&["integer", "real"]) => DataType::Float64,
+        _ if only(&["blob"]) => DataType::Binary,
+        _ => DataType::String,
+    }
 }
 
 /// The dtype a SQLite column of declared type `t` reads as, by its type affinity (the
