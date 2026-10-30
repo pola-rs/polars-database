@@ -129,12 +129,13 @@ def test_cancel_on_keyboard_interrupt(driver: str) -> None:
     )
     try:
         deadline = time.monotonic() + 20
-        while _scanning() == 0 and time.monotonic() < deadline:
+        # a second look could fall between two fetches: the first one that saw it counts
+        while (scanning := _scanning()) == 0 and time.monotonic() < deadline:
             if proc.poll() is not None:
                 stderr = proc.stderr.read() if proc.stderr else ""
                 pytest.fail(f"the scan exited early: {stderr}")
             time.sleep(0.1)
-        assert _scanning() > 0, "the scan never started"
+        assert scanning > 0, "the scan never started"
         proc.send_signal(signal.SIGINT)
         try:
             proc.wait(timeout=20)
