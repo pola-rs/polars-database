@@ -7,7 +7,9 @@ dialects, SQL pushdown, partitioning, driver resolution and the ADBC and Python 
 Polars calls the plugin directly from its engine through the versioned FFI contracts in
 [`polars-io-ext-ffi`](https://github.com/pola-rs/polars/tree/main/crates/polars-io-ext-ffi)
 (`lazyframe_resolver.v1`, `file_reader.v1`); compatibility is decided by the plugin IDs the module
-exports, not by the package version.
+exports, not by the package version. Polars also calls a few Python functions of the module (`scan_resolver`,
+`find_adbc_driver`, `driver_statuses`, `dialect_from_scheme`); they stay compatible within a major
+version, which is what Polars' `polars-database >= x, < next major` requirement relies on.
 
 ## Development
 
