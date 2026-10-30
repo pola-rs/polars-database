@@ -1366,3 +1366,24 @@ def test_scan_duckdb_session_null_order(tmp_path: Path) -> None:
             assert k == sorted(v for v in k if v is not None) + [None] * 10
     finally:
         conn.close()
+
+
+def test_scan_numpy_params_arent_merged() -> None:
+    # two arrays whose reprs are the same (NumPy elides the middle)
+    duckdb = pytest.importorskip("duckdb")
+    np = pytest.importorskip("numpy")
+    conn = duckdb.connect()
+    try:
+        a = np.arange(2000)
+        b = a.copy()
+        b[1000] = 4999
+        assert repr(a) == repr(b)
+        query = "SELECT range AS id FROM range(5000) WHERE list_contains(?, range)"
+
+        def scan(params: Any) -> pl.LazyFrame:
+            return pl.scan_database(query, conn, params=[params], partition_on=None)
+
+        both = pl.concat([scan(a).select(pl.max("id")), scan(b).select(pl.max("id"))])
+        assert both.collect()["id"].to_list() == [1999, 4999]
+    finally:
+        conn.close()

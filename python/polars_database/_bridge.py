@@ -1157,13 +1157,24 @@ def _transaction_idle(conn: Any) -> bool | None:
             return bool(info.transaction_status == 0)  # psycopg: IDLE
         if callable(status := getattr(conn, "get_transaction_status", None)):
             return bool(status() == 0)  # psycopg2: TRANSACTION_STATUS_IDLE
+        module = _module_of(conn)
+        if module == "pg8000":
+            # its DB-API connections send `BEGIN` before a statement outside one
+            return not conn._in_transaction
+        if module == "pymysql":
+            in_trans = 1  # SERVER_STATUS_IN_TRANS
+            if not conn.get_autocommit() and not conn.server_status & in_trans:
+                # PyMySQL takes the status from OK packets only: a SELECT since may
+                # have begun one, which `DO 0` (an OK packet) shows
+                with conn.cursor() as cursor:
+                    cursor.execute("DO 0")
+            return not conn.server_status & in_trans
         in_transaction = getattr(conn, "in_transaction", None)
         if callable(in_transaction):
             # a SQLAlchemy Connection, which begins one on its first statement
             return not in_transaction()
-        if isinstance(in_transaction, bool) and _module_of(conn) == "sqlite3":
-            # (mysql.connector has the property too, but its connections can't be
-            # used from two threads at once: the user's, and the scan's at its end)
+        if isinstance(in_transaction, bool) and module in ("sqlite3", "mysql"):
+            # sqlite3, and mysql.connector (the status of its last result)
             return not in_transaction
     return None
 
@@ -1510,6 +1521,7 @@ class _Session:
         cx_cursor: Any = None
         cx: Any = None
         frames: Iterator[DataFrame] | None = None
+        idle = False
         try:
             # driver calls hold the lock, yields don't: other scans of the same live
             # connection interleave their calls, and none waits for another's consumer
@@ -1600,6 +1612,14 @@ class _Session:
                 yield df
             if empty:
                 yield empty_frame
+        except Exception:
+            # A failed statement aborts a Postgres transaction: the session's next one
+            # (another catalog lookup) would fail with `InFailedSqlTransaction`, hiding
+            # this error. Rolled back where the transaction is the scan's.
+            if (self.owned and not self._aborted) or idle:
+                with state.lock, contextlib.suppress(Exception):
+                    self.conn.rollback()
+            raise
         finally:
             # Also runs when the reader stops early and drops this generator, which
             # Polars may do after `collect()` returned: on a live connection, nothing

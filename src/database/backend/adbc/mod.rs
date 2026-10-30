@@ -153,7 +153,7 @@ pub fn connect_options(
     spec: &ConnectionSpec,
     dialect: DialectName,
 ) -> PolarsResult<Vec<(CString, CString)>> {
-    let mut uri = adbc_uri(spec, dialect)?;
+    let mut uri = adbc_uri(spec, dialect)?.map(|u| encoded_userinfo(&u).unwrap_or(u));
     // Redshift's ADBC driver isn't libpq.
     if dialect == DialectName::Postgresql
         && let Some(u) = &mut uri
@@ -487,6 +487,19 @@ fn with_userinfo(uri: &str, user: Option<&str>, password: Option<&str>) -> Optio
     Some(format!("{scheme}://{userinfo}{at}{host_and_tail}"))
 }
 
+/// The URI with its password percent-encoded, if it holds an unencoded `/`, `?` or `#`
+/// (`u:Ab#cd/Ef9@h`, which the Python backends accept): drivers end the userinfo at the
+/// first of them.
+fn encoded_userinfo(uri: &str) -> Option<String> {
+    let (_, rest) = uri.split_once("://")?;
+    let at = userinfo_end(rest)?;
+    if at < rest.find(['/', '?', '#']).unwrap_or(rest.len()) {
+        return None;
+    }
+    let (_, password) = rest[..at].split_once(':')?;
+    with_userinfo(uri, None, Some(&percent_decode(password)))
+}
+
 fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -777,6 +790,36 @@ mod tests {
         let h = clickhouse_http_uri("clickhouse://h:8443?secure=true").unwrap();
         assert_eq!(h.uri, "https://h:8443");
         assert!(clickhouse_http_uri("http://h:8123").is_none());
+    }
+
+    #[test]
+    fn unencoded_passwords() {
+        assert_eq!(
+            encoded_userinfo("postgresql://polars:Ab#cd/Ef9@h:5432/db?sslmode=disable").as_deref(),
+            Some("postgresql://polars:Ab%23cd%2FEf9@h:5432/db?sslmode=disable")
+        );
+        assert_eq!(encoded_userinfo("postgresql://u:p%40ss@h/db"), None);
+        assert_eq!(encoded_userinfo("postgresql://localhost:5432/my@db"), None);
+        let spec = ConnectionSpec::new(ConnectionTarget::Uri(
+            "clickhouse://polars:Ab#cd/Ef9@h:8123/db".into(),
+        ));
+        let options = connect_options(&spec, DialectName::Clickhouse).unwrap();
+        let get = |k: &str| {
+            options
+                .iter()
+                .find(|(key, _)| key.to_str() == Ok(k))
+                .map(|(_, v)| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(get("uri").as_deref(), Some("http://h:8123/?database=db"));
+        assert_eq!(get("password").as_deref(), Some("Ab#cd/Ef9"));
+        let spec = ConnectionSpec::new(ConnectionTarget::Uri(
+            "postgresql://polars:Ab#cd/Ef9@h:5432/db".into(),
+        ));
+        let options = connect_options(&spec, DialectName::Postgresql).unwrap();
+        assert_eq!(
+            options[0].1.to_str().unwrap(),
+            "postgresql://polars:Ab%23cd%2FEf9@h:5432/db?connect_timeout=10"
+        );
     }
 
     #[test]

@@ -367,6 +367,8 @@ pub fn is_transient(error: &polars_error::PolarsError) -> bool {
         "unknown database",
         // ConnectorX's own pool already waited ~30s, retrying each connect itself
         "timed out waiting for connection",
+        // SQLAlchemy's pool waited its `pool_timeout` for a connection of the user's pool
+        "queuepool limit",
         // cancelled statements, statement and lock timeouts: SQLSTATE 57014 (Postgres
         // `QueryCanceled`), 55P03, ODBC HYT00, ADBC's CANCELLED status, MySQL 1205 / 3024 /
         // 1317, Oracle ORA-01013 and python-oracledb's call timeout
@@ -613,6 +615,8 @@ mod tests {
             "syntax error at end of input",
             "division by zero",
             "timed out waiting for connection: password authentication failed",
+            "TimeoutError: QueuePool limit of size 1 overflow 0 reached, connection timed \
+             out, timeout 3.00",
             // statement and lock timeouts, cancels
             "QueryCanceled: canceling statement due to statement timeout",
             "ADBC execute failed (CANCELLED) in 'libadbc_driver_postgresql.so': ERROR: \

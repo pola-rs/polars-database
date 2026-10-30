@@ -377,6 +377,8 @@ pub fn resolve_scan(
             // statement can abort the session's transaction).
             Err(e) => match as_written {
                 Some(written) => {
+                    // closed first: a pool of one connection would wait for it
+                    drop(session);
                     session = open_session_with_retries(
                         backend_impl.as_ref(),
                         &written.connection,

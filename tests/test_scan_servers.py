@@ -2443,6 +2443,97 @@ def test_mysql_float_with_digits_and_integer_booleans(name: str) -> None:
         _execute(name, [f"DROP TABLE IF EXISTS {table}"])
 
 
+def _in_transaction(conn: Any) -> bool:
+    module = type(conn).__module__.split(".")[0]
+    if module == "pg8000":
+        return bool(conn._in_transaction)
+    cur = conn.cursor()
+    try:
+        # an OK packet with the server's status (PyMySQL keeps only theirs)
+        cur.execute("DO 0")
+    finally:
+        cur.close()
+    if module == "pymysql":
+        return bool(conn.server_status & 1)
+    return bool(conn.in_transaction)
+
+
+@pytest.mark.parametrize(
+    ("name", "module"),
+    [("postgres17", "pg8000"), ("mysql", "pymysql"), ("mysql", "mysql.connector")],
+)
+def test_live_connection_left_outside_a_transaction(name: str, module: str) -> None:
+    # the transaction a scan opens on a live connection is rolled back: it would hold
+    # locks that block another session's DDL
+    import importlib
+
+    server = SERVERS[name]
+    if server.uri is None:
+        pytest.skip(f"no {name} URI")
+    driver = importlib.import_module(module)
+    p = _parts(server.uri)
+    if module == "pg8000":
+        conn = driver.dbapi.connect(**p)
+    else:
+        conn = driver.connect(**p)
+    table = f"fix_live_tx_{module.replace('.', '_')}"
+    _execute(
+        name,
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id int PRIMARY KEY, v int)",
+            f"INSERT INTO {table} VALUES (1, 1), (2, 2)",
+        ],
+    )
+    try:
+        for source in [table, f"SELECT * FROM {table}"]:
+            lf = pl.scan_database(source, conn).filter(pl.col("id") < 2)
+            assert lf.collect().height == 1
+            assert not _in_transaction(conn)
+        # a transaction of the user's stays theirs
+        cur = conn.cursor()
+        cur.execute(f"UPDATE {table} SET v = 3 WHERE id = 2")
+        cur.close()
+        assert pl.scan_database(table, conn).collect().height == 2
+        assert _in_transaction(conn)
+        conn.rollback()
+    finally:
+        conn.close()
+        _execute(name, [f"DROP TABLE IF EXISTS {table}"])
+
+
+@needs_postgres
+def test_postgres_engine_pool_of_one_and_a_failed_lookup() -> None:
+    # The name as written is looked up on a new session once the first is closed; a
+    # pool timeout isn't retried. A failed catalog lookup doesn't hide the error.
+    sqlalchemy = pytest.importorskip("sqlalchemy")
+    pytest.importorskip("pg8000")
+    assert POSTGRES is not None
+    _execute(
+        "postgres17",
+        [
+            'DROP TABLE IF EXISTS "FixFold"',
+            'CREATE TABLE "FixFold" (id int PRIMARY KEY)',
+        ],
+    )
+    try:
+        for driver in ["psycopg", "pg8000"]:
+            url = _sqlalchemy_url(POSTGRES, driver)
+            engine = sqlalchemy.create_engine(
+                url, pool_size=1, max_overflow=0, pool_timeout=3
+            )
+            try:
+                start = time.monotonic()
+                assert pl.scan_database("FixFold", engine).collect().height == 0
+                assert time.monotonic() - start < 3
+                with pytest.raises(pl.exceptions.ComputeError, match="does not exist"):
+                    pl.scan_database("fix_no_such_table", engine).collect()
+            finally:
+                engine.dispose()
+    finally:
+        _execute("postgres17", ['DROP TABLE IF EXISTS "FixFold"'])
+
+
 @pytest.mark.parametrize("name", ["mysql", "mariadb"])
 def test_mysql_query_ending_in_comments(name: str) -> None:
     for query in [

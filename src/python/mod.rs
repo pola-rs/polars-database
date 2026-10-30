@@ -22,7 +22,7 @@ use polars_io_ext_ffi::lazyframe_resolver_v1::{self, ResolverHandle};
 use polars_utils::python_function::PythonObject;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyCapsule, PyTuple};
+use pyo3::types::{PyBool, PyBytes, PyCapsule, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 
 use crate::database::backend::resolve::{candidate_statuses, install_hint, probe};
 use crate::database::backend::{BackendKind, adbc, register_python_bridge};
@@ -121,6 +121,47 @@ fn range_of(obj: &Bound<'_, PyAny>) -> PyResult<(Scalar, Scalar)> {
     Ok((get(0)?, get(1)?))
 }
 
+/// A stable identity of `params=`, for scan deduplication: the `repr` of plain values, which
+/// shows them whole. Any other object's (a NumPy array's elides its middle) is the object
+/// itself, which the scan holds, so two scans merge only if they share it.
+fn params_key(params: &Bound<'_, PyAny>) -> PyResult<PlSmallStr> {
+    fn plain(v: &Bound<'_, PyAny>) -> PyResult<bool> {
+        if v.is_none()
+            || v.is_exact_instance_of::<PyBool>()
+            || v.is_exact_instance_of::<PyInt>()
+            || v.is_exact_instance_of::<PyFloat>()
+            || v.is_exact_instance_of::<PyString>()
+            || v.is_exact_instance_of::<PyBytes>()
+        {
+            return Ok(true);
+        }
+        if v.is_exact_instance_of::<PyList>() || v.is_exact_instance_of::<PyTuple>() {
+            for item in v.try_iter()? {
+                if !plain(&item?)? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        if let Ok(d) = v.cast_exact::<PyDict>() {
+            for (k, item) in d.iter() {
+                if !plain(&k)? || !plain(&item)? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        // `Decimal`, `date`, `datetime`, `time`, `timedelta`: their repr is whole
+        let module = v.get_type().module()?;
+        Ok(matches!(module.to_str()?, "decimal" | "datetime"))
+    }
+    Ok(if plain(params)? {
+        params.repr()?.to_string().into()
+    } else {
+        format!("<object at {:#x}>", params.as_ptr() as usize).into()
+    })
+}
+
 /// The `scan_database` arguments, checked by Polars, as a resolver capsule for
 /// `LazyFrame._from_io_plugin_resolver`.
 #[pyfunction]
@@ -179,7 +220,7 @@ fn scan_resolver<'py>(
         credential_provider: credential_provider.map(|p| Arc::new(PythonObject(p))),
         query_params_key: params
             .as_ref()
-            .map(|p| p.bind(py).repr().map(|r| r.to_string().into()))
+            .map(|p| params_key(p.bind(py)))
             .transpose()?,
         query_params: params.map(|p| Arc::new(PythonObject(p))),
         python_options: python_options.map(|p| Arc::new(PythonObject(p))),
