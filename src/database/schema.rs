@@ -59,11 +59,13 @@ pub fn declared_dtype(dialect: DialectName, db_type: &str) -> Option<DataType> {
         return declared_dtype(dialect, inner).map(|d| DataType::List(Box::new(d)));
     }
     if dialect == DialectName::Clickhouse {
-        t = clickhouse_value_type(&t);
-        if let Some(inner) = t.strip_prefix("array(").and_then(|r| r.strip_suffix(')')) {
+        let written = clickhouse_unwrapped(db_type);
+        t = written.to_ascii_lowercase();
+        if t.starts_with("array(") {
+            let inner = written["array(".len()..].strip_suffix(')')?;
             return declared_dtype(dialect, inner).map(|d| DataType::List(Box::new(d)));
         }
-        if let Some(dt) = clickhouse_dtype(&t) {
+        if let Some(dt) = clickhouse_dtype(written) {
             return Some(dt);
         }
     }
@@ -75,12 +77,15 @@ pub fn declared_dtype(dialect: DialectName, db_type: &str) -> Option<DataType> {
     {
         return Some(UNCONSTRAINED_DECIMAL);
     }
-    // Oracle `TIMESTAMP WITH [LOCAL] TIME ZONE`: values are normalised to the UTC session.
-    if dialect == DialectName::Oracle && t.starts_with("timestamp") && t.contains("time zone") {
-        return Some(DataType::Datetime(
-            TimeUnit::Microseconds,
-            Some(TimeZone::UTC),
-        ));
+    // Oracle `TIMESTAMP(p) [WITH [LOCAL] TIME ZONE]`: the time zone types are read as UTC
+    // (see `column_conversion`); 7 to 9 fractional digits are read as text, to keep them.
+    if dialect == DialectName::Oracle && t.starts_with("timestamp") {
+        let tz = t.contains("time zone").then_some(TimeZone::UTC);
+        let unit = match oracle_timestamp_precision(&t) {
+            Some(7..) => TimeUnit::Nanoseconds,
+            _ => TimeUnit::Microseconds,
+        };
+        return Some(DataType::Datetime(unit, tz));
     }
     // Drivers disagree on the width of MySQL `YEAR` and `FLOAT` (4 bytes).
     if matches!(dialect, DialectName::Mysql | DialectName::Singlestore) {
@@ -147,6 +152,16 @@ pub fn declared_dtype(dialect: DialectName, db_type: &str) -> Option<DataType> {
         return None;
     }
     Some(DataType::Decimal(p, s))
+}
+
+/// The fractional second digits of an Oracle `TIMESTAMP(p) …`; `None` without them (6).
+pub fn oracle_timestamp_precision(t: &str) -> Option<u32> {
+    t.strip_prefix("timestamp(")?
+        .split_once(')')?
+        .0
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Casts a batch to the planned schema: selects the planned columns in order and casts each.
@@ -231,12 +246,7 @@ fn check_decimal_exact(src: &Column, cast: &Column) -> PolarsResult<()> {
             .str()?
             .iter()
             .flatten()
-            .find(|v| {
-                let v = v.trim();
-                !v.contains(['e', 'E'])
-                    && v.split_once('.')
-                        .is_some_and(|(_, frac)| frac.trim_end_matches('0').len() > *scale)
-            })
+            .find(|v| decimal_text_scale(v) > *scale)
             .map(str::to_string),
         DataType::Decimal(_, src_scale) if src_scale > scale => {
             let back = cast.cast(src.dtype())?;
@@ -259,6 +269,27 @@ fn check_decimal_exact(src: &Column, cast: &Column) -> PolarsResult<()> {
         ),
         None => Ok(()),
     }
+}
+
+/// The decimal places a decimal's text needs, also in scientific notation (Oracle writes
+/// `1E-100`); 0 for text that isn't a number (the cast fails on it).
+fn decimal_text_scale(v: &str) -> usize {
+    let v = v.trim();
+    let (mantissa, exp) = match v.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i64>().unwrap_or(0)),
+        None => (v, 0),
+    };
+    let frac = mantissa
+        .split_once('.')
+        .map_or(0, |(_, f)| f.trim_end_matches('0').len()) as i64;
+    // `1.5E+3` has no decimal places; `15E-1` one
+    let digits = if frac == 0 {
+        let int = mantissa.split('.').next().unwrap_or("");
+        -(int.len() as i64 - int.trim_end_matches('0').len() as i64)
+    } else {
+        frac
+    };
+    (digits - exp).max(0) as usize
 }
 
 /// A cast between integers and floats (or from a decimal to an integer) must not round
@@ -322,7 +353,8 @@ fn duration_to_time(col: &Column, dtype: &DataType) -> PolarsResult<Option<Colum
     Ok(None)
 }
 
-/// Text of a temporal column (SQLite stores dates as text) parsed to the planned dtype.
+/// Text of a temporal column (SQLite stores dates as text, some conversions write text)
+/// parsed to the planned dtype.
 /// Polars 2.0 has no string-to-temporal cast. A value that doesn't parse is an error.
 fn parse_temporal(col: &Column, dtype: &DataType) -> PolarsResult<Option<Column>> {
     use polars_core::chunked_array::temporal::string::StringMethods;
@@ -333,10 +365,36 @@ fn parse_temporal(col: &Column, dtype: &DataType) -> PolarsResult<Option<Column>
     let ca = col.str()?;
     let parsed: Series = match dtype {
         DataType::Date => ca.as_date(Some("%Y-%m-%d"), true)?.into_series(),
+        // Text without an offset is UTC, as a naive value cast to a time zone is (and as
+        // the conversions write it: Oracle and ClickHouse time zones).
         DataType::Datetime(tu, tz) => {
             let raise = StringChunked::from_slice(PlSmallStr::EMPTY, &["raise"]);
-            ca.as_datetime(None, *tu, true, false, tz.as_ref(), &raise)?
-                .into_series()
+            // The parse overflows outside the nanosecond range (1677 to 2262): a value is
+            // checked by its microseconds first (a second's margin).
+            if *tu == TimeUnit::Nanoseconds {
+                let us = ca.as_datetime(None, TimeUnit::Microseconds, true, false, None, &raise)?;
+                let range = i64::MIN / 1000 + 1_000_000..=i64::MAX / 1000 - 1_000_000;
+                if let Some(i) = us
+                    .physical()
+                    .iter()
+                    .position(|v| v.is_some_and(|v| !range.contains(&v)))
+                {
+                    polars_bail!(
+                        SchemaMismatch:
+                        "database column '{}' has the value {}, outside the range of {dtype} \
+                        (1677 to 2262); read the column with schema_overrides={{'{}': \
+                        pl.Datetime('us')}}",
+                        col.name(), ca.get(i).unwrap_or_default(), col.name()
+                    );
+                }
+            }
+            let naive = ca
+                .as_datetime(None, *tu, true, false, None, &raise)?
+                .into_series();
+            match tz {
+                Some(_) => naive.cast(dtype)?,
+                None => naive,
+            }
         },
         DataType::Time => ca.as_time(None, true)?.into_series(),
         _ => return Ok(None),
@@ -356,23 +414,49 @@ fn parse_temporal(col: &Column, dtype: &DataType) -> PolarsResult<Option<Column>
     Ok(Some(parsed.into_column()))
 }
 
-/// ClickHouse value types whose dtype the declaration fixes.
 /// A ClickHouse type without its `Nullable(…)` and `LowCardinality(…)` wrappers, lower-cased.
 pub fn clickhouse_value_type(db_type: &str) -> String {
-    let mut t = db_type.trim().to_ascii_lowercase();
+    clickhouse_unwrapped(db_type).to_ascii_lowercase()
+}
+
+/// A ClickHouse type without its wrappers, as written: time zone names are case-sensitive.
+fn clickhouse_unwrapped(db_type: &str) -> &str {
+    let mut t = db_type.trim();
     loop {
-        let inner = ["nullable(", "lowcardinality("]
-            .iter()
-            .find_map(|p| t.strip_prefix(p).and_then(|r| r.strip_suffix(')')));
+        let inner = ["nullable(", "lowcardinality("].iter().find_map(|p| {
+            let rest = t
+                .get(..p.len())?
+                .eq_ignore_ascii_case(p)
+                .then(|| &t[p.len()..])?;
+            rest.strip_suffix(')')
+        });
         match inner {
-            Some(inner) => t = inner.trim().to_string(),
+            Some(inner) => t = inner.trim(),
             None => return t,
         }
     }
 }
 
-fn clickhouse_dtype(t: &str) -> Option<DataType> {
+/// The time zone argument of a ClickHouse `DateTime(…)` / `DateTime64(…)`, as written.
+fn clickhouse_time_zone(args: &str) -> Option<TimeZone> {
+    let tz = args.trim().trim_matches('\'');
+    if tz.eq_ignore_ascii_case("utc") {
+        return Some(TimeZone::UTC);
+    }
+    TimeZone::opt_try_new(Some(tz)).ok()?
+}
+
+/// ClickHouse value types whose dtype the declaration fixes. `t` is unwrapped, as written.
+fn clickhouse_dtype(written: &str) -> Option<DataType> {
     use DataType as D;
+    let lower = written.to_ascii_lowercase();
+    let t = lower.as_str();
+    // the arguments as written
+    let args = |prefix: &str| {
+        t.starts_with(prefix)
+            .then(|| written[prefix.len()..].strip_suffix(')'))
+            .flatten()
+    };
     Some(match t {
         "int8" => D::Int8,
         "int16" => D::Int16,
@@ -390,39 +474,24 @@ fn clickhouse_dtype(t: &str) -> Option<DataType> {
         // read as text (`text_conversion`)
         _ if t.starts_with("enum8(") || t.starts_with("enum16(") => D::String,
         // seconds; read through `toDateTime64(…, 0)` (`column_conversion`)
-        _ if t == "datetime" || t.starts_with("datetime(") => {
-            let tz = t
-                .strip_prefix("datetime(")
-                .and_then(|r| r.strip_suffix(')'))
-                .map(|tz| tz.trim().trim_matches('\'').to_string());
-            let tz = match tz {
-                Some(tz) if tz.eq_ignore_ascii_case("utc") => Some(TimeZone::UTC),
-                tz => TimeZone::opt_try_new(tz).ok()?,
-            };
-            D::Datetime(TimeUnit::Milliseconds, tz)
-        },
+        // An unknown zone name keeps the driver's dtype.
+        "datetime" => D::Datetime(TimeUnit::Milliseconds, None),
+        _ if t.starts_with("datetime(") => D::Datetime(
+            TimeUnit::Milliseconds,
+            Some(clickhouse_time_zone(args("datetime(")?)?),
+        ),
         _ => {
-            if let Some(args) = t
-                .strip_prefix("datetime64(")
-                .and_then(|r| r.strip_suffix(')'))
-            {
-                let (precision, tz) = match args.split_once(',') {
-                    Some((p, tz)) => (p, Some(tz.trim().trim_matches('\'').to_string())),
-                    None => (args, None),
-                };
-                let unit = match precision.trim().parse::<u32>().ok()? {
-                    0..=3 => TimeUnit::Milliseconds,
-                    4..=6 => TimeUnit::Microseconds,
-                    _ => TimeUnit::Nanoseconds,
-                };
-                let tz = match tz {
-                    Some(tz) if tz.eq_ignore_ascii_case("utc") => Some(TimeZone::UTC),
-                    // An unknown zone name keeps the driver's dtype.
-                    tz => TimeZone::opt_try_new(tz).ok()?,
-                };
-                return Some(D::Datetime(unit, tz));
-            }
-            return None;
+            let args = args("datetime64(")?;
+            let (precision, tz) = match args.split_once(',') {
+                Some((p, tz)) => (p, Some(clickhouse_time_zone(tz)?)),
+                None => (args, None),
+            };
+            let unit = match precision.trim().parse::<u32>().ok()? {
+                0..=3 => TimeUnit::Milliseconds,
+                4..=6 => TimeUnit::Microseconds,
+                _ => TimeUnit::Nanoseconds,
+            };
+            D::Datetime(unit, tz)
         },
     })
 }
@@ -480,6 +549,40 @@ mod tests {
         assert!(cast(ints(&[1, (1 << 53) + 1]), DataType::Float64).is_err());
         let with_null = Column::new("x".into(), &[Some(1.0), None]);
         assert!(cast(with_null, DataType::Int64).is_ok());
+    }
+
+    #[test]
+    fn decimal_text_in_scientific_notation() {
+        assert_eq!(decimal_text_scale("1.25"), 2);
+        assert_eq!(decimal_text_scale("100"), 0);
+        assert_eq!(decimal_text_scale("1E-100"), 100);
+        assert_eq!(decimal_text_scale("1.5E-70"), 71);
+        assert_eq!(decimal_text_scale("1.5E+25"), 0);
+        assert_eq!(decimal_text_scale("100E-2"), 0);
+        assert_eq!(decimal_text_scale("15e-1"), 1);
+        let text = Column::new("n".into(), &["1E-100", "1"]);
+        let df = DataFrame::new(2, vec![text]).unwrap();
+        let schema = Schema::from_iter([Field::new("n".into(), UNCONSTRAINED_DECIMAL)]);
+        let e = cast_to_schema(&df, &schema, None).unwrap_err();
+        assert!(e.to_string().contains("1E-100"), "{e}");
+    }
+
+    #[test]
+    fn nanoseconds_out_of_range_fail() {
+        let ns = DataType::Datetime(TimeUnit::Nanoseconds, None);
+        let cast = |v: &str| {
+            let df = DataFrame::new(1, vec![Column::new("t".into(), &[v])]).unwrap();
+            cast_to_schema(
+                &df,
+                &Schema::from_iter([Field::new("t".into(), ns.clone())]),
+                None,
+            )
+        };
+        assert!(cast("2024-01-02 03:04:05.123456789").is_ok());
+        let e = cast("9999-12-31 23:59:59.999999999").unwrap_err();
+        assert!(e.to_string().contains("outside the range"), "{e}");
+        assert!(cast("1600-01-01 00:00:00.5").is_err());
+        assert!(cast("-2000-01-01 00:00:00").is_err());
     }
 
     #[test]
@@ -550,6 +653,37 @@ mod tests {
                 TimeUnit::Milliseconds,
                 Some(TimeZone::UTC)
             ))
+        );
+        // a zone's name keeps its case
+        let tokyo = TimeZone::opt_try_new(Some("Asia/Tokyo")).unwrap();
+        assert_eq!(
+            declared_dtype(ch, "Nullable(DateTime64(9, 'Asia/Tokyo'))"),
+            Some(DataType::Datetime(TimeUnit::Nanoseconds, tokyo.clone()))
+        );
+        assert_eq!(
+            declared_dtype(ch, "Array(DateTime('Asia/Tokyo'))"),
+            Some(DataType::List(Box::new(DataType::Datetime(
+                TimeUnit::Milliseconds,
+                tokyo
+            ))))
+        );
+        let ora = DialectName::Oracle;
+        let ns = |tz| Some(DataType::Datetime(TimeUnit::Nanoseconds, tz));
+        assert_eq!(declared_dtype(ora, "timestamp(9)"), ns(None));
+        assert_eq!(
+            declared_dtype(ora, "TIMESTAMP(7) WITH TIME ZONE"),
+            ns(Some(TimeZone::UTC))
+        );
+        assert_eq!(
+            declared_dtype(ora, "timestamp(6) with local time zone"),
+            Some(DataType::Datetime(
+                TimeUnit::Microseconds,
+                Some(TimeZone::UTC)
+            ))
+        );
+        assert_eq!(
+            declared_dtype(ora, "timestamp"),
+            Some(DataType::Datetime(TimeUnit::Microseconds, None))
         );
     }
 }

@@ -544,11 +544,12 @@ fn oracle_type_name(code: &str, precision: &str, scale: &str) -> Option<String> 
             112 => "clob",
             113 => "blob",
             119 => "json",
-            180 => "timestamp",
-            181 => "timestamp with time zone",
+            // the scale is the fractional second digits, as the table's type shows them
+            180 => return Some(format!("timestamp({s})")),
+            181 => return Some(format!("timestamp({s}) with time zone")),
             182 => "interval year to month",
             183 => "interval day to second",
-            231 => "timestamp with local time zone",
+            231 => return Some(format!("timestamp({s}) with local time zone")),
             252 => "boolean",
             c => return Some(format!("type {c}")),
         }
@@ -995,7 +996,8 @@ mod tests {
         // an expression's type: its values have any scale
         assert_eq!(t("2", "0", "0"), "number");
         assert_eq!(t("2", "126", "-127"), "float");
-        assert_eq!(t("181", "0", "6"), "timestamp with time zone");
+        assert_eq!(t("181", "0", "6"), "timestamp(6) with time zone");
+        assert_eq!(t("180", "0", "9"), "timestamp(9)");
         assert!(compares_as_text(DialectName::Oracle, &t("96", "0", "0")));
         assert!(!compares_as_text(DialectName::Oracle, &t("112", "0", "0")));
     }

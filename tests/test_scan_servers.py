@@ -2545,6 +2545,169 @@ def test_mysql_query_ending_in_comments(name: str) -> None:
         assert sorted(lf.filter(pl.col("id") >= 1).collect()["id"].to_list()) == [1, 2]
 
 
+needs_clickhouse = pytest.mark.skipif(
+    SERVERS["clickhouse"].uri is None, reason="no ClickHouse URI"
+)
+
+
+@needs_clickhouse
+def test_clickhouse_time_zones_and_nanoseconds_by_every_driver() -> None:
+    # A zone keeps its case (it was lower-cased, and the driver's dtype used), and
+    # DateTime64(7..9) keeps its nanoseconds (clickhouse_connect and ConnectorX cut them)
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    table = "rvb_ch_tz"
+    _execute(
+        "clickhouse",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id Int32, dt DateTime('Asia/Tokyo'), "
+            "ns DateTime64(9, 'America/New_York'), naive Nullable(DateTime64(7))) "
+            "ENGINE = MergeTree ORDER BY id",
+            f"INSERT INTO {table} VALUES (1, '2024-01-02 03:04:05', "
+            "'2024-11-03 01:30:00.123456789', '2200-01-01 00:00:00.1234567'), "
+            "(2, '2024-06-02 03:04:05', '2001-01-01 00:00:00.000000001', NULL)",
+        ],
+    )
+    try:
+        frames = {}
+        for driver in ["adbc", "clickhouse_connect", "connectorx"]:
+            for source in [table, f"SELECT * FROM {table}"]:
+                lf = _scan("clickhouse", driver, source)
+                df = lf.collect().sort("id")
+                assert lf.collect_schema() == df.schema
+                frames[driver, source] = df
+        first, *rest = frames.values()
+        assert first.schema["dt"] == pl.Datetime("ms", "Asia/Tokyo")
+        assert first.schema["ns"] == pl.Datetime("ns", "America/New_York")
+        assert first["dt"][0] == datetime(
+            2024, 1, 2, 3, 4, 5, tzinfo=ZoneInfo("Asia/Tokyo")
+        )
+        assert first["ns"].dt.nanosecond().to_list() == [123456789, 1]
+        assert first["naive"].dt.nanosecond()[0] == 123456700
+        for df in rest:
+            assert_frame_equal(df, first)
+    finally:
+        _execute("clickhouse", [f"DROP TABLE IF EXISTS {table}"])
+
+
+@pytest.mark.skipif(SERVERS["oracle"].uri is None, reason="no Oracle URI")
+@ORACLE_GROUP
+def test_oracle_nanoseconds_and_numbers_read_exactly() -> None:
+    # TIMESTAMP(9) kept its microseconds only and wrapped outside 1677-2262; an
+    # unconstrained NUMBER in scientific notation read as 0, and one in a query was a
+    # rounded Float64; NUMBER(5) read differently from a table and a query
+    from datetime import datetime
+
+    table = "rvb_ora_exact"
+    _execute(
+        "oracle",
+        [
+            f"BEGIN EXECUTE IMMEDIATE 'DROP TABLE {table}'; "
+            "EXCEPTION WHEN OTHERS THEN NULL; END;",
+            f'CREATE TABLE {table} ("id" NUMBER(5), ts TIMESTAMP(9), '
+            "tz TIMESTAMP(9) WITH TIME ZONE, n NUMBER)",
+            f"INSERT INTO {table} VALUES (1, TIMESTAMP '2024-01-02 03:04:05.123456789', "
+            "TIMESTAMP '2024-01-02 03:04:05.123456789 +05:00', 12345678901234567891)",
+            f"INSERT INTO {table} VALUES (2, NULL, NULL, 1.5e25)",
+        ],
+    )
+    try:
+        frames = []
+        for driver in ["oracledb", "sqlalchemy"]:
+            for source in [
+                table.upper(),
+                f'SELECT "id", ts, tz, n FROM {table}',
+                f'SELECT "id", ts, tz, n * 1 AS n FROM {table}',
+            ]:
+                lf = _scan("oracle", driver, source)
+                df = lf.collect().sort("id")
+                assert lf.collect_schema() == df.schema
+                frames.append(df)
+        for df in frames:
+            assert_frame_equal(df, frames[0])
+        df = frames[0]
+        assert df.schema == pl.Schema(
+            {
+                "id": pl.Int64,
+                "TS": pl.Datetime("ns"),
+                "TZ": pl.Datetime("ns", "UTC"),
+                "N": pl.Decimal(38, 9),
+            }
+        )
+        assert df["TS"].dt.nanosecond()[0] == 123456789
+        assert df["TZ"].dt.replace_time_zone(None)[0] == datetime(
+            2024, 1, 1, 22, 4, 5, 123456
+        )
+        assert df["N"].to_list() == [
+            Decimal("12345678901234567891"),
+            Decimal("15000000000000000000000000"),
+        ]
+        _execute(
+            "oracle",
+            [
+                f"INSERT INTO {table} VALUES (3, TIMESTAMP '9999-12-31 23:59:59.5', "
+                "NULL, 1e-100)"
+            ],
+        )
+        for source in [table.upper(), f'SELECT "id", ts, n FROM {table}']:
+            lf = _scan("oracle", "oracledb", source)
+            with pytest.raises(
+                pl.exceptions.SchemaError, match="'TS' has the value 9999"
+            ):
+                lf.select("TS").collect()
+            with pytest.raises(
+                pl.exceptions.SchemaError, match="'N' has the value 1E-100"
+            ):
+                lf.select("N").collect()
+    finally:
+        _execute(
+            "oracle",
+            [
+                f"BEGIN EXECUTE IMMEDIATE 'DROP TABLE {table}'; EXCEPTION WHEN OTHERS THEN NULL; END;"
+            ],
+        )
+
+
+@pytest.mark.skipif(SERVERS["mysql"].uri is None, reason="no MySQL URI")
+@pytest.mark.parametrize("module", ["pymysql", "mysql.connector"])
+def test_mysql_live_connection_in_another_time_zone(module: str) -> None:
+    # a live connection has no session setup: its TIMESTAMP values were read in its
+    # time zone, but labelled UTC
+    from datetime import datetime
+
+    driver = pytest.importorskip(module)
+    server = SERVERS["mysql"]
+    assert server.uri is not None
+    table = f"rvb_my_tz_{module.replace('.', '_')}"
+    _execute(
+        "mysql",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id int, ts timestamp(6) NULL)",
+            "SET time_zone = '+00:00'",
+            f"INSERT INTO {table} VALUES (1, '2024-01-02 03:04:05.5'), (2, NULL)",
+        ],
+    )
+    conn = driver.connect(**_parts(server.uri))
+    try:
+        cur = conn.cursor()
+        cur.execute("SET time_zone = '+09:00'")
+        cur.close()
+        instant = datetime(2024, 1, 2, 3, 4, 5, 500000, tzinfo=UTC)
+        lf = pl.scan_database(table, conn)
+        assert lf.collect_schema()["ts"] == pl.Datetime("us", "UTC")
+        assert lf.collect().sort("id")["ts"].to_list() == [instant, None]
+        assert lf.filter(pl.col("ts") == instant).collect()["id"].to_list() == [1]
+        # a query's column type is unknown: read as the session shows it, not as UTC
+        query = pl.scan_database(f"SELECT id, ts FROM {table}", conn)
+        assert query.collect_schema()["ts"] == pl.Datetime("us")
+    finally:
+        conn.close()
+        _execute("mysql", [f"DROP TABLE IF EXISTS {table}"])
+
+
 @pytest.mark.skipif(SERVERS["mysql"].uri is None, reason="no MySQL URI")
 @pytest.mark.parametrize("driver", ["adbc", "pymysql", "mysql.connector"])
 def test_mysql_query_dtypes_are_the_tables(driver: str) -> None:

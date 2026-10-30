@@ -221,6 +221,8 @@ pub fn resolve_scan(
     };
     let as_written = (!Arc::ptr_eq(&written, &options)).then_some(written);
     let backend = resolve_backend(&options.connection, dialect, options.driver.as_deref())?;
+    // The session setup (UTC, …) runs on every session of the scan.
+    let setup_runs = !options.connection.is_live() && backend.kind.has_sessions();
     if options.connection.has_query_params() {
         polars_ensure!(
             matches!(options.relation, DatabaseRelation::Query { .. }),
@@ -360,7 +362,7 @@ pub fn resolve_scan(
                 },
                 DatabaseRelation::Query { .. } => CatalogInfo::default(),
             };
-            let select_list = converted_select_list(dialect, &backend.kind, &info);
+            let select_list = converted_select_list(dialect, &backend.kind, setup_runs, &info);
             let (discovered, sampled) = discover_schema(
                 session,
                 options,
@@ -424,6 +426,15 @@ pub fn resolve_scan(
             }
         }
 
+        // DuckDB returns `TIMESTAMPTZ` in the session time zone, the machine's by default:
+        // the same instants, planned in UTC as on other databases. (Its Python module reads
+        // each query on a new cursor, a connection with its own settings: a session setup
+        // wouldn't apply.)
+        if dialect == DialectName::Duckdb {
+            for (_, dtype) in discovered.iter_mut() {
+                *dtype = in_utc(dtype);
+            }
+        }
         // A declared type fixes the dtype, whichever driver read it.
         let is_query = matches!(options.relation, DatabaseRelation::Query { .. });
         for (name, dtype) in discovered.iter_mut() {
@@ -462,6 +473,7 @@ pub fn resolve_scan(
                             let converted = column_conversion(
                                 dialect,
                                 &backend.kind,
+                                setup_runs,
                                 t,
                                 &dialect.quote_ident(name),
                             )
@@ -480,6 +492,7 @@ pub fn resolve_scan(
                                 && column_conversion(
                                     dialect,
                                     &backend.kind,
+                                    setup_runs,
                                     t,
                                     &dialect.quote_ident(name),
                                 )
@@ -568,6 +581,15 @@ pub fn resolve_scan(
     })
 }
 
+/// A dtype with its time zones (also in lists) as UTC.
+fn in_utc(dtype: &DataType) -> DataType {
+    match dtype {
+        DataType::Datetime(tu, Some(_)) => DataType::Datetime(*tu, Some(TimeZone::UTC)),
+        DataType::List(inner) => DataType::List(Box::new(in_utc(inner))),
+        dt => dt.clone(),
+    }
+}
+
 /// Whether the source is read with conversions in its select list: a table, or a query that
 /// is wrapped for them (with pushdown, or without it where it can be: see
 /// `compile_unwrapped`).
@@ -631,10 +653,11 @@ const CONNECTORX_SQLITE_TEXT: &str = "<connectorx sqlite text>";
 const CONNECTORX_SQLITE_REAL: &str = "<connectorx sqlite real>";
 
 /// SQL that converts a column of a declared type where the backend can't read it as is, or
-/// `None` to select it as it is.
+/// `None` to select it as it is. `setup_runs`: the session setup runs (see `resolve_scan`).
 fn column_conversion(
     dialect: DialectName,
     backend: &BackendKind,
+    setup_runs: bool,
     db_type: &str,
     column: &str,
 ) -> Option<String> {
@@ -651,11 +674,18 @@ fn column_conversion(
         return Some(sql);
     }
     // ClickHouse `DateTime` (seconds) reaches Arrow as a plain UInt32; `DateTime64` is a
-    // timestamp, and compares like the column.
+    // timestamp, and compares like the column. clickhouse_connect and ConnectorX cut a
+    // `DateTime64(7..9)` to microseconds: its text, in UTC, keeps the nanoseconds.
     if dialect == DialectName::Clickhouse {
         let t = super::schema::clickhouse_value_type(db_type);
         if t == "datetime" || t.starts_with("datetime(") {
             return Some(format!("toDateTime64({column}, 0)"));
+        }
+        if !matches!(backend, BackendKind::Adbc { .. })
+            && declared_dtype(dialect, db_type)
+                .is_some_and(|d| matches!(d, DataType::Datetime(TimeUnit::Nanoseconds, _)))
+        {
+            return Some(format!("toString({column}, 'UTC')"));
         }
     }
     // Read as text and parse the exact value; the planned dtype stays the declared decimal.
@@ -677,16 +707,27 @@ fn column_conversion(
     // Oracle returns `TIMESTAMP WITH LOCAL TIME ZONE` in the session's time zone (a live
     // connection's is the user's), and drivers drop the offset of `TIMESTAMP WITH TIME
     // ZONE`, keeping the wall-clock time: read both as UTC, which the planned dtype says
-    // they are.
+    // they are. oracledb reads 7 to 9 fractional digits as microseconds, and wraps a
+    // value outside the nanosecond range: they are read as text (`SYYYY` writes a BC
+    // year as negative, which fails the parse).
     if dialect == DialectName::Oracle {
         let t = db_type.trim().to_ascii_lowercase();
-        if t.starts_with("timestamp") && t.contains("local time zone") {
-            return Some(format!(
-                "SYS_EXTRACT_UTC(CAST({column} AS TIMESTAMP WITH TIME ZONE))"
-            ));
-        }
-        if t.starts_with("timestamp") && t.contains("time zone") {
-            return Some(format!("SYS_EXTRACT_UTC({column})"));
+        if t.starts_with("timestamp") {
+            let utc = if t.contains("local time zone") {
+                format!("SYS_EXTRACT_UTC(CAST({column} AS TIMESTAMP WITH TIME ZONE))")
+            } else if t.contains("time zone") {
+                format!("SYS_EXTRACT_UTC({column})")
+            } else {
+                column.to_string()
+            };
+            if super::schema::oracle_timestamp_precision(&t).is_some_and(|p| p > 6) {
+                return Some(format!(
+                    "TRIM(TO_CHAR({utc}, 'SYYYY-MM-DD HH24:MI:SS.FF9'))"
+                ));
+            }
+            if utc != column {
+                return Some(utc);
+            }
         }
     }
     // The ADBC MySQL driver sizes an `UNSIGNED` decimal one digit short, failing on values
@@ -701,8 +742,21 @@ fn column_conversion(
     // MySQL zero dates (`'0000-00-00'`, and dates with a zero month or day) are no date:
     // read them as NULL, as Connector/J's `zeroDateTimeBehavior=convertToNull` does. Drivers
     // fail on them otherwise. Pushed filters see them as NULL too (`zero_dates_as_null`).
+    //
+    // A `TIMESTAMP` is read in the session time zone, UTC only after the session setup
+    // (not on a live connection, nor on ConnectorX): elsewhere its stored instant
+    // (`UNIX_TIMESTAMP` of the column) is read as UTC.
     if mysql_zero_date_type(dialect, db_type) {
-        return Some(format!("IF({}, NULL, {column})", mysql_zero_date(column)));
+        let t = db_type.trim().to_ascii_lowercase();
+        let value = if !setup_runs && (t == "timestamp" || t.starts_with("timestamp(")) {
+            format!(
+                "TIMESTAMPADD(MICROSECOND, CAST(UNIX_TIMESTAMP({column}) * 1000000 AS SIGNED), \
+                TIMESTAMP '1970-01-01 00:00:00')"
+            )
+        } else {
+            column.to_string()
+        };
+        return Some(format!("IF({}, NULL, {value})", mysql_zero_date(column)));
     }
     let _ = backend;
     None
@@ -823,14 +877,15 @@ fn substitute_null(e: &SqlExpr, column: &str) -> SqlExpr {
 fn converted_select_list(
     dialect: DialectName,
     backend: &BackendKind,
+    setup_runs: bool,
     info: &CatalogInfo,
 ) -> Option<Vec<SqlSelectItem>> {
     let mut any = false;
     let items = info
         .types
         .iter()
-        .map(
-            |(name, t)| match column_conversion(dialect, backend, t, &dialect.quote_ident(name)) {
+        .map(|(name, t)| {
+            match column_conversion(dialect, backend, setup_runs, t, &dialect.quote_ident(name)) {
                 Some(sql) => {
                     any = true;
                     SqlSelectItem::Expr {
@@ -839,8 +894,8 @@ fn converted_select_list(
                     }
                 },
                 None => SqlSelectItem::Column(name.clone()),
-            },
-        )
+            }
+        })
         .collect::<Vec<_>>();
     any.then_some(items)
 }
@@ -1202,7 +1257,15 @@ fn select_item(config: &DatabaseScanConfig, c: &PlSmallStr) -> SqlSelectItem {
     let conversion = config
         .column(c)
         .and_then(|m| m.db_type.as_deref())
-        .and_then(|t| column_conversion(dialect, &config.backend.kind, t, &dialect.quote_ident(c)));
+        .and_then(|t| {
+            column_conversion(
+                dialect,
+                &config.backend.kind,
+                config.session_setup_runs(),
+                t,
+                &dialect.quote_ident(c),
+            )
+        });
     match conversion {
         Some(sql) => SqlSelectItem::Expr {
             sql,

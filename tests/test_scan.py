@@ -1113,6 +1113,26 @@ def test_scan_duckdb_string_literal_with_nul(tmp_path: Path, driver: str) -> Non
         assert pushed is (driver == "duckdb")
 
 
+def test_scan_duckdb_timestamptz_is_planned_in_utc(tmp_path: Path) -> None:
+    # DuckDB returns TIMESTAMPTZ in the session time zone, the machine's by default
+    from datetime import datetime, timezone
+
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE t AS SELECT TIMESTAMPTZ '2024-01-01 00:00:00+00' AS tz"
+        )
+
+    def connect() -> Any:
+        return duckdb.connect(path, config={"TimeZone": "Asia/Tokyo"})
+
+    for source in ["t", "SELECT * FROM t"]:
+        lf = pl.scan_database(source, connect)
+        assert lf.collect_schema()["tz"] == pl.Datetime("us", "UTC")
+        assert lf.collect()["tz"].item() == datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+
 def test_scan_engine_with_a_shared_connection_pool() -> None:
     # a StaticPool's one connection is the user's: used as a live connection, so its
     # temporary tables are visible and it isn't discarded
