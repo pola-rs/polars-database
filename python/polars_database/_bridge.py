@@ -1420,24 +1420,8 @@ def _description_dtypes(cursor: Any, description: Any) -> list[Any]:
     return [pl.Null] * len(description)
 
 
-# Names of server-side cursors: unique in the process, as a cursor left open in a live
-# connection's transaction (see `_Session.execute`) may outlive its session.
+# Names of server-side cursors, unique in the process.
 _CURSOR_IDS = itertools.count()
-
-
-def _close_if_open(conn: Any, name: str) -> None:
-    """
-    Closes a psycopg server-side cursor if it still exists: a cursor lives in its
-    transaction, so then that is still the scan's (one statement, so nothing else runs
-    between the check and the CLOSE). Nothing is begun on an idle connection.
-    """
-    with contextlib.suppress(Exception):
-        if conn.info.transaction_status != 2:  # INTRANS
-            return
-        conn.execute(
-            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_catalog.pg_cursors "
-            f"WHERE name = '{name}') THEN EXECUTE 'CLOSE {name}'; END IF; END $$"
-        )
 
 
 class _ConnectionState:
@@ -1445,10 +1429,8 @@ class _ConnectionState:
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        # executions in progress, and whether the first found no transaction open
-        # (`None`: unknown)
+        # executions in progress
         self.active = 0
-        self.idle_before: bool | None = False
 
 
 # A live connection is the user's one object: the scans of a query (a self-join, a
@@ -1525,19 +1507,19 @@ class _Session:
         cursor = None
         cx_cursor: Any = None
         cx: Any = None
-        stopped = False
         frames: Iterator[DataFrame] | None = None
         try:
             # driver calls hold the lock, yields don't: other scans of the same live
             # connection interleave their calls, and none waits for another's consumer
             with state.lock:
-                if state.active == 0:
-                    # a live connection that wasn't in a transaction is left without one
-                    state.idle_before = (
-                        None if self.owned else _transaction_idle(self.conn)
-                    )
                 state.active += 1
                 entered = True
+                # A live connection outside a transaction is left without one. Polars
+                # may release a read after `collect()` returned (an early stop), while
+                # the user runs statements on the connection again: a ROLLBACK then
+                # could end theirs. So the result is read whole and the transaction it
+                # opened rolled back here, before any batch is handed over.
+                idle = not self.owned and _transaction_idle(self.conn) is True
                 cursor = self._server_cursor(batch_size)
                 cx = ConnectionExecutor(cursor if cursor is not None else self.conn)
                 cx_cursor = cx.cursor if cx.cursor is not cursor else None
@@ -1600,6 +1582,12 @@ class _Session:
                 # some drivers yield no batch for an empty result, and close the
                 # cursor when done: take the column names first
                 empty_frame = _empty_frame(cx.result)
+                if idle and _transaction_idle(self.conn) is False:
+                    frames = iter(list(frames))
+                    if _module_of(cx.result) == "sqlalchemy":
+                        with contextlib.suppress(Exception):
+                            cx.result.close()
+                    self.conn.rollback()
             empty = True
             while True:
                 with state.lock:
@@ -1607,20 +1595,14 @@ class _Session:
                 if df is None:
                     break
                 empty = False
-                try:
-                    yield df
-                except GeneratorExit:
-                    stopped = True
-                    raise
+                yield df
             if empty:
                 yield empty_frame
         finally:
-            # also runs when the reader stops early and drops this generator
-            # Polars releases an early-stopped read after `collect()` returned, while the
-            # user may run statements on a live connection again: the scan's
-            # transaction and server-side cursor are then left for the user's commit
-            # or rollback to end, as a CLOSE or ROLLBACK now would hit theirs.
-            late = stopped and not self.owned
+            # Also runs when the reader stops early and drops this generator, which
+            # Polars may do after `collect()` returned: on a live connection, nothing
+            # here may then send a statement that could fail in, or end, a transaction
+            # of the user's.
             with state.lock:
                 if (
                     self._aborted
@@ -1632,13 +1614,7 @@ class _Session:
                 if frames is not None:
                     with contextlib.suppress(Exception):
                         frames.close()  # type: ignore[attr-defined]
-                if cursor is not None and late and _module_of(cursor) == "psycopg":
-                    # psycopg would CLOSE it even in a transaction the user began
-                    # since (aborting it): closed only if it's still there
-                    # (psycopg2 skips the CLOSE itself once its transaction ended)
-                    cursor._closed = True
-                    _close_if_open(self.conn, cursor.name)
-                elif cursor is not None:
+                if cursor is not None:
                     with contextlib.suppress(Exception):
                         cursor.close()
                 if (
@@ -1657,16 +1633,9 @@ class _Session:
                         cx_cursor.close()
                 if entered:
                     state.active -= 1
-                if (self.owned and cursor is not None and not self._aborted) or (
-                    state.active == 0
-                    and state.idle_before
-                    and not late
-                    and _transaction_idle(self.conn) is False
-                ):
+                if self.owned and cursor is not None and not self._aborted:
                     with contextlib.suppress(Exception):
-                        # the query opened a transaction (a server-side cursor lives
-                        # in one), holding a snapshot and locks: end it, once no other
-                        # scan reads in it. A transaction the user had open is theirs.
+                        # the server-side cursor's transaction holds a snapshot
                         self.conn.rollback()
 
     def _reset_pooled(self) -> None:
@@ -1697,14 +1666,10 @@ class _Session:
         """A server-side cursor, so rows stream instead of being fetched up front."""
         module = _module_of(self.conn)
         if not self.owned:
-            # a named cursor needs a transaction; in autocommit it would have to be
-            # declared WITH HOLD, which materializes the whole result
-            if module in ("psycopg", "psycopg2") and not getattr(
-                self.conn, "autocommit", True
-            ):
-                cursor = self.conn.cursor(name=f"polars_scan_{next(_CURSOR_IDS)}")
-                cursor.itersize = batch_size
-                return cursor
+            # No server-side cursor on the user's connection: Polars may go on reading
+            # (or stop) after `collect()` returned, while the user runs statements on
+            # it again; a FETCH or CLOSE then, after their transaction ended, would
+            # fail in their next one. A client-side cursor reads the result whole.
             if _unbuffered_mysql(self.conn, module):
                 # MySQL can't keep two results open on one connection: another scan's
                 # statement would end this one's result early, silently with PyMySQL

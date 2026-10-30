@@ -1600,13 +1600,17 @@ def test_mysql_engine_connections_dont_keep_the_session_setup() -> None:
 
 @needs_postgres
 @pytest.mark.parametrize("module", ["psycopg", "psycopg2"])
-def test_postgres_live_connection_after_an_early_stop(module: str) -> None:
-    # Polars releases an early-stopped read after `collect()` returned: the scan
-    # neither cancels nor rolls back then, which would hit the user's next statements
+@pytest.mark.parametrize("in_transaction", [False, True])
+def test_postgres_live_connection_after_an_early_stop(
+    module: str, in_transaction: bool
+) -> None:
+    # Polars may release an early-stopped read after `collect()` returned: nothing
+    # the scan sends then may hit the user's next statements. In a transaction of the
+    # user's, it reads in that transaction.
     import importlib
 
     driver = importlib.import_module(module)
-    table = f"review_early_stop_{module}"
+    table = f"review_early_stop_{module}_{in_transaction}"
     assert POSTGRES is not None
     _execute(
         "postgres17",
@@ -1619,9 +1623,11 @@ def test_postgres_live_connection_after_an_early_stop(module: str) -> None:
     try:
         q = "SELECT g AS id FROM generate_series(1, 300000) g"
         for k in range(10):
+            cur = conn.cursor()
+            if in_transaction:
+                cur.execute("SELECT 1")
             lf = pl.scan_database(q, conn, batch_size=1000)
             lf.filter((pl.col("id").hash() % 7) == 0).head(2).collect()
-            cur = conn.cursor()
             cur.execute(f"INSERT INTO {table} VALUES (%s)", (k,))
             cur.close()
             conn.commit()
@@ -1727,9 +1733,8 @@ def test_postgres_cancel_on_a_shared_live_connection() -> None:
             thread.join()
             other_batches.close()  # type: ignore[attr-defined]
         assert n == 200_000
-        # `other` stopped early: its transaction is the user's to end
-        status = conn.info.transaction_status
-        assert status == psycopg.pq.TransactionStatus.INTRANS
+        # the scans' transactions were rolled back once their queries ran
+        assert conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
 
 
 @pytest.mark.skipif(SERVERS["mysql"].uri is None, reason="no MySQL URI")
