@@ -270,6 +270,9 @@ pub struct PartitionReader {
     index: usize,
     partition: Arc<CompiledPartition>,
     n_rows: Mutex<Option<u64>>,
+    /// The rows of a source that isn't repeatable, read to count them: the read returns
+    /// these rows, the ones the count (and the slices planned from it) saw.
+    counted_rows: Mutex<Option<DataFrame>>,
     /// The running statement's cancel handle; replaced when a retry reconnects.
     cancel: Arc<Mutex<Option<CancelHandle>>>,
     cancelled: Arc<AtomicBool>,
@@ -285,15 +288,31 @@ impl PartitionReader {
         )
     }
 
-    /// Runs the partition's `COUNT(*)`.
+    /// Runs the partition's `COUNT(*)`. A source that isn't repeatable (`TABLESAMPLE`,
+    /// `LIMIT` without `ORDER BY`, …) returns other rows each time: its rows are read and
+    /// kept for the read instead.
     fn count(&self) -> PolarsResult<u64> {
         if let Some(n) = *self.n_rows.lock().unwrap() {
             return Ok(n);
         }
+        let repeatable = self
+            .shared
+            .config
+            .compiled
+            .as_ref()
+            .is_none_or(|c| c.repeatable);
         let mut session = self.shared.acquire(&self.cancelled)?;
-        let r = session
-            .query(&self.partition.count_sql)
-            .and_then(|df| catalog::scalar_u64(&df));
+        let r = if repeatable {
+            session
+                .query(&self.partition.count_sql)
+                .and_then(|df| catalog::scalar_u64(&df))
+        } else {
+            session.query(&self.partition.sql).map(|df| {
+                let n = df.height() as u64;
+                *self.counted_rows.lock().unwrap() = Some(df);
+                n
+            })
+        };
         // Back to the pool: holding it until this partition is read would let readers that
         // are counted out of order (a negative slice counts from the end) take every
         // session while the partition that is read next waits. A failed session may be in
@@ -303,7 +322,7 @@ impl PartitionReader {
         } else {
             run_detached(move || drop(session));
         }
-        let n = r.map_err(|e| e.context(self.context().into()))?;
+        let n = r.map_err(|e| out_of_range_date_hint(e).context(self.context().into()))?;
         *self.n_rows.lock().unwrap() = Some(n);
         Ok(n)
     }
@@ -342,8 +361,14 @@ impl PartitionReader {
             batch_size: config.options.fetch.batch_size,
             // Reconnecting to a live connection gives back the same connection: no retries.
             live: config.options.connection.is_live(),
-            limited: config.compiled.as_ref().is_some_and(|c| c.limit.is_some()),
+            // A source that isn't repeatable was counted from the rows it returns (if this
+            // read takes them); a pushed LIMIT counts more rows than it reads.
+            limited: config
+                .compiled
+                .as_ref()
+                .is_some_and(|c| c.limit.is_some() || !c.repeatable),
             expected_rows: *self.n_rows.lock().unwrap(),
+            counted_rows: self.counted_rows.lock().unwrap().take(),
             context: self.context(),
             projected,
             dtype: field.dtype().clone(),
@@ -372,6 +397,8 @@ struct PartitionStream {
     limited: bool,
     /// The partition's `COUNT(*)`, if the host asked for it.
     expected_rows: Option<u64>,
+    /// The rows read by the count of a source that isn't repeatable, returned as they are.
+    counted_rows: Option<DataFrame>,
     context: String,
     projected: Schema,
     dtype: ArrowDataType,
@@ -445,8 +472,25 @@ impl PartitionStream {
         Ok(())
     }
 
+    fn cast(&self, df: &DataFrame) -> PolarsResult<DataFrame> {
+        let overrides = self.shared.config.options.schema_overrides.as_deref();
+        cast_to_schema(df, &self.projected, overrides)
+    }
+
     /// The next non-empty batch, cast to the planned schema; `None` at the end.
     fn next_batch(&mut self) -> PolarsResult<Option<DataFrame>> {
+        if let Some(df) = self.counted_rows.take() {
+            self.complete = true;
+            self.sent = true;
+            self.rows_read = df.height() as u64;
+            if df.height() == 0 {
+                return Ok(None);
+            }
+            return self.cast(&df).map(Some);
+        }
+        if self.complete {
+            return Ok(None);
+        }
         if self.session.is_none() {
             if let Err(e) = self.start() {
                 if !self.retryable(&e) || self.session.is_none() {
@@ -473,7 +517,7 @@ impl PartitionStream {
             if batch.height() == 0 {
                 continue;
             }
-            return cast_to_schema(&batch, &self.projected).map(Some);
+            return self.cast(&batch).map(Some);
         }
     }
 
@@ -508,6 +552,24 @@ impl PartitionStream {
     }
 }
 
+/// Python's `datetime` holds years 1..9999 only: a Python driver fails on an Oracle BC
+/// date with a bare `ValueError`. Says which values and what to do.
+fn out_of_range_date_hint(e: PolarsError) -> PolarsError {
+    let msg = e.to_string();
+    if !(msg.contains("year must be in 1..9999")
+        || (msg.contains("year") && msg.contains("is out of range")))
+    {
+        return e;
+    }
+    e.wrap_msg(|m| {
+        format!(
+            "{m}\n\nthe result has a date or timestamp outside years 1..9999 (e.g. a BC \
+            date), which the Python driver can't convert; read the column as text in a query \
+            (e.g. Oracle TO_CHAR(col, 'SYYYY-MM-DD HH24:MI:SS')), or with another driver"
+        )
+    })
+}
+
 impl Iterator for PartitionStream {
     type Item = PolarsResult<Box<dyn Array>>;
 
@@ -531,7 +593,7 @@ impl Iterator for PartitionStream {
             },
             Err(e) => {
                 self.done = true;
-                let e = e.context(self.context.clone().into());
+                let e = out_of_range_date_hint(e).context(self.context.clone().into());
                 *self.error.lock().unwrap() = Some(e.clone());
                 Some(Err(e))
             },
@@ -562,13 +624,21 @@ impl Drop for PartitionStream {
             // working for nobody. A cancelled or failed session may be in any state: it is
             // closed, not reused. Cancelling and closing may block.
             let running = batches.is_some();
-            run_detached(move || {
+            let stop = move || {
                 if running && let Some(cancel) = cancel {
                     let _ = cancel();
                 }
                 drop(batches);
                 drop(session);
-            });
+            };
+            if self.shared.config.options.connection.is_live() {
+                // The user's connection: its cursor is closed and the scan's transaction
+                // rolled back before the read returns, or they would race the user's
+                // next statements on it.
+                stop();
+            } else {
+                run_detached(stop);
+            }
         }
     }
 }
@@ -689,6 +759,7 @@ unsafe extern "C" fn reader_new(h: ScanHandle, source: FfiStr<'_>) -> FfiResult<
             index,
             partition: Arc::new(partition),
             n_rows: Mutex::new(None),
+            counted_rows: Mutex::new(None),
             cancel: Arc::new(Mutex::new(None)),
             cancelled: Arc::new(AtomicBool::new(false)),
             error: Arc::new(Mutex::new(None)),

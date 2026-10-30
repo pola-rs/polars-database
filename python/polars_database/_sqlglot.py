@@ -67,6 +67,19 @@ def _ansi(kind: str, text: str) -> Any:
     return _raw(f"{kind} '{text}'")
 
 
+def _string(text: str, dialect: str | None) -> Any:
+    if dialect == "tsql":
+        # N'…': a plain literal is converted to the database's code page first, which can
+        # turn characters it lacks into '?'
+        return exp.National(this=text)
+    if dialect == "postgres" and "\\" in text:
+        # E'…' reads backslashes the same whatever `standard_conforming_strings` is; a
+        # plain '…' holding one means something else when it is off
+        escaped = text.replace("\\", "\\\\").replace("'", "''")
+        return _raw(f"E'{escaped}'")
+    return exp.Literal.string(text)
+
+
 def _literal(v: Any, dialect: str | None) -> Any:
     if v == "Null":
         return exp.Null()
@@ -84,9 +97,7 @@ def _literal(v: Any, dialect: str | None) -> Any:
             return _cast(x, f"Decimal(38, {scale})")
         return exp.Literal.number(x)
     if kind == "String":
-        # N'…' on SQL Server: a plain literal is converted to the database's code page
-        # first, which can turn characters it lacks into '?'
-        return exp.National(this=x) if dialect == "tsql" else exp.Literal.string(x)
+        return _string(x, dialect)
     if kind == "Date":
         if dialect == "oracle":
             return _ansi("DATE", x)
@@ -149,16 +160,15 @@ def _expr(e: Any, d: str | None) -> Any:
         inner, lo, hi = x
         return exp.Between(this=_expr(inner, d), low=_expr(lo, d), high=_expr(hi, d))
     if kind == "Like":
-        pattern = (
-            exp.National(this=x["pattern"])
-            if d == "tsql"
-            else exp.Literal.string(x["pattern"])
-        )
+        pattern = _string(x["pattern"], d)
         like = exp.Like(this=_expr(x["expr"], d), expression=pattern)
         if d == "clickhouse" and x["escape"] == "\\":
             # no ESCAPE clause; backslash is its escape character already
             return like
-        return exp.Escape(this=like, expression=exp.Literal.string(x["escape"]))
+        escape = (
+            exp.Literal.string(x["escape"]) if d == "tsql" else _string(x["escape"], d)
+        )
+        return exp.Escape(this=like, expression=escape)
     if kind == "IsNotDistinctFrom":
         left, right, not_distinct = x
         node = exp.NullSafeEQ if not_distinct else exp.NullSafeNEQ
@@ -211,14 +221,32 @@ def _from(f: Any) -> Any:
 _SUBQUERY_PLACEHOLDER = f"__polars_subquery_{secrets.token_hex(8)}__"
 
 
-def _ordered(o: Any, d: str | None) -> Any:
+def _ordered(o: Any, d: str | None) -> list[Any]:
     # NULLs where the dialect puts them anyway, so no emulation is generated
     null_ordering = sqlglot.Dialect.get_or_raise(d).NULL_ORDERING
     desc = bool(o["descending"])
     nulls_first = (null_ordering == "nulls_are_small" and not desc) or (
         null_ordering == "nulls_are_large" and desc
     )
-    return exp.Ordered(this=_expr(o["expr"], d), desc=desc, nulls_first=nulls_first)
+    this = _expr(o["expr"], d)
+    if d is None:
+        # an unknown database (FlightSQL, ODBC): its NULL order is unknown, and it may
+        # not have `NULLS FIRST`. NULLs first on ASC, as range partitions expect
+        # (`nulls_sort_first` in `partition.rs`)
+        is_null = exp.Case(
+            ifs=[
+                exp.If(
+                    this=exp.Is(this=this.copy(), expression=exp.Null()),
+                    true=exp.Literal.number(0),
+                )
+            ],
+            default=exp.Literal.number(1),
+        )
+        return [
+            exp.Ordered(this=is_null, desc=desc, nulls_first=nulls_first),
+            exp.Ordered(this=this, desc=desc, nulls_first=nulls_first),
+        ]
+    return [exp.Ordered(this=this, desc=desc, nulls_first=nulls_first)]
 
 
 def build(query: dict[str, Any], dialect: str | None = None) -> Any:
@@ -229,7 +257,9 @@ def build(query: dict[str, Any], dialect: str | None = None) -> Any:
     if filters := query["filter"]:
         select = select.where(*(_expr(f, d) for f in filters), copy=False)
     if order_by := query["order_by"]:
-        select = select.order_by(*(_ordered(o, d) for o in order_by), copy=False)
+        select = select.order_by(
+            *(e for o in order_by for e in _ordered(o, d)), copy=False
+        )
     if (limit := query["limit"]) is not None:
         select = select.limit(int(limit), copy=False)
     return select
@@ -271,6 +301,105 @@ def _is_read_only(stmt: Any) -> bool:
     return not any(s.args.get("into") for s in stmt.find_all(exp.Select))
 
 
+# Functions that return other values each time they run (or each time a query runs), by
+# lower-cased name; sqlglot parses most of them as `Anonymous`. `random()` / `rand()` /
+# `DBMS_RANDOM.VALUE` and the `uuid()` family parse as typed nodes (`_VOLATILE_NODES`).
+_VOLATILE_FUNCTIONS = frozenset(
+    {
+        # Postgres (and DuckDB)
+        "random",
+        "random_normal",
+        "setseed",
+        "gen_random_uuid",
+        "gen_random_bytes",
+        "uuid_generate_v1",
+        "uuid_generate_v1mc",
+        "uuid_generate_v4",
+        "uuidv4",
+        "uuidv7",
+        "nextval",
+        # the time of the call or statement; `now()` / `CURRENT_TIMESTAMP` are the
+        # transaction's (and SQL Server's `SYSDATETIME()` its statement's), so not listed
+        "clock_timestamp",
+        "statement_timestamp",
+        "timeofday",
+        # SQLite
+        "randomblob",
+        # SQL Server
+        "newid",
+        "newsequentialid",
+        "crypt_gen_random",
+        # Oracle (`DBMS_RANDOM.*` and `seq.NEXTVAL` are checked apart)
+        "sys_guid",
+        # MySQL / MariaDB
+        "rand",
+        "uuid",
+        "uuid_short",
+        "uuid_v4",
+        "uuid_v7",
+        "random_bytes",
+        "sysdate",
+        # ClickHouse (and its `rand*` family, see `_is_volatile`)
+        "generateuuidv4",
+        "generateuuidv7",
+        "generateulid",
+        "generateserialid",
+        "generatesnowflakeid",
+        "fuzzbits",
+        # Snowflake
+        "uuid_string",
+        "seq1",
+        "seq2",
+        "seq4",
+        "seq8",
+        "randstr",
+    }
+)
+_VOLATILE_NODES = tuple(
+    node
+    for node in (
+        getattr(exp, name, None)
+        for name in ("Rand", "Randn", "Uuid", "Seq1", "Seq2", "Seq4", "Seq8")
+    )
+    if node is not None
+)
+
+
+def _is_volatile(node: Any, dialect: str | None, relations: set[str]) -> bool:
+    if isinstance(node, _VOLATILE_NODES):
+        return True
+    if isinstance(node, exp.Anonymous):
+        name = node.name.lower()
+        return name in _VOLATILE_FUNCTIONS or (
+            dialect == "clickhouse" and name.startswith("rand")
+        )
+    if isinstance(node, exp.Dot):
+        # Oracle `DBMS_RANDOM.RANDOM()`, `DBMS_CRYPTO.RANDOMBYTES(…)`
+        return node.this.name.lower() in ("dbms_random", "dbms_crypto")
+    if isinstance(node, exp.Column) and node.table:
+        # `seq.NEXTVAL` (Oracle, Snowflake), `DBMS_RANDOM.VALUE` without parentheses; a
+        # qualifier that names a table or alias of the query is a column `nextval`
+        qualifier = node.table.lower()
+        if qualifier in relations:
+            return False
+        return node.name.lower() == "nextval" or qualifier in (
+            "dbms_random",
+            "dbms_crypto",
+        )
+    return False
+
+
+def _relations(stmt: Any) -> set[str]:
+    """Lower-cased names and aliases of the tables, subqueries and CTEs of a query."""
+    names: set[str] = set()
+    for node in stmt.find_all(exp.Table, exp.Subquery, exp.CTE):
+        names.add(node.alias_or_name.lower())
+        if isinstance(node, exp.Table):
+            names.add(node.name.lower())
+    names.discard("")
+    return names
+
+
 def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
     """Facts about a user query that decide whether it can be wrapped."""
     facts: dict[str, Any] = {
@@ -301,9 +430,13 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
     facts["top_level_order_by_without_limit"] = (
         stmt.args.get("order") is not None and not has_limit and not has_top
     )
+    relations = _relations(stmt)
     # anywhere in the query: a nested LIMIT without a unique ORDER BY picks rows too
-    facts["repeatable"] = (
-        stmt.find(exp.Limit, exp.Fetch, exp.Offset, exp.TableSample, exp.Rand) is None
+    facts["repeatable"] = stmt.find(
+        exp.Limit, exp.Fetch, exp.Offset, exp.TableSample
+    ) is None and not any(
+        _is_volatile(node, dialect, relations)
+        for node in stmt.find_all(exp.Func, exp.Dot, exp.Column)
     )
     selects = stmt.selects
     if selects and not any(isinstance(s, exp.Star) or s.is_star for s in selects):

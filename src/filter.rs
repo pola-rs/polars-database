@@ -9,6 +9,7 @@ use polars_core::scalar::Scalar;
 use serde_json::Value;
 
 use crate::database::DatabaseScanConfig;
+use crate::database::backend::BackendKind;
 use crate::database::dialect::{DialectName, StringSemantics};
 use crate::database::sql::{SqlBinOp, SqlExpr, SqlLiteral};
 
@@ -253,9 +254,32 @@ pub fn parse_value(dtype: &DataType, v: &Value) -> Option<AnyValue<'static>> {
             tz.clone().map(std::sync::Arc::new),
         ),
         DataType::Duration(tu) => AnyValue::Duration(text()?.parse().ok()?, *tu),
-        DataType::Decimal(p, s) => AnyValue::Decimal(text()?.parse().ok()?, *p, *s),
+        DataType::Decimal(p, s) => {
+            let v = text()?.parse().ok()?;
+            if !decimal_fits(v, *p) {
+                return None;
+            }
+            AnyValue::Decimal(v, *p, *s)
+        },
         _ => return None,
     })
+}
+
+/// See [`Translator::mysql_without_setup`]. SingleStore has no session setup at all: its
+/// `sql_mode` and time zone are unknown.
+fn mysql_without_setup(dialect: DialectName, setup_runs: bool) -> bool {
+    match dialect {
+        DialectName::Mysql => !setup_runs,
+        DialectName::Singlestore => true,
+        _ => false,
+    }
+}
+
+/// Whether a decimal's digits fit its precision.
+fn decimal_fits(v: i128, precision: usize) -> bool {
+    v.unsigned_abs()
+        .checked_ilog10()
+        .is_none_or(|digits| (digits as usize) < precision)
 }
 
 /// How a translated expression relates to the Polars predicate `P`.
@@ -282,32 +306,107 @@ impl Translator<'_> {
     }
 
     fn strings(&self, column: &str) -> StringSemantics {
-        self.config
+        let s = self
+            .config
             .column(column)
-            .map_or_else(|| self.dialect().default_string_semantics(), |c| c.strings)
+            .map_or_else(|| self.dialect().default_string_semantics(), |c| c.strings);
+        // Oracle compares byte-wise only under `NLS_COMP=BINARY`, which the session setup
+        // sets. A live session (or a logon trigger, an instance default) may be linguistic.
+        if self.dialect() == DialectName::Oracle && !self.config.session_setup_runs() {
+            return StringSemantics {
+                empty_is_null: s.empty_is_null,
+                ..StringSemantics::UNKNOWN
+            };
+        }
+        s
     }
 
     /// Whether the driver binds `params=` into the SQL: a `%` in a pushed literal would then
     /// be read as a placeholder by `%s`-style drivers, so such literals aren't pushed.
     fn binds_params(&self) -> bool {
-        self.config.options.connection.has_query_params()
+        let connection = &self.config.options.connection;
+        // or given as the driver's `execute()` argument (`parameters`, psycopg's and
+        // mysql.connector's `params`, PyMySQL's `args`)
+        connection.has_query_params()
+            || connection
+                .execute_options
+                .iter()
+                .any(|(k, _)| matches!(k.as_str(), "parameters" | "params" | "args"))
+    }
+
+    /// Whether queries run through SQLAlchemy: a SQLAlchemy URI, Engine or Connection.
+    fn sqlalchemy(&self) -> bool {
+        match &self.config.backend.kind {
+            BackendKind::Sqlalchemy => true,
+            BackendKind::Python { module } => module == "sqlalchemy",
+            _ => false,
+        }
     }
 
     /// MySQL literals are written for the session setup: backslash escapes on
     /// (`NO_BACKSLASH_ESCAPES` removed) and a UTC time zone. Where it doesn't run, the
     /// server may read them otherwise, so such literals aren't pushed.
     fn mysql_without_setup(&self) -> bool {
-        self.dialect() == DialectName::Mysql && !self.config.session_setup_runs()
+        mysql_without_setup(self.dialect(), self.config.session_setup_runs())
     }
 
     /// A literal that can be written into the SQL (see `binds_params`, `mysql_without_setup`).
+    /// NUL can only be written where the renderer escapes it, or where the query text goes
+    /// to a driver that reads it whole (DuckDB's Python module): elsewhere it ends the query
+    /// text for C drivers (ADBC, ODBC), and Postgres rejects it.
     fn writable(&self, lit: &SqlLiteral) -> bool {
         let Some(s) = lit.as_str() else {
             return true;
         };
-        let placeholder = self.binds_params() && s.contains('%');
-        let escape = self.mysql_without_setup() && s.contains('\\');
-        !(placeholder || escape)
+        // SQLAlchemy binds `params=` through `text()`, which reads `:name` (and `\:`) in
+        // string literals too
+        let placeholder =
+            self.binds_params() && (s.contains('%') || (self.sqlalchemy() && s.contains(':')));
+        // the renderer writes `\\` and NUL (`\0`) as backslash escapes
+        let escape = self.mysql_without_setup() && (s.contains('\\') || s.contains('\0'));
+        let nul = s.contains('\0')
+            && !matches!(
+                self.dialect(),
+                DialectName::Mysql
+                    | DialectName::Clickhouse
+                    | DialectName::Snowflake
+                    | DialectName::Bigquery
+                    | DialectName::Databricks
+            )
+            && !(self.dialect() == DialectName::Duckdb
+                && matches!(&self.config.backend.kind, BackendKind::Python { module } if module == "duckdb"));
+        !(placeholder || escape || nul)
+    }
+
+    /// Whether a literal compared with the column means the same value to the database.
+    /// MySQL and MariaDB read an integer 1-99 compared with a `YEAR` column as a year
+    /// (2001-2069 and 1970-1999); 0 and every other integer compare as themselves. A
+    /// decimal literal wider than its precision (DuckDB `HUGEINT` is read as
+    /// `Decimal(38, 0)` but holds 39 digits) isn't a valid value.
+    fn literal_fits(&self, name: &str, av: &AnyValue<'_>) -> bool {
+        if let AnyValue::Decimal(v, p, _) = av
+            && !decimal_fits(*v, *p)
+        {
+            return false;
+        }
+        if matches!(
+            self.dialect(),
+            DialectName::Mysql | DialectName::Singlestore
+        ) && self
+            .config
+            .column(name)
+            .is_some_and(|c| match c.db_type.as_deref() {
+                Some(t) => {
+                    let t = t.trim().to_ascii_lowercase();
+                    t == "year" || t.starts_with("year(")
+                },
+                // an integer of unknown type (`schema=`) may be a `YEAR`
+                None => c.dtype.is_integer(),
+            })
+        {
+            return !av.extract::<i64>().is_some_and(|y| (1..=99).contains(&y));
+        }
+        true
     }
 
     /// Whether predicates on the column can be pushed at all (see `ColumnMeta::comparable`).
@@ -393,6 +492,9 @@ impl Translator<'_> {
             return None;
         }
         let pat = lit.value().extract_str()?;
+        if !self.writable(&SqlLiteral::String(pat.into())) {
+            return None;
+        }
         let (prefix, suffix) = match op {
             StrOp::StartsWith => ("", "%"),
             StrOp::EndsWith => ("%", ""),
@@ -459,7 +561,7 @@ impl Translator<'_> {
                 has_null = true;
                 continue;
             }
-            if !self.temporal_in_range(&av) {
+            if !self.temporal_in_range(&av) || !self.literal_fits(name, &av) {
                 return None;
             }
             let lit = SqlLiteral::from_any_value(&av, dtype)?;
@@ -635,6 +737,9 @@ impl Translator<'_> {
             };
         }
 
+        if !self.literal_fits(name, av) {
+            return None;
+        }
         let lit = SqlLiteral::from_any_value(av, dtype)?;
         if !self.writable(&lit) || !self.temporal_in_range(av) {
             return None;
@@ -750,6 +855,22 @@ mod tests {
             Some(DataType::Decimal(10, 2))
         );
         assert!(matches!(Node::parse("not json"), Node::Unknown));
+        // DuckDB `HUGEINT` read as `Decimal(38, 0)`: 39 digits don't fit
+        let max = r#"{"op": "eq", "args": [{"col": "h"},
+            {"lit": {"dtype": "decimal[38, 0]", "value": "170141183460469231731687303715884105727"}}]}"#;
+        assert!(
+            matches!(Node::parse(max), Node::Compare(_, _, ref r) if matches!(**r, Node::Unknown))
+        );
+        assert!(mysql_without_setup(DialectName::Singlestore, true));
+        assert!(mysql_without_setup(DialectName::Mysql, false));
+        assert!(!mysql_without_setup(DialectName::Mysql, true));
+        assert!(!mysql_without_setup(DialectName::Postgresql, false));
+        assert!(decimal_fits(0, 1));
+        assert!(decimal_fits(-99_999, 5));
+        assert!(!decimal_fits(100_000, 5));
+        assert!(decimal_fits(10i128.pow(38) - 1, 38));
+        assert!(!decimal_fits(i128::MAX, 38));
+        assert!(!decimal_fits(i128::MIN, 38));
         assert!(matches!(
             Node::parse(r#"{"op": "frobnicate", "args": [{"col": "a"}, {"col": "b"}]}"#),
             Node::Unknown

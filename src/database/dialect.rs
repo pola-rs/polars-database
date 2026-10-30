@@ -48,6 +48,15 @@ pub struct StringSemantics {
     pub empty_is_null: bool,
 }
 
+/// A statement of the dialect's session setup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetupStatement {
+    pub sql: &'static str,
+    /// Pushed literals or comparisons rely on it: a session where it fails is not used.
+    /// Otherwise it only tightens session hygiene, and a server that rejects it is ignored.
+    pub required: bool,
+}
+
 impl StringSemantics {
     pub const BINARY: Self = Self {
         equality_exact: true,
@@ -434,19 +443,41 @@ impl DialectName {
     }
 
     /// Statements run once per session, before any query.
-    pub fn session_setup(self) -> &'static [&'static str] {
-        match self {
-            Self::Postgresql => &[
-                "SET application_name = 'polars'",
-                "SET TIME ZONE 'UTC'",
-                "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
-            ],
-            Self::Mysql => &[
-                "SET time_zone = '+00:00'",
-                // literals are written with backslash escapes
+    pub fn session_setup(self) -> &'static [SetupStatement] {
+        const fn optional(sql: &'static str) -> SetupStatement {
+            SetupStatement {
+                sql,
+                required: false,
+            }
+        }
+        const fn required(sql: &'static str) -> SetupStatement {
+            SetupStatement {
+                sql,
+                required: true,
+            }
+        }
+        const POSTGRES: &[SetupStatement] = &[
+            optional("SET application_name = 'polars'"),
+            optional("SET TIME ZONE 'UTC'"),
+            optional("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"),
+        ];
+        const MYSQL: &[SetupStatement] = &[
+            // `TIMESTAMP` values and literals are read in the session time zone
+            required("SET time_zone = '+00:00'"),
+            // literals are written with backslash escapes
+            required(
                 "SET SESSION sql_mode = REPLACE(@@SESSION.sql_mode, 'NO_BACKSLASH_ESCAPES', '')",
-                "SET SESSION TRANSACTION READ ONLY",
-            ],
+            ),
+            optional("SET SESSION TRANSACTION READ ONLY"),
+        ];
+        // string comparisons are pushed as byte-wise (see `default_string_semantics`)
+        const ORACLE: &[SetupStatement] = &[required(
+            "ALTER SESSION SET NLS_COMP = BINARY NLS_SORT = BINARY",
+        )];
+        match self {
+            Self::Postgresql => POSTGRES,
+            Self::Mysql => MYSQL,
+            Self::Oracle => ORACLE,
             _ => &[],
         }
     }
@@ -454,8 +485,15 @@ impl DialectName {
     /// Quotes a string literal for the fixed metadata queries.
     pub fn quote_str(self, s: &str) -> String {
         let mut out = s.replace('\'', "''");
-        if matches!(self, Self::Mysql | Self::Singlestore | Self::Bigquery) {
+        if matches!(
+            self,
+            Self::Mysql | Self::Singlestore | Self::Bigquery | Self::Redshift
+        ) {
             out = out.replace('\\', "\\\\");
+        }
+        // `E'…'` reads backslashes the same whatever `standard_conforming_strings` is.
+        if self == Self::Postgresql && out.contains('\\') {
+            return format!("E'{}'", out.replace('\\', "\\\\"));
         }
         format!("'{out}'")
     }
@@ -611,6 +649,8 @@ mod tests {
     #[test]
     fn quoting() {
         assert_eq!(DialectName::Mysql.quote_str("a'b\\c"), "'a''b\\\\c'");
+        assert_eq!(DialectName::Postgresql.quote_str("a'b"), "'a''b'");
+        assert_eq!(DialectName::Postgresql.quote_str("a'b\\c"), "E'a''b\\\\c'");
         assert_eq!(DialectName::Postgresql.quote_ident("a\"b"), "\"a\"\"b\"");
         assert_eq!(DialectName::Mssql.quote_ident("a]b"), "[a]]b]");
     }

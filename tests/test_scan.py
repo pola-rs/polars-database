@@ -705,3 +705,543 @@ def test_scan_order_by_needs_one_ordered_read(shop_uri: str) -> None:
         pl.scan_database(
             "SELECT * FROM orders", shop_uri, order_by="id", pushdown=False
         ).collect()
+
+
+def test_scan_query_that_isnt_repeatable_counts_its_own_rows(shop_uri: str) -> None:
+    # each run picks other rows: the count that a negative slice needs is taken from
+    # the rows read, not from a second run (which "changed the table")
+    lf = pl.scan_database("SELECT * FROM orders WHERE abs(random()) % 2 = 0", shop_uri)
+    tail = lf.tail(5).collect()
+    assert tail.height == 5
+    assert tail["id"].is_sorted()
+    n = lf.select(pl.len()).collect().item()
+    assert 0 < n < N_ROWS
+
+
+@pytest.mark.parametrize("driver", ["adbc", "sqlite3"])
+def test_scan_sampled_integer_column_with_a_later_float(
+    tmp_path: Path, driver: str
+) -> None:
+    if driver == "adbc":
+        pytest.importorskip("adbc_driver_sqlite")
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x NUMERIC)")
+        # typed Int64 from the first 1000 rows
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?)",
+            [(i, i if i < 1000 else i + 0.5) for i in range(1100)],
+        )
+        conn.commit()
+    lf = pl.scan_database("t", f"sqlite:///{path}", driver=driver)
+    assert lf.collect_schema()["x"] == pl.Int64
+    # never truncated to 1000
+    with pytest.raises(pl.exceptions.PolarsError, match=r"1000\.5|Float64"):
+        lf.collect()
+    out = pl.scan_database(
+        "t", f"sqlite:///{path}", driver=driver, schema_overrides={"x": pl.Float64}
+    ).collect()
+    assert out.filter(pl.col("id") == 1000)["x"].item() == 1000.5
+
+
+@pytest.mark.parametrize("partition_num", [1, 4])
+def test_scan_order_by_with_range_partitions_keeps_nulls_first(
+    tmp_path: Path, partition_num: int
+) -> None:
+    # SQLite sorts NULLs first: they must come from the first partition, not the last
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, v TEXT)")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?)",
+            [(i, f"v{i}") for i in range(1, 101)] + [(None, "n1"), (None, "n2")],
+        )
+        conn.commit()
+    lf = pl.scan_database(
+        "t",
+        f"sqlite:///{path}",
+        order_by="id",
+        partition_on="id",
+        partition_num=partition_num,
+    )
+    ids = lf.collect()["id"].to_list()
+    assert ids == [None, None, *range(1, 101)]
+
+
+def test_scan_errors_dont_leak_passwords() -> None:
+    # unencoded `#`, `?` and `/` in a URI password, and `;` in a braced ODBC value
+    for uri in [
+        "teradata://u:pa#Sekr3t@h/db",
+        "teradata://u:pa?Sekr3t@h/db",
+        "teradata://u:pa/Sekr3t@h/db",
+        "Driver={No Such Driver 1};Server=s;UID=u;PWD={a;Sekr3t}",
+    ]:
+        with pytest.raises(Exception) as exc:  # noqa: PT011
+            pl.scan_database("t", uri).collect()
+        assert "Sekr3t" not in str(exc.value), uri
+
+
+@pytest.mark.parametrize("driver", ["adbc", "sqlite3"])
+def test_scan_string_literal_with_nul(tmp_path: Path, driver: str) -> None:
+    if driver == "adbc":
+        pytest.importorskip("adbc_driver_sqlite")
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, s TEXT)")
+        conn.executemany("INSERT INTO t VALUES (?, ?)", [(1, "a\0b"), (2, "ab")])
+        conn.commit()
+    lf = pl.scan_database("t", f"sqlite:///{path}", driver=driver)
+    table = lf.collect()
+    for p in [
+        pl.col("s") == "a\0b",
+        pl.col("s") != "a\0b",
+        pl.col("s").is_in(["a\0b"]),
+        pl.col("s").str.starts_with("a\0"),
+    ]:
+        assert_frame_equal(lf.filter(p).collect().sort("id"), table.filter(p))
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT id, unicode(randomblob(1)) AS b FROM orders",
+        "SELECT id, random() % 256 AS b FROM orders",
+    ],
+)
+def test_scan_query_with_a_volatile_function_isnt_partitioned(
+    shop_uri: str, query: str
+) -> None:
+    lf = pl.scan_database(
+        query, shop_uri, partition_on="b", partition_num=4, partition_range=(0, 255)
+    )
+    with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+        lf.collect()
+
+
+def test_scan_hugeint_literals(tmp_path: Path) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    big = 99_999_999_999_999_999_999_999_999_999_999_999_999
+    with duckdb.connect(path) as conn:
+        # HUGEINT is read as Decimal(38, 0), though its maximum has 39 digits
+        conn.execute(
+            "CREATE TABLE t AS SELECT * FROM (VALUES (1, 5::HUGEINT), "
+            f"(2, {big}::HUGEINT), (3, NULL::HUGEINT), (4, {2**127 - 1}::HUGEINT)) "
+            "v(id, h)"
+        )
+    lf = pl.scan_database("t", f"duckdb:///{path}")
+    table = lf.collect()
+    assert table.height == 4
+    values = pl.Series([5, big], dtype=pl.Int128).cast(pl.Decimal(38, 0))
+    for p in [
+        pl.col("h") == 5,
+        pl.col("h") >= pl.lit(big, dtype=pl.Decimal(38, 0)),
+        pl.col("h").is_in(values),
+    ]:
+        assert_frame_equal(lf.filter(p).collect().sort("id"), table.filter(p))
+
+
+def _assert_filters_match(lf: pl.LazyFrame, predicates: list[pl.Expr]) -> None:
+    table = lf.collect()
+    for p in predicates:
+        assert_frame_equal(lf.filter(p).collect().sort("id"), table.filter(p))
+
+
+@pytest.mark.parametrize("source", ["t", "SELECT * FROM t"])
+def test_scan_duckdb_collations_and_non_text_columns(
+    tmp_path: Path, source: str
+) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE t (id INTEGER, s VARCHAR COLLATE NOCASE, v VARCHAR, "
+            "u UUID, e ENUM('a', 'b'))"
+        )
+        conn.execute(
+            "INSERT INTO t VALUES "
+            "(1, 'abc', 'abc', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'a'), "
+            "(2, 'ABC', 'ABC', 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'b')"
+        )
+    lf = pl.scan_database(source, f"duckdb:///{path}")
+    assert lf.collect_schema()["u"] == pl.String
+    _assert_filters_match(
+        lf,
+        [
+            pl.col("s") == "abc",
+            pl.col("s") != "abc",
+            pl.col("s") < "b",
+            pl.col("s").is_in(["abc"]),
+            # the database casts the literal to UUID / the enum
+            pl.col("u") == "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11",
+            pl.col("u") == "zzz",
+            pl.col("u") < "b",
+            pl.col("e") == "nope",
+        ],
+    )
+    # a VARCHAR is still compared, as a superset: the table declares a collation
+    assert "filters 1/1" in lf.filter(pl.col("v") == "abc").explain()
+
+
+def test_scan_duckdb_session_default_collation() -> None:
+    duckdb = pytest.importorskip("duckdb")
+    conn = duckdb.connect()
+    conn.execute("CREATE TABLE t (id INTEGER, v VARCHAR)")
+    conn.execute("INSERT INTO t VALUES (1, 'abc'), (2, 'ABC')")
+    conn.execute("SET default_collation = 'nocase'")
+    lf = pl.scan_database("t", conn)
+    _assert_filters_match(lf, [pl.col("v") == "abc", pl.col("v") < "b"])
+    assert "(0 exact)" in lf.filter(pl.col("v") == "abc").explain()
+
+
+@pytest.mark.parametrize("source", ["t", "SELECT * FROM t"])
+def test_scan_sqlite_strings_without_text_affinity(tmp_path: Path, source: str) -> None:
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, n NUMERIC, x, s TEXT COLLATE NOCASE)")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?, ?, ?)",
+            [
+                (1, "abc", "10", "abc"),
+                (2, 1, 10, "ABC"),
+                (3, 10, None, "b"),
+                (4, 9, None, None),
+                (5, "x", None, None),
+            ],
+        )
+        conn.commit()
+    lf = pl.scan_database(source, f"sqlite:///{path}")
+    assert lf.collect_schema()["n"] == pl.String
+    _assert_filters_match(
+        lf,
+        [
+            pl.col("n") == "01",
+            pl.col("n") == "1.0",
+            pl.col("n") > "9",
+            pl.col("x") == "10",
+            pl.col("s") == "abc",
+            pl.col("s") != "abc",
+            pl.col("s") < "b",
+        ],
+    )
+
+
+@pytest.mark.parametrize("driver", ["sqlite3", "sqlalchemy", "live"])
+def test_scan_row_driver_with_leading_nulls(tmp_path: Path, driver: str) -> None:
+    # more leading NULLs than a row driver's default inference length (100)
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?)",
+            [(i, None if i < 150 else "x") for i in range(200)],
+        )
+        conn.commit()
+    if driver == "live":
+        with closing(sqlite3.connect(path, check_same_thread=False)) as live:
+            df = pl.scan_database("t", live).collect()
+    else:
+        df = pl.scan_database("t", f"sqlite:///{path}", driver=driver).collect()
+    assert df.schema["s"] == pl.String
+    assert df["s"].null_count() == 150
+
+
+def test_scan_sqlalchemy_literals_with_colons(tmp_path: Path) -> None:
+    # SQLAlchemy's `text()` would read `:name` in a pushed literal as a placeholder,
+    # and `\:` as an escaped `:`
+    pytest.importorskip("sqlalchemy")
+    path = tmp_path / "t.db"
+    rows = [(1, "\\:x"), (2, ":x"), (3, "y"), (4, ":abc"), (5, ":lo"), (6, "0")]
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)")
+        conn.executemany("INSERT INTO t VALUES (?, ?)", rows)
+        conn.commit()
+    uri = f"sqlite:///{path}"
+    expected = pl.DataFrame(rows, schema=["id", "s"], orient="row")
+    predicates = [
+        pl.col("s") == "\\:x",
+        pl.col("s") != "\\:x",
+        pl.col("s").is_in(["\\:x"]),
+        pl.col("s") == ":abc",
+        pl.col("s").str.starts_with(":"),
+        pl.col("s") == ":lo",
+    ]
+    lf = pl.scan_database("t", uri, driver="sqlalchemy")
+    # with SQLAlchemy's `:name` parameters, the query's own placeholders are bound
+    q = pl.scan_database(
+        "SELECT id, s FROM t WHERE id > :lo", uri, driver="sqlalchemy", params={"lo": 0}
+    )
+    for p in predicates:
+        want = sorted(expected.filter(p)["id"].to_list())
+        assert sorted(lf.filter(p).collect()["id"].to_list()) == want, p
+        assert sorted(q.filter(p).collect()["id"].to_list()) == want, p
+
+
+def test_scan_sqlalchemy_live_connection_left_outside_a_transaction(
+    shop_uri: str,
+) -> None:
+    sqlalchemy = pytest.importorskip("sqlalchemy")
+    engine = sqlalchemy.create_engine(shop_uri)
+    try:
+        with engine.connect() as conn:
+            assert pl.scan_database("orders", conn).collect().height == N_ROWS
+            assert not conn.in_transaction()
+            # a transaction the user opened is theirs: it stays open
+            conn.exec_driver_sql("SELECT 1")
+            pl.scan_database("orders", conn).head(1).collect()
+            assert conn.in_transaction()
+    finally:
+        engine.dispose()
+
+
+def test_scan_engine_with_a_small_pool(shop_uri: str, expected: pl.DataFrame) -> None:
+    # more partitions than the pool has connections: they share them, rather than
+    # wait for the pool to time out
+    sqlalchemy = pytest.importorskip("sqlalchemy")
+    engine = sqlalchemy.create_engine(
+        shop_uri,
+        poolclass=sqlalchemy.pool.QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=2,
+    )
+    try:
+        lf = pl.scan_database(
+            "orders", engine, partition_on="id", partition_num=4, max_connections=4
+        )
+        assert_frame_equal(_sorted(lf.collect()), expected)
+    finally:
+        engine.dispose()
+
+
+def test_connectorx_checks_the_connection_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # a failed login fails `connect`, rather than every catalog lookup in turn
+    from polars.io.database import _utils
+
+    from polars_database import _bridge
+
+    calls: list[str] = []
+
+    def read(sql: str, *, connection_uri: str, protocol: str | None) -> Any:
+        calls.append(connection_uri)
+        if "wrong" in connection_uri:
+            msg = "timed out waiting for connection: password authentication failed"
+            raise RuntimeError(msg)
+        return pl.DataFrame({"x": [1]})
+
+    monkeypatch.setattr(_utils, "_read_sql_connectorx", read)
+    monkeypatch.setattr(_bridge, "_CONNECTORX_CHECKED", set())
+    with pytest.raises(RuntimeError, match="password authentication failed"):
+        _bridge._ConnectorXSession("postgresql://u:wrong@h/db", "postgresql")
+    good = "postgresql://u:right@h/db"
+    _bridge._ConnectorXSession(good, "postgresql")
+    _bridge._ConnectorXSession(good, "postgresql")
+    assert calls == ["postgresql://u:wrong@h/db", good]
+
+
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
+def test_sqlite_uri_paths_mean_one_file_for_every_driver(
+    driver: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip(
+        {"adbc": "adbc_driver_sqlite", "sqlite3": "sqlite3"}.get(driver, driver)
+    )
+    monkeypatch.chdir(tmp_path)
+    for name, x in [("rel.db", 1), ("a b.db", 2)]:
+        with closing(sqlite3.connect(tmp_path / name)) as conn:
+            conn.execute("CREATE TABLE t (x INTEGER)")
+            conn.execute("INSERT INTO t VALUES (?)", (x,))
+            conn.commit()
+
+    def read(uri: str) -> int:
+        return pl.scan_database("t", uri, driver=driver).collect().item()
+
+    # as SQLAlchemy reads them: three slashes are relative, four absolute
+    assert read("sqlite:///rel.db") == 1
+    assert read(f"sqlite:///{tmp_path}/rel.db") == 1
+    assert read("sqlite:rel.db") == 1
+    assert read("sqlite:///a%20b.db") == 2
+    if driver == "connectorx":
+        with pytest.raises(Exception, match="connectorx can't open SQLite with URI"):
+            read("sqlite:///rel.db?mode=ro")
+    else:
+        assert read("sqlite:///rel.db?mode=ro") == 1
+    # no file was created elsewhere
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a b.db", "rel.db"]
+
+
+@pytest.mark.parametrize("driver", ["duckdb", "adbc"])
+def test_scan_duckdb_string_literal_with_nul(tmp_path: Path, driver: str) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE t AS SELECT * FROM (VALUES (1, 'a' || chr(0) || 'b'), "
+            "(2, 'ab')) v(id, s)"
+        )
+    lf = pl.scan_database("t", f"duckdb:///{path}", driver=driver)
+    table = lf.collect()
+    for p in [pl.col("s") == "a\0b", pl.col("s") != "a\0b"]:
+        assert_frame_equal(lf.filter(p).collect().sort("id"), table.filter(p))
+        # the Python module reads the whole query text; C drivers stop at the NUL
+        pushed = "filters 1/1" in lf.filter(p).explain()
+        assert pushed is (driver == "duckdb")
+
+
+def test_scan_engine_with_a_shared_connection_pool() -> None:
+    # a StaticPool's one connection is the user's: used as a live connection, so its
+    # temporary tables are visible and it isn't discarded
+    sqlalchemy = pytest.importorskip("sqlalchemy")
+    engine = sqlalchemy.create_engine(
+        "sqlite://",
+        poolclass=sqlalchemy.pool.StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    try:
+        with engine.connect() as conn:
+            conn.exec_driver_sql("CREATE TEMPORARY TABLE tmp (id INTEGER, s TEXT)")
+            conn.exec_driver_sql("INSERT INTO tmp VALUES (1, 'a'), (2, 'b')")
+            conn.commit()
+        lf = pl.scan_database("tmp", engine)
+        assert sorted(lf.collect()["id"].to_list()) == [1, 2]
+        assert lf.filter(pl.col("s") == "b").collect()["id"].to_list() == [2]
+        assert sorted(lf.collect()["id"].to_list()) == [1, 2]
+    finally:
+        engine.dispose()
+
+
+def test_engine_pool_capacity() -> None:
+    sqlalchemy = pytest.importorskip("sqlalchemy")
+    from polars.io.database._scan import _engine_pool_capacity
+
+    def capacity(**kwargs: Any) -> int | None:
+        engine = sqlalchemy.create_engine(
+            "sqlite:///unused.db", poolclass=sqlalchemy.pool.QueuePool, **kwargs
+        )
+        return _engine_pool_capacity(engine)
+
+    assert capacity(pool_size=2, max_overflow=3) == 5
+    # unbounded
+    assert capacity(pool_size=0) is None
+    assert capacity(pool_size=2, max_overflow=-1) is None
+
+
+def test_connectorx_missing_sqlite_file(tmp_path: Path) -> None:
+    # ConnectorX would retry opening it for minutes
+    pytest.importorskip("connectorx")
+    path = tmp_path / "missing.db"
+    with pytest.raises(Exception, match="no SQLite database file"):
+        pl.scan_database("t", f"sqlite:///{path}", driver="connectorx").collect()
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("driver", ["adbc", "sqlite3"])
+def test_scan_empty_sqlite_table_is_typed_by_affinity(
+    tmp_path: Path, driver: str
+) -> None:
+    if driver == "adbc":
+        pytest.importorskip("adbc_driver_sqlite")
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute(
+            "CREATE TABLE t (id INTEGER, s VARCHAR(10), f DOUBLE, b BLOB, d DATE)"
+        )
+    lf = pl.scan_database("t", f"sqlite:///{path}", driver=driver)
+    assert dict(lf.collect_schema()) == {
+        "id": pl.Int64,
+        "s": pl.String,
+        "f": pl.Float64,
+        "b": pl.Binary,
+        "d": pl.String,
+    }
+    # rows added after planning fit the planned schema
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("INSERT INTO t VALUES (1, 'x', 1.5, x'00', '2020-01-02')")
+        conn.commit()
+    assert lf.collect().rows() == [(1, "x", 1.5, b"\x00", "2020-01-02")]
+
+
+def test_scan_sqlite_user_schema_string_isnt_taken_as_text(tmp_path: Path) -> None:
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, x, c CHAR(3))")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?, ?)", [(1, "10", "a"), (2, 10, "a ")]
+        )
+        conn.commit()
+    schema = {"id": pl.Int64, "x": pl.String, "c": pl.String}
+    lf = pl.scan_database("t", f"sqlite:///{path}", schema=schema)
+    _assert_filters_match(lf, [pl.col("x") == "10", pl.col("x") != "10"])
+    # SQLite doesn't pad CHAR(n): its strings compare exactly
+    exact = pl.scan_database("t", f"sqlite:///{path}").filter(pl.col("c") == "a")
+    assert "(1 exact)" in exact.explain()
+    assert exact.collect()["id"].to_list() == [1]
+
+
+def test_scan_duckdb_names_resolve_case_insensitively(tmp_path: Path) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, u UUID, v VARCHAR)")
+        conn.execute(
+            "INSERT INTO t VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'a')"
+        )
+    for source in ["T", "MAIN.T", "t"]:
+        lf = pl.scan_database(source, f"duckdb:///{path}")
+        _assert_filters_match(lf, [pl.col("u") == "zzz", pl.col("v") != "a"])
+        assert "(1 exact)" in lf.filter(pl.col("v") == "a").explain(), source
+
+
+def test_scan_duckdb_uri_paths_via_adbc(tmp_path: Path) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    with duckdb.connect(str(tmp_path / "d.db")) as conn:
+        conn.execute("CREATE TABLE t AS SELECT 1 AS id")
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        # relative, as the Python backends (and SQLAlchemy) read it
+        for uri in ["duckdb:///d.db", "duckdb:///d.db?read_only=true"]:
+            try:
+                lf = pl.scan_database("t", uri, driver="adbc")
+                assert lf.collect()["id"].to_list() == [1], uri
+            except pl.exceptions.PolarsError as e:
+                if "driver" in str(e) and "not found" in str(e).lower():
+                    pytest.skip("no DuckDB ADBC driver")
+                raise
+    finally:
+        os.chdir(cwd)
+
+
+def test_scan_shared_connection_pool_keeps_the_users_transaction() -> None:
+    # the pool's reset on return would roll back the one shared connection
+    sqlalchemy = pytest.importorskip("sqlalchemy")
+    engine = sqlalchemy.create_engine(
+        "sqlite://",
+        poolclass=sqlalchemy.pool.StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("CREATE TABLE t (id INTEGER)")
+            conn.exec_driver_sql("INSERT INTO t VALUES (1), (2)")
+        user = engine.connect()
+        user.exec_driver_sql("INSERT INTO t VALUES (3)")  # not committed
+        assert pl.scan_database("t", engine).collect().height == 3
+        assert user.in_transaction()
+        user.commit()
+        user.close()
+        with engine.connect() as conn:
+            assert conn.exec_driver_sql("SELECT count(*) FROM t").scalar() == 3
+    finally:
+        engine.dispose()
+
+
+def test_restored_setting_literals() -> None:
+    from polars_database._bridge import _sql_str
+
+    assert _sql_str("UTC", dialect="postgresql") == "'UTC'"
+    # independent of `standard_conforming_strings`
+    assert _sql_str("a\\b'c", dialect="postgresql") == "E'a\\\\b''c'"
+    assert _sql_str("a\\b", dialect="mysql") == "'a\\\\b'"

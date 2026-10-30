@@ -119,6 +119,16 @@ pub fn declared_dtype(dialect: DialectName, db_type: &str) -> Option<DataType> {
             return Some(DataType::Int64);
         }
     }
+    // MySQL `decimal(30,15) unsigned zerofill`: the attributes don't change the values.
+    let mut t = t.as_str();
+    if matches!(dialect, DialectName::Mysql | DialectName::Singlestore) {
+        while let Some(rest) = t
+            .strip_suffix("unsigned")
+            .or_else(|| t.strip_suffix("zerofill"))
+        {
+            t = rest.trim_end();
+        }
+    }
     let args = ["numeric(", "decimal(", "number("]
         .iter()
         .find_map(|p| t.strip_prefix(p))?;
@@ -137,7 +147,13 @@ pub fn declared_dtype(dialect: DialectName, db_type: &str) -> Option<DataType> {
 }
 
 /// Casts a batch to the planned schema: selects the planned columns in order and casts each.
-pub fn cast_to_schema(df: &DataFrame, schema: &Schema) -> PolarsResult<DataFrame> {
+/// The columns in `overrides` (`schema_overrides`) are cast as the user asked, also when
+/// a float becomes an integer.
+pub fn cast_to_schema(
+    df: &DataFrame,
+    schema: &Schema,
+    overrides: Option<&Schema>,
+) -> PolarsResult<DataFrame> {
     let height = df.height();
     let mut columns = Vec::with_capacity(schema.len());
     for (name, dtype) in schema.iter() {
@@ -189,6 +205,9 @@ pub fn cast_to_schema(df: &DataFrame, schema: &Schema) -> PolarsResult<DataFrame
                     )
                 })?;
             check_decimal_exact(col, &cast)?;
+            if overrides.is_none_or(|o| !o.contains(name)) {
+                check_numeric_exact(col, &cast)?;
+            }
             cast
         };
         columns.push(col);
@@ -237,6 +256,37 @@ fn check_decimal_exact(src: &Column, cast: &Column) -> PolarsResult<()> {
         ),
         None => Ok(()),
     }
+}
+
+/// A cast between integers and floats (or from a decimal to an integer) must not round
+/// either: a strict cast truncates `1000.5` to `1000`, and `2**53 + 1` becomes
+/// `9007199254740992.0`. Columns typed from a sample (SQLite, which has no column types)
+/// may hold values of both kinds.
+fn check_numeric_exact(src: &Column, cast: &Column) -> PolarsResult<()> {
+    let (from, to) = (src.dtype(), cast.dtype());
+    let lossy = (to.is_integer() && (from.is_float() || from.is_decimal()))
+        || (to.is_float() && from.is_integer());
+    if !lossy {
+        return Ok(());
+    }
+    let back = cast.cast(from)?;
+    let same = src
+        .as_materialized_series()
+        .equal_missing(back.as_materialized_series())?;
+    let Some(i) = same.iter().position(|v| v != Some(true)) else {
+        return Ok(());
+    };
+    let alt = if to.is_integer() {
+        "pl.Float64"
+    } else {
+        "pl.Int64"
+    };
+    polars_bail!(
+        SchemaMismatch:
+        "database column '{}' has the value {}, which {to} would round; read the column with \
+        schema_overrides={{'{}': {alt}}} (or as pl.String)",
+        src.name(), src.get(i)?, src.name()
+    )
 }
 
 /// A `TIME` read as a duration (PyMySQL returns `timedelta`s) as a time of day. MySQL `TIME`
@@ -409,6 +459,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inexact_numeric_casts_fail() {
+        let cast = |col: Column, dtype: DataType| {
+            let df = DataFrame::new(col.len(), vec![col]).unwrap();
+            cast_to_schema(
+                &df,
+                &Schema::from_iter([Field::new("x".into(), dtype)]),
+                None,
+            )
+        };
+        let floats = |v: &[f64]| Column::new("x".into(), v);
+        assert!(cast(floats(&[1.0, 2.0]), DataType::Int64).is_ok());
+        let e = cast(floats(&[1.0, 1000.5]), DataType::Int64).unwrap_err();
+        assert!(e.to_string().contains("1000.5"), "{e}");
+        let ints = |v: &[i64]| Column::new("x".into(), v);
+        assert!(cast(ints(&[1, 1 << 53]), DataType::Float64).is_ok());
+        assert!(cast(ints(&[1, (1 << 53) + 1]), DataType::Float64).is_err());
+        let with_null = Column::new("x".into(), &[Some(1.0), None]);
+        assert!(cast(with_null, DataType::Int64).is_ok());
+    }
+
+    #[test]
     fn declared_types() {
         {
             let pg = DialectName::Postgresql;
@@ -443,6 +514,14 @@ mod tests {
         assert_eq!(
             declared_dtype(my, "bigint unsigned"),
             Some(DataType::UInt64)
+        );
+        assert_eq!(
+            declared_dtype(my, "decimal(30,15) unsigned"),
+            Some(DataType::Decimal(30, 15))
+        );
+        assert_eq!(
+            declared_dtype(my, "DECIMAL(20,5) UNSIGNED ZEROFILL"),
+            Some(DataType::Decimal(20, 5))
         );
         let ms = DialectName::Mssql;
         assert_eq!(declared_dtype(ms, "tinyint"), Some(DataType::UInt8));

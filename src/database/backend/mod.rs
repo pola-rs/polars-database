@@ -47,6 +47,16 @@ impl BackendKind {
     pub fn needs_python(&self) -> bool {
         !matches!(self, Self::Adbc { .. })
     }
+
+    /// Whether statements run in a session that later queries share, so that the dialect's
+    /// session setup applies to them. ConnectorX and arrow-odbc open one per query.
+    pub fn has_sessions(&self) -> bool {
+        match self {
+            Self::ConnectorX => false,
+            Self::Odbc { module } => module != "arrow_odbc",
+            _ => true,
+        }
+    }
 }
 
 impl fmt::Display for BackendKind {
@@ -242,8 +252,8 @@ impl DatabaseBackend for PythonBackend {
             },
             _ => caps |= BackendCapabilities::STREAMING | BackendCapabilities::CANCEL,
         }
-        if matches!(self.choice.kind, BackendKind::ConnectorX) {
-            // ConnectorX has no sessions: setup statements can't apply to later queries.
+        if !self.choice.kind.has_sessions() {
+            // Setup statements can't apply to later queries.
             caps.remove(BackendCapabilities::SESSION_SETUP);
         }
         caps
@@ -260,8 +270,9 @@ impl DatabaseBackend for PythonBackend {
 }
 
 /// Opens a session and runs the dialect's session setup (read-only transactions, UTC, the
-/// application name). A setup statement the server rejects is skipped: it only tightens
-/// session hygiene, it never changes results.
+/// application name, binary string comparisons). An optional setup statement the server
+/// rejects is skipped: it only tightens session hygiene. A required one fails the session:
+/// the pushed SQL was written for it, and would mean something else without it.
 pub fn open_session(
     backend: &dyn DatabaseBackend,
     spec: &ConnectionSpec,
@@ -273,10 +284,25 @@ pub fn open_session(
         .contains(BackendCapabilities::SESSION_SETUP)
     {
         for stmt in dialect.session_setup() {
-            if let Err(e) = session.execute_update(stmt) {
-                if polars_core::config::verbose() {
-                    eprintln!("[scan_database]: session setup '{stmt}' failed, skipped: {e}");
-                }
+            match session.execute_update(stmt.sql) {
+                Ok(()) => {},
+                Err(e) if stmt.required => {
+                    return Err(e.context(
+                        format!(
+                            "session setup '{}' failed; the {dialect} queries rely on it",
+                            stmt.sql
+                        )
+                        .into(),
+                    ));
+                },
+                Err(e) => {
+                    if polars_core::config::verbose() {
+                        eprintln!(
+                            "[scan_database]: session setup '{}' failed, skipped: {e}",
+                            stmt.sql
+                        );
+                    }
+                },
             }
         }
     }
@@ -310,14 +336,23 @@ fn align_null_columns(mut a: DataFrame, mut b: DataFrame) -> PolarsResult<(DataF
 }
 
 /// Whether a failed connect or query is worth retrying: lost or refused connections, busy
-/// servers and listeners, timeouts. Authentication, permission and SQL errors fail the same
-/// way again, and retrying a failed login can lock the account.
+/// servers and listeners, connect timeouts. Authentication, permission and SQL errors fail
+/// the same way again, and retrying a failed login can lock the account. Statement and lock
+/// timeouts and cancelled queries are the user's limits: a retry would only defeat them.
 pub fn is_transient(error: &polars_error::PolarsError) -> bool {
     // The plugin's own errors (bad arguments, values it can't read): never the server's.
     if matches!(error, polars_error::PolarsError::InvalidOperation(_)) {
         return false;
     }
-    let msg = error.to_string().to_ascii_lowercase();
+    // Drivers echo their input (a DSN, which holds `connect_timeout=`; a value or name):
+    // URIs are dropped, and the keywords below are phrases that input rarely holds.
+    let msg = error
+        .to_string()
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .filter(|w| !w.contains("://"))
+        .collect::<Vec<_>>()
+        .join(" ");
     const PERMANENT: &[&str] = &[
         "password",
         "authenticat",
@@ -333,6 +368,25 @@ pub fn is_transient(error: &polars_error::PolarsError) -> bool {
         "unknown database",
         // ConnectorX's own pool already waited ~30s, retrying each connect itself
         "timed out waiting for connection",
+        // cancelled statements, statement and lock timeouts: SQLSTATE 57014 (Postgres
+        // `QueryCanceled`), 55P03, ODBC HYT00, ADBC's CANCELLED status, MySQL 1205 / 3024 /
+        // 1317, Oracle ORA-01013 and python-oracledb's call timeout
+        "57014",
+        "55p03",
+        "hyt00",
+        "querycanceled",
+        "canceling statement",
+        "cancelled",
+        "canceled",
+        "statement timeout",
+        "lock timeout",
+        "lock wait timeout",
+        "query timeout",
+        "max_execution_time",
+        "maximum statement execution time",
+        "query execution was interrupted",
+        "ora-01013",
+        "dpy-4024",
     ];
     const TRANSIENT: &[&str] = &[
         "connection refused",
@@ -349,8 +403,13 @@ pub fn is_transient(error: &polars_error::PolarsError) -> bool {
         "too many clients",
         "the database system is starting up",
         "the database system is shutting down",
+        // connect timeouts (libpq's "timeout expired", sockets, ODBC HYT01)
         "timed out",
-        "timeout",
+        "timeout expired",
+        "connect timeout",
+        "connection timeout",
+        "connecttimeout",
+        "hyt01",
         "temporarily unavailable",
         "ora-12514",
         "ora-12516",
@@ -453,7 +512,87 @@ pub fn open_backend(
 mod tests {
     use polars_error::polars_err;
 
-    use super::is_transient;
+    use super::*;
+    use crate::database::connection::ConnectionTarget;
+
+    #[test]
+    fn session_setup_needs_sessions() {
+        for (kind, sessions) in [
+            ("odbc:arrow_odbc", false),
+            ("connectorx", false),
+            ("odbc:pyodbc", true),
+            ("python:pymysql", true),
+            ("adbc:postgresql", true),
+        ] {
+            assert_eq!(
+                BackendKind::parse(kind).unwrap().has_sessions(),
+                sessions,
+                "{kind}"
+            );
+        }
+    }
+
+    /// A backend whose sessions reject every statement holding `reject`.
+    struct Rejecting {
+        choice: BackendChoice,
+        reject: &'static str,
+    }
+
+    struct RejectingSession(&'static str);
+
+    impl DatabaseSession for RejectingSession {
+        fn execute(&mut self, sql: &str, _: Option<usize>) -> PolarsResult<BatchIter> {
+            if sql.contains(self.0) {
+                polars_bail!(ComputeError: "rejected: {sql}");
+            }
+            Ok(Box::new(std::iter::empty()))
+        }
+    }
+
+    impl DatabaseBackend for Rejecting {
+        fn choice(&self) -> &BackendChoice {
+            &self.choice
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::SESSION_SETUP
+        }
+
+        fn connect(
+            &self,
+            _: &ConnectionSpec,
+            _: DialectName,
+        ) -> PolarsResult<Box<dyn DatabaseSession>> {
+            Ok(Box::new(RejectingSession(self.reject)))
+        }
+    }
+
+    #[test]
+    fn required_session_setup() {
+        let spec = ConnectionSpec::new(ConnectionTarget::Uri("mysql://h/db".into()));
+        let backend = |reject| Rejecting {
+            choice: BackendChoice {
+                kind: BackendKind::Adbc {
+                    driver: "mysql".into(),
+                },
+                version: None,
+                location: None,
+                reason: "test".into(),
+            },
+            reject,
+        };
+        // the read-only transaction only tightens hygiene
+        assert!(open_session(&backend("READ ONLY"), &spec, DialectName::Mysql).is_ok());
+        // literals are written for the time zone and backslash escapes
+        for reject in ["time_zone", "sql_mode"] {
+            let e = open_session(&backend(reject), &spec, DialectName::Mysql)
+                .err()
+                .unwrap();
+            assert!(e.to_string().contains("session setup"), "{e}");
+        }
+        assert!(open_session(&backend("NLS_COMP"), &spec, DialectName::Oracle).is_err());
+        assert!(open_session(&backend("TIME ZONE"), &spec, DialectName::Postgresql).is_ok());
+    }
 
     #[test]
     fn transient_errors() {
@@ -463,6 +602,8 @@ mod tests {
             "ORA-12520: TNS:listener could not find available handler",
             "ConnectionRefusedError: [Errno 111] Connection refused",
             "FATAL: sorry, too many clients already",
+            "OperationalError: (2003, \"Can't connect to MySQL server on '127.0.0.1' (timed out)\")",
+            "[HYT01] [Microsoft][ODBC Driver 18 for SQL Server]Login timeout expired",
         ] {
             assert!(is_transient(&e(m)), "{m}");
         }
@@ -473,6 +614,17 @@ mod tests {
             "syntax error at end of input",
             "division by zero",
             "timed out waiting for connection: password authentication failed",
+            // statement and lock timeouts, cancels
+            "QueryCanceled: canceling statement due to statement timeout",
+            "ADBC execute failed (CANCELLED) in 'libadbc_driver_postgresql.so': ERROR: \
+             canceling statement due to statement timeout (SQLSTATE 57014)",
+            "OperationalError: (1205, 'Lock wait timeout exceeded; try restarting transaction')",
+            "(3024, 'Query execution was interrupted, maximum statement execution time exceeded')",
+            "ORA-01013: user requested cancel of current operation",
+            "[HYT00] [Microsoft][ODBC Driver 18 for SQL Server]Query timeout expired",
+            // echoed input
+            "invalid connection option \"redshift://h:5439/db?connect_timeout\"",
+            "invalid input syntax for type integer: \"timeout\"",
         ] {
             assert!(!is_transient(&e(m)), "{m}");
         }

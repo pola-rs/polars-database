@@ -25,7 +25,7 @@ use crate::database::backend::adbc::{self, FoundDriver, StreamOwner};
 use crate::database::backend::{
     BackendKind, BatchIter, CancelHandle, DatabaseSession, ProbeResult, PythonDriverBridge,
 };
-use crate::database::connection::{ConnectionSpec, ConnectionTarget};
+use crate::database::connection::{ConnectionSpec, ConnectionTarget, scrub_secrets};
 use crate::database::dialect::DialectName;
 
 fn bridge_module(py: Python<'_>) -> PyResult<&Bound<'_, PyModule>> {
@@ -37,6 +37,12 @@ fn bridge_module(py: Python<'_>) -> PyResult<&Bound<'_, PyModule>> {
 
 fn err(e: PyErr) -> polars_error::PolarsError {
     polars_err!(ComputeError: "{e}")
+}
+
+/// A driver error with the connection's secrets removed: some drivers echo the DSN, password
+/// included.
+fn scrubbed_err(e: PyErr, secrets: &[String]) -> polars_error::PolarsError {
+    polars_err!(ComputeError: "{}", scrub_secrets(&e.to_string(), secrets))
 }
 
 /// Moves the Arrow C stream out of an `arrow_array_stream` capsule, leaving a released stream
@@ -168,6 +174,7 @@ impl PythonDriverBridge for PyDriverBridge {
         dialect: DialectName,
         batch_size: Option<usize>,
     ) -> PolarsResult<Box<dyn DatabaseSession>> {
+        let secrets: Arc<[String]> = spec.secrets().into();
         Python::attach(|py| {
             let (target_kind, obj) = target(py, spec)?;
             let session = bridge_module(py)?.call_method1(
@@ -191,9 +198,10 @@ impl PythonDriverBridge for PyDriverBridge {
                 session: Arc::new(session.unbind()),
                 can_cancel,
                 batch_size,
+                secrets: secrets.clone(),
             }) as Box<dyn DatabaseSession>)
         })
-        .map_err(err)
+        .map_err(|e| scrubbed_err(e, &secrets))
     }
 
     fn adbc_connect(
@@ -242,6 +250,8 @@ struct PySession {
     session: Arc<Py<PyAny>>,
     can_cancel: bool,
     batch_size: Option<usize>,
+    /// Scrubbed from driver errors.
+    secrets: Arc<[String]>,
 }
 
 impl DatabaseSession for PySession {
@@ -250,13 +260,16 @@ impl DatabaseSession for PySession {
             self.session
                 .call_method1(py, "execute", (sql, batch_size.or(self.batch_size)))
         })
-        .map_err(err)?;
-        Ok(Box::new(PyBatches { iter: Some(iter) }))
+        .map_err(|e| scrubbed_err(e, &self.secrets))?;
+        Ok(Box::new(PyBatches {
+            iter: Some(iter),
+            secrets: self.secrets.clone(),
+        }))
     }
 
     fn execute_update(&mut self, sql: &str) -> PolarsResult<()> {
         Python::attach(|py| self.session.call_method1(py, "execute_update", (sql,)))
-            .map_err(err)?;
+            .map_err(|e| scrubbed_err(e, &self.secrets))?;
         Ok(())
     }
 
@@ -288,6 +301,7 @@ impl Drop for PySession {
 /// Batches from a Python iterator of DataFrames.
 struct PyBatches {
     iter: Option<Py<PyAny>>,
+    secrets: Arc<[String]>,
 }
 
 impl Iterator for PyBatches {
@@ -312,7 +326,7 @@ impl Iterator for PyBatches {
             },
             Err(e) => {
                 self.iter = None;
-                Some(Err(err(e)))
+                Some(Err(scrubbed_err(e, &self.secrets)))
             },
         }
     }

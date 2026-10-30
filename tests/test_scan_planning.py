@@ -146,7 +146,13 @@ def test_sql_snapshot_details() -> None:
     assert "filters 0/1" in plans["mysql"]["not_superset"]["pushed"]
     assert "filters 1/1 (1 exact)" in plans["mysql"]["not_exact"]["pushed"]
     assert "filters 1/1 (0 exact)" in plans["mysql"]["str_eq"]["pushed"]
-    assert "filters 1/1 (1 exact)" in plans["postgresql"]["str_eq"]["pushed"]
+    # with `schema=` collations are unknown: string equality is a superset everywhere
+    assert "filters 1/1 (0 exact)" in plans["postgresql"]["str_eq"]["pushed"]
+    # ... and so are types the dtype doesn't show: a MySQL integer may be a YEAR (which
+    # reads `42` as 2042), a SQLite string column may hold numbers (affinity)
+    assert "filters 0/1" in plans["mysql"]["int_cmp"]["pushed"]
+    assert "filters 1/1" in plans["mysql"]["not_exact"]["pushed"]
+    assert "filters 0/1" in plans["sqlite"]["str_eq"]["pushed"]
     # floats: pushed only where comparisons agree with Polars (total order NaN)
     assert "filters 0/1" in plans["bigquery"]["float_cmp"]["pushed"]
     assert "filters 1/1 (1 exact)" in plans["postgresql"]["float_cmp"]["pushed"]
@@ -290,7 +296,11 @@ def test_plan_with_password_hides_it() -> None:
 @pytest.mark.parametrize(
     ("uri", "path"),
     [
-        ("sqlite:////tmp/a.db", "//tmp/a.db"),
+        # as SQLAlchemy reads them: three slashes are relative, four absolute
+        ("sqlite:////tmp/a.db", "/tmp/a.db"),
+        ("sqlite:///rel.db", "rel.db"),
+        ("sqlite:rel.db", "rel.db"),
+        ("sqlite:///a%20b.db?mode=ro", "a b.db"),
         ("duckdb:///C:\\Users\\a\\t.duckdb", "C:\\Users\\a\\t.duckdb"),
         ("sqlite:///d:/a/b.db", "d:/a/b.db"),
         ("sqlite://", ":memory:"),
@@ -654,3 +664,354 @@ def test_all_null_first_batch(tmp_path: Path) -> None:
     )
     assert lf.collect_schema()["v"] == pl.Int64
     assert lf.collect()["v"].null_count() == 500
+
+
+# connection URIs of the Python backends
+
+
+def test_credential_provider_keeps_the_uri_password() -> None:
+    from polars_database._bridge import _with_credentials
+
+    uri = "postgresql://u:pw@h/db"
+    assert _with_credentials(uri, ("v", None)) == "postgresql://v:pw@h/db"
+    assert _with_credentials(uri, (None, "p@ss")) == "postgresql://u:p%40ss@h/db"
+    # an unencoded `#` in the password: encoded, so that drivers read the host
+    assert (
+        _with_credentials("postgresql://u:pa#ss@h/db?x=1", None)
+        == "postgresql://u:pa%23ss@h/db?x=1"
+    )
+
+
+def test_credential_provider_tuples() -> None:
+    from polars_database._bridge import credentials
+
+    with pytest.raises(TypeError, match=r"not a \(user, password\) tuple"):
+        credentials(lambda: ("u", "p"))
+    # `(credentials, expiry)`
+    assert credentials(lambda: ({"user": "u"}, None)) == ("u", None)
+
+
+@pytest.mark.parametrize("password", ["pa#ss", "pa?ss", "pa/ss", "p@ss"])
+def test_url_parts_with_unencoded_password(password: str) -> None:
+    from polars_database._bridge import _url_parts
+
+    assert _url_parts(f"postgresql+pg8000://u:{password}@h:5/db?x=1") == {
+        "host": "h",
+        "port": 5,
+        "user": "u",
+        "password": password,
+        "database": "db",
+    }
+    assert _url_parts("postgresql://h:5/db?x=a@b")["host"] == "h"
+
+
+@pytest.mark.parametrize(
+    ("kind", "uri", "added"),
+    [
+        ("python:psycopg", "postgresql://h/db", True),
+        ("python:psycopg2", "redshift://h/db", True),
+        ("connectorx", "postgresql://h/db", True),
+        ("sqlalchemy", "postgresql://h/db", True),
+        ("sqlalchemy", "postgresql+psycopg://h/db", True),
+        # pg8000 and redshift_connector reject `connect_timeout`
+        ("sqlalchemy", "postgresql+pg8000://h/db", False),
+        ("sqlalchemy", "redshift+redshift_connector://h/db", False),
+        ("python:pg8000", "postgresql://h/db", False),
+        ("python:redshift_connector", "redshift://h/db", False),
+    ],
+)
+def test_connect_timeout_only_for_libpq(kind: str, uri: str, added: bool) -> None:
+    from polars_database._bridge import _with_connect_timeout
+
+    dialect = uri.split(":")[0].split("+")[0]
+    out = _with_connect_timeout(uri, dialect, kind)
+    assert ("connect_timeout=" in out) == added
+
+
+def test_redshift_uri_for_libpq() -> None:
+    from polars_database._bridge import _libpq_uri
+
+    assert _libpq_uri("redshift+psycopg2://u@h/db?x=1") == "postgresql://u@h/db?x=1"
+    assert _libpq_uri("postgres://u@h/db") == "postgres://u@h/db"
+
+
+def test_uri_query_parameters_to_driver_arguments() -> None:
+    import ssl
+
+    from polars_database._bridge import _query_kwargs
+
+    kw = _query_kwargs(
+        "pymysql",
+        "mysql://h/db?charset=latin1&unix_socket=/s&ssl_ca=/ca&connect_timeout=3",
+    )
+    assert kw == {
+        "charset": "latin1",
+        "unix_socket": "/s",
+        "ssl_ca": "/ca",
+        "connect_timeout": 3.0,
+    }
+    kw = _query_kwargs("pymysql", "mysql://h/db?ssl_mode=VERIFY_IDENTITY")
+    assert kw == {"ssl_verify_cert": True, "ssl_verify_identity": True}
+    kw = _query_kwargs("MySQLdb", "mysql://h/db?ssl_ca=/ca&ssl_mode=required")
+    assert kw == {"ssl_mode": "REQUIRED", "ssl": {"ca": "/ca"}}
+
+    kw = _query_kwargs(
+        "pg8000", "postgresql://h/db?sslmode=verify-full&host=/run", 5433
+    )
+    ctx = kw.pop("ssl_context")
+    assert isinstance(ctx, ssl.SSLContext)
+    assert ctx.check_hostname and ctx.verify_mode == ssl.CERT_REQUIRED
+    assert kw == {"unix_sock": "/run/.s.PGSQL.5433"}
+    # `prefer` (libpq's default): pg8000 can't fall back, so no TLS, as without it
+    assert _query_kwargs("pg8000", "postgresql://h/db?sslmode=prefer") == {}
+
+    assert _query_kwargs("trino", "trino://h/c?SSL=true&verify=/ca.pem") == {
+        "http_scheme": "https",
+        "verify": "/ca.pem",
+    }
+    assert _query_kwargs("pymssql", "mssql://h/db?encrypt=yes&charset=UTF-8") == {
+        "encryption": "require",
+        "charset": "UTF-8",
+    }
+
+
+@pytest.mark.parametrize(
+    ("module", "uri", "match"),
+    [
+        ("pymysql", "mysql://h/db?charset=x&bogus=1", r"pymysql .* \['bogus'\]"),
+        ("pg8000", "postgresql://h/db?gssencmode=require", "gssencmode"),
+        ("pg8000", "postgresql://h/db?target_session_attrs=read-write", "honour"),
+        ("pg8000", "postgresql://h/db?client_encoding=latin1", "honour"),
+        (
+            "pg8000",
+            "postgresql://h/db?sslmode=verify-full&sslrootcert=/nonexistent",
+            "/nonexistent",
+        ),
+        ("redshift_connector", "redshift://h/db?sslmode=require", "verify-ca"),
+        ("clickhouse_connect", "clickhouse://h/db?secure=maybe", "boolean"),
+    ],
+)
+def test_uri_query_parameters_not_mapped_raise(
+    module: str, uri: str, match: str
+) -> None:
+    from polars_database._bridge import _query_kwargs
+
+    with pytest.raises(ValueError, match=match):
+        _query_kwargs(module, uri)
+
+
+def test_driver_errors_are_scrubbed_of_secrets() -> None:
+    from polars_database._bridge import _scrubbed, _secrets
+
+    secrets = _secrets("postgresql://u:pa%23Sekr3t@h/db", ("u", "Pr0v1ded"), {})
+    for secret in ["pa#Sekr3t", "pa%23Sekr3t", "Pr0v1ded"]:
+        with pytest.raises(OSError, match="invalid dsn") as exc, _scrubbed(secrets):
+            raise OSError(f"invalid dsn: 'postgresql://u:{secret}@h/db'")
+        assert "Sekr3t" not in str(exc.value)
+        assert "Pr0v1ded" not in str(exc.value)
+
+    odbc = _secrets("Driver={x};Server=s;UID=u;PWD={a;Sekr3t}", None, {})
+    with pytest.raises(OSError) as exc, _scrubbed(odbc):
+        raise OSError("login failed: PWD={a;Sekr3t}, a;Sekr3t")
+    assert "Sekr3t" not in str(exc.value)
+
+    class Echo(Exception):
+        def __str__(self) -> str:
+            return "echoes pa#Sekr3t"
+
+    # a message not built from `args`: replaced
+    with pytest.raises(RuntimeError, match=r"Echo: echoes \*\*\*"), _scrubbed(secrets):
+        raise Echo
+
+
+def test_uri_query_parameters_libpq_and_mysql_ssl() -> None:
+    from polars_database import _bridge
+    from polars_database._bridge import _query_kwargs
+
+    # libpq parameters pg8000 honours, or that change nothing for it
+    uri = (
+        "postgresql://h/db?connect_timeout=5&target_session_attrs=any"
+        "&client_encoding=UTF8&gssencmode=prefer&keepalives_idle=30"
+        "&fallback_application_name=app"
+    )
+    assert _query_kwargs("pg8000", uri) == {
+        _bridge._PG8000_CONNECT_TIMEOUT: 5.0,
+        "application_name": "app",
+    }
+    # `ssl=true` requires TLS; mysql.connector only prefers it, so it's checked
+    assert _query_kwargs("pymysql", "mysql://h/db?ssl=false") == {"ssl_disabled": True}
+    assert "ssl" in _query_kwargs("pymysql", "mysql://h/db?ssl=true")
+    for q in ["ssl=true", "ssl_mode=REQUIRED", "ssl_mode=VERIFY_CA"]:
+        kw = _query_kwargs("mysql.connector", f"mysql://h/db?{q}")
+        assert kw[_bridge._REQUIRE_TLS] is True
+        assert kw.get("ssl_disabled") is False or kw.get("ssl_verify_cert") is True
+
+
+def test_mysql_tls_check_rejects_a_plain_connection() -> None:
+    from polars_database._bridge import _check_mysql_tls
+
+    class Conn:
+        closed = False
+
+        def __init__(self, cipher: str) -> None:
+            self.cipher = cipher
+
+        def cursor(self) -> Any:
+            conn = self
+
+            class Cursor:
+                def execute(self, sql: str) -> None:
+                    pass
+
+                def fetchone(self) -> tuple[str, str]:
+                    return ("Ssl_cipher", conn.cipher)
+
+                def close(self) -> None:
+                    pass
+
+            return Cursor()
+
+        def close(self) -> None:
+            self.closed = True
+
+    _check_mysql_tls(Conn("TLS_AES_256_GCM_SHA384"))
+    plain = Conn("")
+    with pytest.raises(ValueError, match="requires TLS"):
+        _check_mysql_tls(plain)
+    assert plain.closed
+
+
+@pytest.mark.parametrize(
+    ("dialect", "query", "repeatable"),
+    [
+        ("sqlite", "SELECT unicode(randomblob(1)) AS b FROM t", False),
+        ("postgres", "SELECT get_byte(uuid_send(gen_random_uuid()), 0) FROM t", False),
+        ("postgres", "SELECT clock_timestamp(), statement_timestamp()", False),
+        ("postgres", "SELECT nextval('s')", False),
+        ("tsql", "SELECT NEWID() AS u FROM t", False),
+        ("oracle", "SELECT DBMS_RANDOM.VALUE FROM dual", False),
+        ("oracle", "SELECT s.nextval FROM dual", False),
+        ("mysql", "SELECT UUID(), SYSDATE()", False),
+        ("clickhouse", "SELECT rand64()", False),
+        ("snowflake", "SELECT seq4()", False),
+        # a column named nextval; the transaction's time
+        ("postgres", "SELECT t.nextval FROM t", True),
+        ("oracle", "SELECT x.nextval FROM t x", True),
+        ("postgres", "SELECT id, now() FROM t", True),
+        ("mysql", "SELECT NOW()", True),
+    ],
+)
+def test_volatile_functions_make_a_query_not_repeatable(
+    dialect: str, query: str, repeatable: bool
+) -> None:
+    from polars_database._sqlglot import inspect_query
+
+    assert inspect_query(query, dialect)["repeatable"] is repeatable
+
+
+@pytest.mark.parametrize(
+    ("uri", "userinfo", "host"),
+    [
+        # an `@` in a parameter isn't the end of the userinfo, port or not
+        (
+            "postgresql://u:pw@127.0.0.1:5432/db?application_name=a@b",
+            "u:pw",
+            "127.0.0.1:5432",
+        ),
+        ("postgresql://h:5432/db?application_name=a@b", None, "h:5432"),
+        ("clickhouse://h:8123/db?user=a@b", None, "h:8123"),
+        # a password that starts like a port
+        ("postgresql://u:12#Sekr3t@h:5432/db", "u:12#Sekr3t", "h:5432"),
+        # `host:port/` ends the authority: hidden (see below), not connected to
+        ("postgresql://u:12/Sekr3t@h:5432/db", None, "u:12"),
+        ("postgresql://localhost:5432/my@db", None, "localhost:5432"),
+        ("postgresql://u:pa/ss@h:5432/db", "u:pa/ss", "h:5432"),
+        ("postgresql://u:12?Sekr3t@h:5432/db", "u:12?Sekr3t", "h:5432"),
+        ("postgresql://u:pw@[::1]:5432/db", "u:pw", "[::1]:5432"),
+        ("sqlite:///tmp/a:b@c.db", None, ""),
+    ],
+)
+def test_uri_userinfo(uri: str, userinfo: str | None, host: str) -> None:
+    from polars_database._bridge import _split_authority
+
+    split = _split_authority(uri)
+    assert split is not None
+    assert (split[1], split[2]) == (userinfo, host)
+
+
+def test_short_secrets_are_scrubbed_only_as_values() -> None:
+    from polars_database._bridge import _raise_unmapped, _scrub, _secrets
+
+    secrets = _secrets("postgresql://u:a@h/db?sslkey=k&password=b", None, {})
+    assert "k" not in secrets
+    message = "OperationalError: bad dsn postgresql://u:a@h/db?password=b"
+    assert _scrub(message, secrets) == (
+        "OperationalError: bad dsn postgresql://u:***@h/db?password=***"
+    )
+    assert _secrets("x", None, {"private_key_passphrase": "pp"}) == ["pp"]
+    assert _secrets("postgresql://u:12/Sekr3t@h:5432/db", None, {}) == [
+        "12/Sekr3t",
+        "Sekr3t",
+        "12",
+    ]
+    # base64-style: `/` then `=`
+    uri = "mysql://polars:kq7/Zx9+Ab==@127.0.0.1:3306/polars"
+    assert _secrets(uri, None, {}) == ["kq7/Zx9+Ab==", "Zx9+Ab==", "kq7"]
+    assert _scrub('invalid port ":kq7", value "kq7"', _secrets(uri, None, {})) == (
+        'invalid port ":***", value "***"'
+    )
+    for key in ["key", "encryption_key", "azure_storage_connection_string"]:
+        assert _secrets("x", None, {key: "s3cret"}) == ["s3cret"], key
+    assert "PrivateKeyPassphrase" not in str(
+        _secrets("Driver={x};PrivateKeyPassphrase=Sekr3t", None, {})
+    )
+    assert _secrets("Driver={x};PrivateKeyPassphrase=Sekr3t", None, {}) == ["Sekr3t"]
+    # a parameter name that isn't one may be a password the URI parse missed
+    with pytest.raises(ValueError, match=r"parameter\(s\) \(2\)"):
+        _raise_unmapped("pg8000", ["Sekr3t@h:5432/db", "sslmode"])
+
+
+def test_order_by_puts_nulls_first_where_the_database_is_unknown() -> None:
+    # range partitions put NULLs first: an unknown database is told to as well, in
+    # SQL that every database runs
+    lf = pl.scan_database(
+        "t",
+        "sqlite:///x.db",
+        dialect="generic",
+        schema={"id": pl.Int64},
+        order_by="id",
+        driver="sqlalchemy",
+        partition_on=None,
+    )
+    sql = next(line for line in lf.explain().splitlines() if "sql[0]:" in line)
+    assert 'ORDER BY CASE WHEN "id" IS NULL THEN 0 ELSE 1 END ASC, "id" ASC' in sql
+    assert "NULLS" not in sql
+
+
+def test_mysql_integer_of_unknown_type_keeps_literals_1_to_99() -> None:
+    # with `schema=` an integer may be a YEAR, which reads 1-99 as 2001-2069, 1970-1999
+    lf = pl.scan_database(
+        "s.t",
+        DIALECT_URIS["mysql"],
+        schema=EDGE_SCHEMA,
+        driver="sqlalchemy",
+        partition_on=None,
+    )
+    for predicate, pushed in [
+        (pl.col("i32") > 42, "filters 0/1"),
+        (pl.col("i32").is_in([5, 1970]), "filters 0/1"),
+        (pl.col("i32") > 500, "filters 1/1 (1 exact)"),
+        (pl.col("i32") == 0, "filters 1/1 (1 exact)"),
+        (pl.col("i32").is_between(100, 1950), "filters 1/1 (1 exact)"),
+    ]:
+        assert pushed in lf.filter(predicate).explain(), str(predicate)
+
+
+def test_url_parts_errors_dont_echo_the_uri() -> None:
+    from polars_database._bridge import _url_parts
+
+    with pytest.raises(ValueError, match="invalid port") as exc:
+        _url_parts("mysql://polars:kq7/Zx9+Ab==@127.0.0.1:3306/polars")
+    assert "kq7" not in str(exc.value)
+    with pytest.raises(ValueError, match="several"):
+        _url_parts("postgresql://u@h1:5432,h2:5433/db")

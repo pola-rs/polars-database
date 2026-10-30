@@ -145,17 +145,20 @@ impl ConnectionSpec {
         }
     }
 
-    /// A stable identity of the connection that never includes secrets. Used for scan
-    /// deduplication and caching.
+    /// A stable identity of the connection. Used for scan deduplication and caching.
+    ///
+    /// Secrets are hashed as they are: scans that differ only in one (a password or a client
+    /// key, so another role or row-level-security identity) read different data and must not be
+    /// merged. The hash is never shown.
     pub fn fingerprint(&self, state: &mut impl Hasher) {
         match &self.target {
             ConnectionTarget::Uri(uri) => {
                 0u8.hash(state);
-                redact_uri(uri).hash(state);
+                uri.hash(state);
             },
             ConnectionTarget::Odbc(s) => {
                 1u8.hash(state);
-                redact_odbc(s).hash(state);
+                s.hash(state);
             },
             #[cfg(feature = "python")]
             ConnectionTarget::Factory(f) => {
@@ -179,24 +182,201 @@ impl ConnectionSpec {
             .hash(state);
         self.query_params_key.hash(state);
     }
+
+    /// The secrets in the connection as given: the URI's password and the values of
+    /// secret-looking URI parameters, ODBC attributes and connect options, also
+    /// percent-decoded. For scrubbing driver messages, which may echo them. Longest first, so
+    /// that one secret containing another is replaced whole.
+    pub fn secrets(&self) -> Vec<String> {
+        let mut out = vec![];
+        match &self.target {
+            ConnectionTarget::Uri(uri) => {
+                if let Some(range) = uri_password_range(uri) {
+                    out.extend(password_secrets(&uri[range]));
+                }
+                if let Some((_, query)) = uri.split_once('?') {
+                    for kv in query.split(['&', '#']) {
+                        if let Some((k, v)) = kv.split_once('=')
+                            && is_secret_key(k)
+                        {
+                            out.push(v.to_string());
+                        }
+                    }
+                }
+            },
+            ConnectionTarget::Odbc(s) => {
+                for (k, v) in odbc_attributes(s) {
+                    if let Some(v) = v
+                        && is_secret_key(k.trim())
+                    {
+                        out.push(v.trim().to_string());
+                        out.push(odbc_unquote(v.trim()));
+                    }
+                }
+            },
+            #[cfg(feature = "python")]
+            ConnectionTarget::Factory(_) | ConnectionTarget::Live(_) => {},
+        }
+        for (k, v) in &self.connect_options {
+            if is_secret_key(k) {
+                out.push(v.to_string());
+            }
+        }
+        let decoded: Vec<String> = out.iter().map(|s| percent_decode(s)).collect();
+        out.extend(decoded);
+        out.retain(|s| !s.is_empty());
+        out.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        out.dedup();
+        out
+    }
+}
+
+/// A URI password and, if it holds an unencoded `/`, `?`, `#` or `@`, its pieces: a driver
+/// that misreads the URI echoes one (`invalid port "kq7"` for `kq7/Zx9=`).
+pub(crate) fn password_secrets(password: &str) -> Vec<String> {
+    let mut out = vec![password.to_string()];
+    if password.contains(['/', '?', '#', '@']) {
+        out.extend(
+            password
+                .split(['/', '?', '#', '@'])
+                .filter(|p| !p.is_empty())
+                .map(str::to_string),
+        );
+    }
+    out
+}
+
+/// Secrets shorter than this are only replaced where they stand as a value (`:pw@`, `=pw`):
+/// as bare substrings they would garble the message (`a` → `Oper***tionError`).
+const MIN_BARE_SECRET_LEN: usize = 4;
+
+/// Replaces every secret in `message` (from [`ConnectionSpec::secrets`]) with `***`.
+pub fn scrub_secrets(message: &str, secrets: &[String]) -> String {
+    secrets.iter().fold(message.to_string(), |m, s| {
+        if s.chars().count() >= MIN_BARE_SECRET_LEN {
+            return m.replace(s.as_str(), "***");
+        }
+        let mut out = String::with_capacity(m.len());
+        let mut rest = m.as_str();
+        while let Some(i) = rest.find(s.as_str()) {
+            let (before, after) = (&rest[..i], &rest[i + s.len()..]);
+            let opens = before.ends_with([':', '=', '"', '\'']);
+            let closes = after
+                .chars()
+                .next()
+                .is_none_or(|c| matches!(c, '@' | ';' | '&' | ' ' | '\'' | '"' | '}' | ',' | ')'));
+            out.push_str(before);
+            out.push_str(if opens && closes { "***" } else { s });
+            rest = after;
+        }
+        out.push_str(rest);
+        out
+    })
+}
+
+/// The index of the `@` that ends the userinfo of `rest`, the part of a URI after `scheme://`.
+/// Where the URI connects to: never a host found in its path or query.
+///
+/// The usual case: the last `@` before the first `/`, `?` or `#`. A password may also hold an
+/// unencoded `/`, `?` or `#` (`u:pa/ss@host`); then there is no `@` before it, and a later `@`
+/// ends the userinfo if it is followed by a host (`host`, `host:port` or `[v6]:port`), and if
+/// what lies between doesn't look like a query (`h:5432/db?x=a@b` has no userinfo). Database
+/// URIs have no fragments: a `#` before a later `@` is always in the password.
+pub(crate) fn userinfo_end(rest: &str) -> Option<usize> {
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if let Some(at) = rest[..end].rfind('@') {
+        return Some(at);
+    }
+    // Without a `:` there is no password to hold the delimiter.
+    if !rest[..end].contains(':') || rest.starts_with('[') {
+        return None;
+    }
+    later_userinfo_end(rest, end, true, true)
+}
+
+/// [`userinfo_end`] for hiding the password: a password may hold both an `@` and a `/`, `?` or
+/// `#` (`u:p@ss/w@host`), so a later `@` that would end the userinfo is taken too.
+pub(crate) fn secret_userinfo_end(rest: &str) -> Option<usize> {
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..end].rfind('@') {
+        Some(at) => {
+            Some(later_userinfo_end(rest, end, false, true).map_or(at, |later| later.max(at)))
+        },
+        None if !rest[..end].contains(':') || rest.starts_with('[') => None,
+        None => later_userinfo_end(rest, end, false, false),
+    }
+}
+
+/// The last `@` after `end` (the first `/`, `?` or `#`) that can end a userinfo. For
+/// `routing`, `host:port/` ends the authority: `localhost:5432/my@db` has no userinfo (a
+/// password like `12/x` is then only hidden, see [`secret_userinfo_end`]).
+///
+/// With `query_guard`, what lies between mustn't look like a query (`=`, `&`). Hiding a
+/// password that the authority doesn't already end drops it: the password may be base64.
+fn later_userinfo_end(rest: &str, end: usize, routing: bool, query_guard: bool) -> Option<usize> {
+    let fragment = rest.as_bytes().get(end) == Some(&b'#');
+    if routing
+        && rest.as_bytes().get(end) == Some(&b'/')
+        && let Some((_, port)) = rest[..end].rsplit_once(':')
+        && !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    rest.match_indices('@')
+        .rev()
+        .map(|(at, _)| at)
+        .take_while(|&at| at > end)
+        .find(|&at| {
+            let after = &rest[at + 1..];
+            let host = &after[..after.find(['/', '?', '#']).unwrap_or(after.len())];
+            is_host(host) && (!query_guard || fragment || !rest[end..at].contains(['=', '&']))
+        })
+}
+
+/// `host`, `host:port`, `[v6]` or `[v6]:port` (libpq's `h1:1,h2:2` too).
+fn is_host(s: &str) -> bool {
+    !s.is_empty()
+        && s.split(',').all(|h| {
+            let (name, port) = match h.strip_prefix('[') {
+                Some(v6) => match v6.split_once(']') {
+                    Some((addr, port)) if !addr.is_empty() => (None, port),
+                    _ => return false,
+                },
+                None => {
+                    let (name, port) = h.split_at(h.find(':').unwrap_or(h.len()));
+                    (Some(name), port)
+                },
+            };
+            let port_ok = port.is_empty()
+                || port
+                    .strip_prefix(':')
+                    .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+            let name_ok = name.is_none_or(|n| {
+                !n.is_empty()
+                    && n.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'%')
+                    })
+            });
+            port_ok && name_ok
+        })
+}
+
+/// Where the password of a `scheme://user:password@host` URI is.
+fn uri_password_range(uri: &str) -> Option<std::ops::Range<usize>> {
+    let auth_start = uri.find("://")? + 3;
+    let rest = &uri[auth_start..];
+    let at = secret_userinfo_end(rest)?;
+    let colon = rest[..at].find(':')?;
+    Some(auth_start + colon + 1..auth_start + at)
 }
 
 /// Replaces the password of a `scheme://user:password@host` URI and the values of
 /// secret-looking query parameters.
 pub fn redact_uri(uri: &str) -> String {
     let mut out = uri.to_string();
-    if let Some(scheme_end) = out.find("://") {
-        let auth_start = scheme_end + 3;
-        let rest = &out[auth_start..];
-        let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        if let Some(at) = rest[..auth_end].rfind('@') {
-            let userinfo = &rest[..at];
-            if let Some(colon) = userinfo.find(':') {
-                let start = auth_start + colon + 1;
-                let end = auth_start + at;
-                out.replace_range(start..end, "***");
-            }
-        }
+    if let Some(range) = uri_password_range(&out) {
+        out.replace_range(range, "***");
     }
     if let Some(q) = out.find('?') {
         let (head, query) = out.split_at(q + 1);
@@ -213,21 +393,117 @@ pub fn redact_uri(uri: &str) -> String {
     out
 }
 
+/// The `key=value` attributes of an ODBC connection string, `None` for one without `=`. A value
+/// in braces (`{…}`, with `}}` for `}`) may hold `;`. Values are returned as written.
+fn odbc_attributes(s: &str) -> Vec<(&str, Option<&str>)> {
+    let mut out = vec![];
+    let mut rest = s;
+    loop {
+        let attr_end = rest.find(';').unwrap_or(rest.len());
+        let Some(eq) = rest[..attr_end].find('=') else {
+            out.push((&rest[..attr_end], None));
+            match rest.get(attr_end + 1..) {
+                Some(r) => rest = r,
+                None => break,
+            }
+            continue;
+        };
+        let value = &rest[eq + 1..];
+        let lead = value.len() - value.trim_start().len();
+        let mut end = value.find(';').unwrap_or(value.len());
+        if value[lead..].starts_with('{') {
+            let bytes = value.as_bytes();
+            let mut i = lead + 1;
+            while i < bytes.len() {
+                if bytes[i] == b'}' {
+                    if bytes.get(i + 1) == Some(&b'}') {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            // The value ends at the first `;` after its closing brace (an unclosed one runs to
+            // the end).
+            let close = i.min(value.len());
+            end = close + value[close..].find(';').unwrap_or(value.len() - close);
+        }
+        out.push((&rest[..eq], Some(&value[..end])));
+        match value.get(end + 1..) {
+            Some(r) => rest = r,
+            None => break,
+        }
+    }
+    out
+}
+
+/// An ODBC value without its braces, `}}` unescaped.
+fn odbc_unquote(v: &str) -> String {
+    match v.strip_prefix('{') {
+        Some(inner) => inner.strip_suffix('}').unwrap_or(inner).replace("}}", "}"),
+        None => v.to_string(),
+    }
+}
+
 pub fn redact_odbc(s: &str) -> String {
-    s.split(';')
-        .map(|kv| match kv.split_once('=') {
-            Some((k, _)) if is_secret_key(k.trim()) => format!("{k}=***"),
-            _ => kv.to_string(),
+    odbc_attributes(s)
+        .into_iter()
+        .map(|(k, v)| match v {
+            Some(_) if is_secret_key(k.trim()) => format!("{k}=***"),
+            Some(v) => format!("{k}={v}"),
+            None => k.to_string(),
         })
         .collect::<Vec<_>>()
         .join(";")
 }
 
 fn is_secret_key(k: &str) -> bool {
-    let k = k.to_ascii_lowercase();
-    ["password", "pwd", "secret", "token", "key", "credential"]
-        .iter()
-        .any(|s| k.contains(s))
+    let k = k.to_ascii_lowercase().replace(['_', '-'], "");
+    // Not any `…key`: `sslkey` and `primarykey` name no secret.
+    [
+        "password",
+        "passwd",
+        "pwd",
+        "passphrase",
+        "secret",
+        "token",
+        "credential",
+        "apikey",
+        "accesskey",
+        "privatekey",
+        "accountkey",
+        "encryptionkey",
+        "masterkey",
+        // DuckDB's `azure_storage_connection_string` holds an `AccountKey=`.
+        "connectionstring",
+    ]
+    .iter()
+    .any(|s| k.contains(s))
+        // SQLCipher's `?key=`
+        || k == "key"
+}
+
+/// Decodes `%XX` escapes; others are kept as they are.
+pub fn percent_decode(s: &str) -> String {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Bytes, not `&s[..]`: the byte after `%` may start a multi-byte character.
+        if bytes[i] == b'%'
+            && let Some(hi) = bytes.get(i + 1).copied().and_then(hex)
+            && let Some(lo) = bytes.get(i + 2).copied().and_then(hex)
+        {
+            out.push(hi << 4 | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 impl fmt::Debug for ConnectionTarget {
@@ -274,6 +550,8 @@ impl fmt::Debug for ConnectionSpec {
 
 #[cfg(test)]
 mod tests {
+    use std::hash::BuildHasher;
+
     use super::*;
 
     #[test]
@@ -288,6 +566,126 @@ mod tests {
             redact_odbc("Driver={X};Server=s;PWD=abc;UID=u"),
             "Driver={X};Server=s;PWD=***;UID=u"
         );
+    }
+
+    #[test]
+    fn redacts_passwords_with_uri_delimiters() {
+        for pw in [
+            "pa#Sekr3t",
+            "pa?Sekr3t",
+            "pa/Sekr3t",
+            "pa#S@kr3t",
+            "p@ss/w#rd",
+        ] {
+            let uri = format!("teradata://u:{pw}@h/db?x=1");
+            assert_eq!(redact_uri(&uri), "teradata://u:***@h/db?x=1", "{pw}");
+            let spec = ConnectionSpec::new(ConnectionTarget::Uri(uri.into()));
+            assert!(spec.secrets().contains(&pw.to_string()), "{pw}");
+        }
+        // A password that starts like a port.
+        for pw in ["12#Sekr3t", "12/Sekr3t", "12?Sekr3t"] {
+            let uri = format!("postgresql://u:{pw}@h:5432/db");
+            assert_eq!(redact_uri(&uri), "postgresql://u:***@h:5432/db", "{pw}");
+        }
+        // An `@` in a parameter isn't a password.
+        for uri in [
+            "postgresql://u@h/db?application_name=a@b",
+            "sqlite:///tmp/a:b@c.db",
+        ] {
+            assert_eq!(redact_uri(uri), uri);
+        }
+        // After `host:port`, it may be (`u:12/x=@h`): hidden, though the URI connects to `h`.
+        assert_eq!(
+            redact_uri("clickhouse://h:8123/db?user=a@b"),
+            "clickhouse://h:***@b"
+        );
+        assert_eq!(
+            redact_uri("postgresql://polars:pw@127.0.0.1:5432/polars?application_name=a@b"),
+            "postgresql://polars:***@127.0.0.1:5432/polars?application_name=a@b"
+        );
+        let spec = ConnectionSpec::new(ConnectionTarget::Uri(
+            "postgresql://u:a%23b@h/db?sslkey=/k&api_key=k123&sslmode=require".into(),
+        ));
+        assert_eq!(spec.secrets(), ["a%23b", "k123", "a#b"]);
+    }
+
+    #[test]
+    fn userinfo_for_routing() {
+        let end = |rest: &'static str| userinfo_end(rest).map(|at| &rest[..at]);
+        assert_eq!(end("localhost:5432/my@db"), None);
+        assert_eq!(end("u:pa/ss@h:5432/db"), Some("u:pa/ss"));
+        assert_eq!(end("u:12#x@h:5432/db"), Some("u:12#x"));
+        // `12/x` reads as a port and a path: only hidden
+        assert_eq!(end("u:12/x@h:5432/db"), None);
+        assert_eq!(redact_uri("pg://u:12/Sekr3t@h/db"), "pg://u:***@h/db");
+        assert_eq!(
+            redact_uri("mysql://polars:kq7/Zx9+Ab==@127.0.0.1:3306/polars"),
+            "mysql://polars:***@127.0.0.1:3306/polars"
+        );
+        assert_eq!(end("polars:kq7/Zx9+Ab==@127.0.0.1:3306/polars"), None);
+        let spec = ConnectionSpec::new(ConnectionTarget::Uri(
+            "mysql://polars:kq7/Zx9+Ab==@127.0.0.1:3306/polars".into(),
+        ));
+        assert_eq!(
+            scrub_secrets(
+                r#"invalid integer value "kq7" for "port"; invalid port ":kq7""#,
+                &spec.secrets()
+            ),
+            r#"invalid integer value "***" for "port"; invalid port ":***""#
+        );
+        for k in [
+            "key",
+            "encryption_key",
+            "MASTER_KEY",
+            "azure_storage_connection_string",
+        ] {
+            assert!(is_secret_key(k), "{k}");
+        }
+        assert!(!is_secret_key("sslkey"));
+    }
+
+    #[test]
+    fn short_secrets_are_scrubbed_only_as_values() {
+        let secrets = ["a".to_string(), "Sekr3t".to_string()];
+        assert_eq!(
+            scrub_secrets(
+                "OperationalError: bad dsn postgresql://u:a@h/db?password=a; Sekr3t",
+                &secrets
+            ),
+            "OperationalError: bad dsn postgresql://u:***@h/db?password=***; ***"
+        );
+    }
+
+    #[test]
+    fn redacts_braced_odbc_values() {
+        let s = "Driver={ODBC Driver 18 for SQL Server};Server=s;UID=u;PWD={a;Sek}}r3t};X=1";
+        assert_eq!(
+            redact_odbc(s),
+            "Driver={ODBC Driver 18 for SQL Server};Server=s;UID=u;PWD=***;X=1"
+        );
+        let spec = ConnectionSpec::new(ConnectionTarget::Odbc(s.into()));
+        assert!(spec.secrets().contains(&"a;Sek}r3t".to_string()));
+        assert!(!redact_odbc(s).contains("Sek"));
+        assert_eq!(redact_odbc("DSN=x;Trusted;"), "DSN=x;Trusted;");
+        assert_eq!(redact_odbc("PWD={unclosed;x"), "PWD=***");
+        assert_eq!(
+            scrub_secrets("bad dsn PWD={a;Sek}}r3t} / a;Sek}r3t", &spec.secrets()),
+            "bad dsn PWD=*** / ***"
+        );
+    }
+
+    #[test]
+    fn fingerprints_differ_in_secrets() {
+        let fp = |uri: &str| {
+            let mut h = polars_utils::aliases::PlFixedStateQuality::default().build_hasher();
+            ConnectionSpec::new(ConnectionTarget::Uri(uri.into())).fingerprint(&mut h);
+            h.finish()
+        };
+        assert_ne!(
+            fp("postgresql://u@h/db?sslkey=/certs/a.key"),
+            fp("postgresql://u@h/db?sslkey=/certs/b.key")
+        );
+        assert_eq!(fp("postgresql://u:p@h/db"), fp("postgresql://u:p@h/db"));
     }
 
     #[test]

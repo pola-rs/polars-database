@@ -25,7 +25,7 @@ use polars_arrow::array::{Array, StructArray};
 use polars_arrow::datatypes::ArrowDataType;
 use polars_arrow::ffi::{ArrowArrayStream, ArrowArrayStreamReader};
 use polars_core::frame::DataFrame;
-use polars_error::{PolarsResult, polars_bail, polars_err};
+use polars_error::{PolarsResult, polars_bail, polars_ensure, polars_err};
 
 use self::ffi::*;
 pub use self::manifest::{FoundDriver, find_driver, manifest_search_dirs};
@@ -33,7 +33,10 @@ use super::{
     BackendCapabilities, BackendChoice, BatchIter, CancelHandle, DatabaseBackend, DatabaseSession,
     PythonDriverBridge,
 };
-use crate::database::connection::{ConnectionSpec, ConnectionTarget};
+use crate::database::connection::{
+    ConnectionSpec, ConnectionTarget, password_secrets, percent_decode, scrub_secrets,
+    secret_userinfo_end, userinfo_end,
+};
 use crate::database::dialect::DialectName;
 
 /// An initialised driver. Never unloaded.
@@ -359,18 +362,17 @@ fn secrets(options: &[(CString, CString)]) -> Vec<String> {
             k.to_string_lossy().to_ascii_lowercase(),
             v.to_string_lossy(),
         );
-        if ["password", "passwd", "pwd", "secret", "token"]
+        if ["password", "passwd", "pwd", "passphrase", "secret", "token"]
             .iter()
             .any(|s| k.contains(s))
         {
             out.push(v.into_owned());
         } else if k == ADBC_OPTION_URI.to_string_lossy()
             && let Some((_, rest)) = v.split_once("://")
-            // Up to the last `@`: a password may hold `@`, `/`, `?` or `#`, a host doesn't.
-            && let Some((userinfo, _)) = rest.rsplit_once('@')
-            && let Some((_, password)) = userinfo.split_once(':')
+            && let Some(at) = secret_userinfo_end(rest)
+            && let Some((_, password)) = rest[..at].split_once(':')
         {
-            out.push(password.to_string());
+            out.extend(password_secrets(password));
             out.push(percent_decode(password));
         }
     }
@@ -382,9 +384,7 @@ fn secrets(options: &[(CString, CString)]) -> Vec<String> {
 }
 
 fn redact(message: &str, secrets: &[String]) -> String {
-    secrets
-        .iter()
-        .fold(message.to_string(), |m, s| m.replace(s.as_str(), "***"))
+    scrub_secrets(message, secrets)
 }
 
 /// The database options for a connection, `uri` first. The same for every loader.
@@ -403,6 +403,15 @@ pub fn connect_options(
         u.push_str("connect_timeout=10");
     }
     let mut options: Vec<(CString, CString)> = vec![];
+    if dialect == DialectName::Duckdb
+        && let Some(u) = uri.take()
+    {
+        // The DuckDB driver reads `duckdb:///d.db` as `/d.db`: it gets the path, as the
+        // Python backends read it, and the parameters as settings.
+        for (k, v) in duckdb_options(&u) {
+            options.push((cstring(&k, "option key")?, cstring(&v, &k)?));
+        }
+    }
     let mut creds = credentials(spec)?;
     if dialect == DialectName::Clickhouse
         && let Some(u) = &uri
@@ -490,7 +499,7 @@ fn adbc_uri(spec: &ConnectionSpec, dialect: DialectName) -> PolarsResult<Option<
         ConnectionTarget::Uri(_) => {
             let uri = spec.uri_without_scheme_driver().unwrap_or_default();
             if dialect == DialectName::Sqlite {
-                return Ok(Some(sqlite_path(&uri)));
+                return Ok(Some(sqlite_path(&uri)?));
             }
             Ok(Some(uri))
         },
@@ -556,40 +565,129 @@ fn clickhouse_http_uri(uri: &str) -> Option<ClickhouseHttp> {
     })
 }
 
-fn percent_decode(s: &str) -> String {
-    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        // Bytes, not `&s[..]`: the byte after `%` may start a multi-byte character.
-        if bytes[i] == b'%'
-            && let Some(hi) = bytes.get(i + 1).copied().and_then(hex)
-            && let Some(lo) = bytes.get(i + 2).copied().and_then(hex)
-        {
-            out.push(hi << 4 | lo);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
+/// The path and the parameters of a `sqlite:` or `duckdb:` URI, read as SQLAlchemy (and the
+/// Python backends, `_file_target`) read it: `sqlite:///rel.db` → `rel.db`,
+/// `sqlite:////abs.db` → `/abs.db`, `sqlite://` → `:memory:`. `None` for a `file:` URI after
+/// the scheme, or a string without the scheme, which pass through.
+fn file_target<'a>(uri: &'a str, schemes: &[&str]) -> Option<(String, Vec<(&'a str, String)>)> {
+    let lower = uri.to_ascii_lowercase();
+    let prefix = schemes.iter().find(|p| lower.starts_with(*p))?;
+    let mut rest = &uri[prefix.len()..];
+    if let Some(r) = rest.strip_prefix("//") {
+        // An authority (`sqlite://rel.db`, ConnectorX's form) is read as part of the path.
+        rest = r.strip_prefix('/').unwrap_or(r);
     }
-    String::from_utf8_lossy(&out).into_owned()
+    if rest.starts_with("file:") {
+        return None;
+    }
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let mut path = match percent_decode(path) {
+        p if matches!(p.as_str(), "" | ":memory:" | "/:memory:") => ":memory:".to_string(),
+        p => p,
+    };
+    // `sqlite:////C:/path` → `C:/path`: on Windows, `/C:/path` is a network path.
+    let b = path.as_bytes();
+    if b.len() >= 4
+        && b[0] == b'/'
+        && b[1].is_ascii_alphabetic()
+        && b[2] == b':'
+        && matches!(b[3], b'/' | b'\\')
+    {
+        path.remove(0);
+    }
+    let params = query
+        .split('&')
+        .filter(|kv| !kv.is_empty())
+        .map(|kv| {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            (k, percent_decode(&v.replace('+', " ")))
+        })
+        .collect();
+    Some((path, params))
 }
 
-/// `sqlite:///path/to.db` → `/path/to.db`; `sqlite://` → `:memory:`. `file:` URIs and plain
-/// paths pass through.
-fn sqlite_path(uri: &str) -> String {
-    let lower = uri.to_ascii_lowercase();
-    let rest = ["sqlite3://", "sqlite://", "sqlite3:", "sqlite:"]
-        .iter()
-        .find(|p| lower.starts_with(*p))
-        .map(|p| &uri[p.len()..]);
-    match rest {
-        None => uri.to_string(),
-        Some("" | "/" | ":memory:" | "/:memory:") => ":memory:".to_string(),
-        Some(path) => path.to_string(),
+/// SQLite URI filename parameters: they make the path a `file:` URI.
+const SQLITE_URI_PARAMS: [&str; 7] = [
+    "cache",
+    "immutable",
+    "mode",
+    "modeof",
+    "nolock",
+    "psow",
+    "vfs",
+];
+
+/// The file of a `sqlite:` URI ([`file_target`]). URI filename parameters (`?mode=ro`) make a
+/// `file:` URI; others are an error, as the ADBC driver has no option for them.
+fn sqlite_path(uri: &str) -> PolarsResult<String> {
+    let Some((path, params)) = file_target(uri, &["sqlite3:", "sqlite:"]) else {
+        let lower = uri.to_ascii_lowercase();
+        return Ok(
+            match ["sqlite3:", "sqlite:"]
+                .iter()
+                .find(|p| lower.starts_with(*p))
+            {
+                // `sqlite:///file:a.db?mode=ro`
+                Some(p) => uri[p.len()..].trim_start_matches('/').to_string(),
+                None => uri.to_string(),
+            },
+        );
+    };
+    let mut file_params = vec![];
+    let mut unknown = vec![];
+    for (k, v) in &params {
+        if SQLITE_URI_PARAMS.contains(k) {
+            file_params.push(format!("{k}={}", percent_encode(v)));
+        } else if !matches!(*k, "uri" | "check_same_thread") {
+            // `uri=true` is implied by the file parameters (SQLAlchemy's form); the thread
+            // check is a Python `sqlite3` option.
+            unknown.push(*k);
+        }
     }
+    polars_ensure!(
+        unknown.is_empty(),
+        InvalidOperation:
+        "the SQLite ADBC driver has no option for URI parameter(s) {unknown:?}; \
+        pin another driver with driver=\"sqlite3\""
+    );
+    if file_params.is_empty() {
+        return Ok(path);
+    }
+    let mut file = String::from("file:");
+    for c in path.chars() {
+        match c {
+            '%' => file.push_str("%25"),
+            '?' => file.push_str("%3F"),
+            '#' => file.push_str("%23"),
+            c => file.push(c),
+        }
+    }
+    Ok(format!("{file}?{}", file_params.join("&")))
+}
+
+/// The DuckDB driver's database options for a `duckdb:` URI: `path`, and the URI parameters as
+/// DuckDB settings (`read_only=true` is `access_mode=READ_ONLY`). DuckDB rejects an unknown
+/// setting itself.
+fn duckdb_options(uri: &str) -> Vec<(String, String)> {
+    let Some((path, params)) = file_target(uri, &["duckdb:"]) else {
+        return vec![("path".into(), uri.to_string())];
+    };
+    let mut out = vec![("path".to_string(), path)];
+    for (k, v) in params {
+        if k == "read_only" {
+            let read_only = matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+            out.push((
+                "access_mode".into(),
+                if read_only { "READ_ONLY" } else { "READ_WRITE" }.into(),
+            ));
+        } else {
+            out.push((k.to_string(), v));
+        }
+    }
+    out
 }
 
 /// `username` / `password` database options from the connection's credential provider.
@@ -609,24 +707,31 @@ fn credentials(spec: &ConnectionSpec) -> PolarsResult<Option<(Option<String>, Op
 /// `None` if the URI has no authority part.
 fn with_userinfo(uri: &str, user: Option<&str>, password: Option<&str>) -> Option<String> {
     let (scheme, rest) = uri.split_once("://")?;
-    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(auth_end);
-    let (old_userinfo, host) = match authority.rsplit_once('@') {
-        Some((u, h)) => (Some(u), h),
-        None => (None, authority),
+    // `host_and_tail`: the host, and the path and query after it.
+    let (old_userinfo, host_and_tail) = match userinfo_end(rest) {
+        Some(at) => (Some(&rest[..at]), &rest[at + 1..]),
+        None => (None, rest),
     };
-    let old_user = old_userinfo.map(|u| u.split_once(':').map_or(u, |(u, _)| u));
+    let (old_user, old_password) = match old_userinfo.map(|u| u.split_once(':')) {
+        Some(Some((u, p))) => (Some(u), Some(p)),
+        Some(None) => (old_userinfo, None),
+        None => (None, None),
+    };
     let user = match user {
         Some(u) => Some(percent_encode(u)),
         None => old_user.map(str::to_string),
     };
     let mut userinfo = user.unwrap_or_default();
-    if let Some(p) = password {
+    // A provider that gives only the user keeps the URI's password.
+    if let Some(p) = password
+        .map(percent_encode)
+        .or(old_password.map(str::to_string))
+    {
         userinfo.push(':');
-        userinfo.push_str(&percent_encode(p));
+        userinfo.push_str(&p);
     }
     let at = if userinfo.is_empty() { "" } else { "@" };
-    Some(format!("{scheme}://{userinfo}{at}{host}{tail}"))
+    Some(format!("{scheme}://{userinfo}{at}{host_and_tail}"))
 }
 
 fn percent_encode(s: &str) -> String {
@@ -1135,11 +1240,11 @@ mod tests {
         let s = secrets(&opts(&[
             ("uri", "mysql://u:p%40ss@w/rd@h:3306/db?x=1"),
             ("password", "hunter2"),
-            ("adbc.snowflake.sql.client_option.auth_token", "tok"),
+            ("adbc.snowflake.sql.client_option.auth_token", "tok3n"),
             ("username", "u"),
         ]));
         let m = redact(
-            "bad uri mysql://u:p%40ss@w/rd@h:3306/db: password='hunter2' p@ss@w/rd tok u",
+            "bad uri mysql://u:p%40ss@w/rd@h:3306/db: password='hunter2' p@ss@w/rd tok3n u",
             &s,
         );
         assert_eq!(
@@ -1308,13 +1413,82 @@ mod tests {
             Some("mysql://u@h")
         );
         assert_eq!(with_userinfo("/tmp/a.db", Some("u"), None), None);
+        // An `@` in a parameter isn't the end of the userinfo.
+        assert_eq!(
+            with_userinfo(
+                "postgresql://polars:pw@127.0.0.1:5432/polars?application_name=a@b",
+                Some("u"),
+                None
+            )
+            .as_deref(),
+            Some("postgresql://u:pw@127.0.0.1:5432/polars?application_name=a@b")
+        );
+        assert_eq!(
+            with_userinfo("postgresql://u:12#Sekr3t@h:5432/db", None, Some("x")).as_deref(),
+            Some("postgresql://u:x@h:5432/db")
+        );
+        // A path with an `@` isn't a userinfo.
+        assert_eq!(
+            with_userinfo("postgresql://localhost:5432/my@db", Some("u"), None).as_deref(),
+            Some("postgresql://u@localhost:5432/my@db")
+        );
+        // Only a user from the provider: the URI's password stays.
+        assert_eq!(
+            with_userinfo("postgresql://old:p%40ss@h/db", Some("new"), None).as_deref(),
+            Some("postgresql://new:p%40ss@h/db")
+        );
+        assert_eq!(
+            with_userinfo("postgresql://old:pa#ss@h/db", Some("new"), Some("y")).as_deref(),
+            Some("postgresql://new:y@h/db")
+        );
     }
 
     #[test]
     fn sqlite_paths() {
-        assert_eq!(sqlite_path("sqlite:///tmp/a.db"), "/tmp/a.db");
+        let sqlite_path = |uri: &str| super::sqlite_path(uri).unwrap();
+        // As SQLAlchemy reads them: three slashes are relative, four absolute.
+        assert_eq!(sqlite_path("sqlite:///tmp/a.db"), "tmp/a.db");
+        assert_eq!(sqlite_path("sqlite:////tmp/a.db"), "/tmp/a.db");
+        assert_eq!(sqlite_path("sqlite:rel.db"), "rel.db");
+        assert_eq!(sqlite_path("sqlite:///a%20b.db"), "a b.db");
         assert_eq!(sqlite_path("sqlite://"), ":memory:");
         assert_eq!(sqlite_path("sqlite:///:memory:"), ":memory:");
         assert_eq!(sqlite_path("file:a.db?mode=ro"), "file:a.db?mode=ro");
+        assert_eq!(
+            sqlite_path("sqlite:///file:a.db?mode=ro"),
+            "file:a.db?mode=ro"
+        );
+        assert_eq!(
+            sqlite_path("sqlite:////t/a%3Fb.db?mode=ro"),
+            "file:/t/a%3Fb.db?mode=ro"
+        );
+        assert_eq!(sqlite_path("sqlite:////C:/t/a.db"), "C:/t/a.db");
+        // As the Python `sqlite3` backend: SQLAlchemy's `uri=true` is implied.
+        assert_eq!(
+            sqlite_path("sqlite:////t/a.db?mode=ro&uri=true"),
+            "file:/t/a.db?mode=ro"
+        );
+        assert!(super::sqlite_path("sqlite:////t/a.db?timeout=5").is_err());
+    }
+
+    #[test]
+    fn duckdb_paths() {
+        let opts = |uri: &str| duckdb_options(uri);
+        assert_eq!(
+            opts("duckdb:///d.db"),
+            [("path".to_string(), "d.db".to_string())]
+        );
+        assert_eq!(
+            opts("duckdb:////t/d.db?read_only=true&threads=2"),
+            [
+                ("path".to_string(), "/t/d.db".to_string()),
+                ("access_mode".to_string(), "READ_ONLY".to_string()),
+                ("threads".to_string(), "2".to_string()),
+            ]
+        );
+        assert_eq!(
+            opts("duckdb://"),
+            [("path".to_string(), ":memory:".to_string())]
+        );
     }
 }

@@ -6,7 +6,7 @@ use polars_utils::aliases::PlHashMap;
 use polars_utils::pl_str::PlSmallStr;
 use serde::{Deserialize, Serialize};
 
-use super::backend::{BackendChoice, BackendKind};
+use super::backend::BackendChoice;
 use super::dialect::{DialectName, StringSemantics};
 use super::options::DatabaseScanOptions;
 
@@ -63,6 +63,9 @@ pub struct CompiledScan {
     pub limit: Option<u64>,
     /// Why the query could not be wrapped, if pushdown was turned off for it.
     pub pushdown_disabled: Option<PlSmallStr>,
+    /// The SQL returns the same rows each time it runs (`QueryFacts::repeatable`; always
+    /// for a table). Otherwise a `COUNT(*)` counts other rows than the read returns.
+    pub repeatable: bool,
 }
 
 /// A database scan, as held by the resolver and its reader builders.
@@ -79,7 +82,7 @@ pub struct DatabaseScanConfig {
     pub compiled: Option<Arc<CompiledScan>>,
     /// Per-worker connection budget, set by the distributed planner.
     pub connection_share: Option<usize>,
-    /// Stable hash of `options` without secrets.
+    /// Stable hash of `options` ([`DatabaseScanOptions::fingerprint`]).
     pub fingerprint: u64,
     /// Why the relation is read as given, without pushdown (`pushdown=False`, or a query that
     /// can't be wrapped).
@@ -123,7 +126,7 @@ impl DatabaseScanConfig {
         out.push((
             "relation",
             match &self.options.relation {
-                super::options::DatabaseRelation::Table { parts } => parts
+                super::options::DatabaseRelation::Table { parts, .. } => parts
                     .iter()
                     .map(|p| self.dialect.quote_ident(p))
                     .collect::<Vec<_>>()
@@ -159,9 +162,10 @@ impl DatabaseScanConfig {
     }
 
     /// Whether every session runs the dialect's session setup (`open_session`): not on a live
-    /// connection, which is the user's session, nor on ConnectorX, which has no sessions.
+    /// connection, which is the user's session, nor on ConnectorX or arrow-odbc, which have no
+    /// sessions.
     pub fn session_setup_runs(&self) -> bool {
-        !self.options.connection.is_live() && !matches!(self.backend.kind, BackendKind::ConnectorX)
+        !self.options.connection.is_live() && self.backend.kind.has_sessions()
     }
 
     pub fn n_partitions(&self) -> usize {

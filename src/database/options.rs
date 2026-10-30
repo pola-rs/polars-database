@@ -1,4 +1,5 @@
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use polars_core::prelude::SchemaRef;
 use polars_core::scalar::Scalar;
@@ -11,8 +12,13 @@ use super::dialect::DialectName;
 /// What a database scan reads.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DatabaseRelation {
-    /// A table, as `[catalog.][schema.]name`. Names are unquoted.
-    Table { parts: Vec<PlSmallStr> },
+    /// A table, as `[catalog.][schema.]name`. Names are unquoted; `quoted` says, per part,
+    /// whether the user quoted it. Bare parts are folded to the dialect's case by
+    /// [`DatabaseRelation::fold_case`] once the dialect is known.
+    Table {
+        parts: Vec<PlSmallStr>,
+        quoted: Vec<bool>,
+    },
     /// A user query. Pushdown wraps it as a derived table.
     Query { sql: PlSmallStr },
 }
@@ -23,9 +29,9 @@ impl DatabaseRelation {
     pub fn parse(source: &str, source_type: Option<&str>) -> Self {
         match source_type {
             Some("table") => {
-                return Self::Table {
-                    parts: split_table_name(source).unwrap_or_else(|| vec![source.into()]),
-                };
+                // A name that doesn't parse is used as written.
+                let parts = split_table_name(source).unwrap_or_else(|| vec![(source.into(), true)]);
+                return Self::table(parts);
             },
             Some("query") => {
                 return Self::Query {
@@ -35,16 +41,47 @@ impl DatabaseRelation {
             _ => {},
         }
         match split_table_name(source) {
-            Some(parts) => Self::Table { parts },
+            Some(parts) => Self::table(parts),
             None => Self::Query {
                 sql: source.trim().into(),
             },
         }
     }
 
+    fn table(parts: Vec<(PlSmallStr, bool)>) -> Self {
+        let (parts, quoted) = parts.into_iter().unzip();
+        Self::Table { parts, quoted }
+    }
+
+    /// The relation with its bare (unquoted) table name parts as the database stores them:
+    /// upper-cased on Oracle, Snowflake and Exasol, lower-cased on Postgres, Redshift and
+    /// Trino. The others match bare names case-insensitively, or as written. Quoted parts stay
+    /// as written. `None` if nothing changes.
+    pub fn fold_case(&self, dialect: DialectName) -> Option<Self> {
+        let Self::Table { parts, quoted } = self else {
+            return None;
+        };
+        let fold: fn(&str) -> String = match dialect {
+            DialectName::Oracle | DialectName::Snowflake | DialectName::Exasol => str::to_uppercase,
+            // Postgres folds ASCII letters only (in UTF-8 databases).
+            DialectName::Postgresql | DialectName::Redshift => str::to_ascii_lowercase,
+            DialectName::Trino => str::to_lowercase,
+            _ => return None,
+        };
+        let folded: Vec<PlSmallStr> = parts
+            .iter()
+            .zip(quoted)
+            .map(|(p, &q)| if q { p.clone() } else { fold(p).into() })
+            .collect();
+        (folded != *parts).then(|| Self::Table {
+            parts: folded,
+            quoted: quoted.clone(),
+        })
+    }
+
     pub fn table_parts(&self) -> Option<&[PlSmallStr]> {
         match self {
-            Self::Table { parts } => Some(parts),
+            Self::Table { parts, .. } => Some(parts),
             Self::Query { .. } => None,
         }
     }
@@ -62,8 +99,9 @@ impl DatabaseRelation {
     }
 }
 
-/// Splits `a.b.c`, honouring quotes. `None` if the string is not a table name.
-fn split_table_name(s: &str) -> Option<Vec<PlSmallStr>> {
+/// Splits `a.b.c`, honouring quotes, into `(part, quoted)`. `None` if the string is not a table
+/// name.
+fn split_table_name(s: &str) -> Option<Vec<(PlSmallStr, bool)>> {
     let s = s.trim();
     if s.is_empty() {
         return None;
@@ -71,7 +109,7 @@ fn split_table_name(s: &str) -> Option<Vec<PlSmallStr>> {
     let mut parts = vec![];
     let mut chars = s.chars().peekable();
     loop {
-        let part = match chars.peek()? {
+        let (part, quoted) = match chars.peek()? {
             q @ ('"' | '`' | '[') => {
                 let close = if *q == '[' { ']' } else { *q };
                 chars.next();
@@ -89,7 +127,7 @@ fn split_table_name(s: &str) -> Option<Vec<PlSmallStr>> {
                     }
                     part.push(c);
                 }
-                part
+                (part, true)
             },
             c if c.is_alphabetic() || *c == '_' => {
                 let mut part = String::new();
@@ -101,11 +139,11 @@ fn split_table_name(s: &str) -> Option<Vec<PlSmallStr>> {
                         break;
                     }
                 }
-                part
+                (part, false)
             },
             _ => return None,
         };
-        parts.push(PlSmallStr::from(part));
+        parts.push((PlSmallStr::from(part), quoted));
         match chars.next() {
             None => break,
             Some('.') => continue,
@@ -176,7 +214,20 @@ pub struct DatabaseScanOptions {
 }
 
 impl DatabaseScanOptions {
-    /// A stable hash without secrets.
+    /// The options with the relation's bare names folded to the dialect's case
+    /// ([`DatabaseRelation::fold_case`]).
+    pub fn with_relation_case_folded(self: Arc<Self>, dialect: DialectName) -> Arc<Self> {
+        match self.relation.fold_case(dialect) {
+            Some(relation) => Arc::new(Self {
+                relation,
+                ..(*self).clone()
+            }),
+            None => self,
+        }
+    }
+
+    /// A stable hash of the scan, for deduplication. It covers secrets too (see
+    /// [`ConnectionSpec::fingerprint`]) and is never shown.
     pub fn fingerprint(&self) -> u64 {
         let mut h = polars_utils::aliases::PlFixedStateQuality::default().build_hasher();
         self.connection.fingerprint(&mut h);
@@ -204,9 +255,14 @@ use std::hash::BuildHasher;
 mod tests {
     use super::*;
 
+    /// A table relation; a part is quoted if it starts with `"`.
     fn table(parts: &[&str]) -> DatabaseRelation {
         DatabaseRelation::Table {
-            parts: parts.iter().map(|s| PlSmallStr::from(*s)).collect(),
+            parts: parts
+                .iter()
+                .map(|s| PlSmallStr::from(s.trim_start_matches('"')))
+                .collect(),
+            quoted: parts.iter().map(|s| s.starts_with('"')).collect(),
         }
     }
 
@@ -219,15 +275,15 @@ mod tests {
         );
         assert_eq!(
             DatabaseRelation::parse(r#""My Schema"."Or""ders""#, None),
-            table(&["My Schema", "Or\"ders"])
+            table(&["\"My Schema", "\"Or\"ders"])
         );
         assert_eq!(
             DatabaseRelation::parse("[dbo].[t]", None),
-            table(&["dbo", "t"])
+            table(&["\"dbo", "\"t"])
         );
         assert_eq!(
             DatabaseRelation::parse("`db`.`t`", None),
-            table(&["db", "t"])
+            table(&["\"db", "\"t"])
         );
         assert!(matches!(
             DatabaseRelation::parse("SELECT * FROM t", None),
@@ -240,6 +296,34 @@ mod tests {
         assert_eq!(
             DatabaseRelation::parse("select", Some("table")),
             table(&["select"])
+        );
+        assert_eq!(
+            DatabaseRelation::parse("not a name", Some("table")),
+            table(&["\"not a name"])
+        );
+    }
+
+    #[test]
+    fn bare_names_fold_per_dialect() {
+        let rel = DatabaseRelation::parse(r#"Sales."Mixed".Orders"#, None);
+        assert_eq!(
+            rel.fold_case(DialectName::Oracle),
+            Some(table(&["SALES", "\"Mixed", "ORDERS"]))
+        );
+        assert_eq!(
+            rel.fold_case(DialectName::Postgresql),
+            Some(table(&["sales", "\"Mixed", "orders"]))
+        );
+        assert_eq!(rel.fold_case(DialectName::Mysql), None);
+        assert_eq!(rel.fold_case(DialectName::Mssql), None);
+        // Already in the stored case, or quoted.
+        assert_eq!(
+            DatabaseRelation::parse("orders", None).fold_case(DialectName::Postgresql),
+            None
+        );
+        assert_eq!(
+            DatabaseRelation::parse(r#""rv_t""#, None).fold_case(DialectName::Oracle),
+            None
         );
     }
 }
