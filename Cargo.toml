@@ -8,7 +8,7 @@ edition = { workspace = true }
 homepage = { workspace = true }
 license = { workspace = true }
 publish = false
-repository = "https://github.com/nameexhaustion/polars-database"
+repository = "https://github.com/pola-rs/polars-database"
 description = "Native database scan plugin for Polars (`scan_database`)."
 
 # Built as a member of the Polars workspace: this repository is cloned (git-ignored) to

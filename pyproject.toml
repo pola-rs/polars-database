@@ -14,7 +14,7 @@ dependencies = ["sqlglot >= 25"]
 [project.urls]
 Homepage = "https://www.pola.rs/"
 Polars = "https://pypi.org/project/polars/"
-Repository = "https://github.com/nameexhaustion/polars-database"
+Repository = "https://github.com/pola-rs/polars-database"
 
 [tool.maturin]
 features = ["python"]
