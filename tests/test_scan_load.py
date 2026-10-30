@@ -49,10 +49,12 @@ def _uri() -> str:
 
 def _sessions(*, active_only: bool) -> int:
     state = "AND state = 'active'" if active_only else ""
+    # client backends only: a parallel query's workers carry its `application_name`
     return int(
         pl.read_database_uri(
             "SELECT COUNT(*) AS n FROM pg_stat_activity "
-            f"WHERE application_name = 'polars' AND pid != pg_backend_pid() {state}",
+            "WHERE application_name = 'polars' AND backend_type = 'client backend' "
+            f"AND pid != pg_backend_pid() {state}",
             _uri(),
         ).item()
     )
@@ -63,7 +65,8 @@ def _scanning() -> int:
     return int(
         pl.read_database_uri(
             "SELECT COUNT(*) AS n FROM pg_stat_activity "
-            "WHERE application_name = 'polars' AND state != 'idle' "
+            "WHERE application_name = 'polars' AND backend_type = 'client backend' "
+            "AND state != 'idle' "
             "AND (query LIKE '%big%' OR query LIKE '%polars_scan%') "
             "AND query NOT LIKE '%1 = 0%'",
             _uri(),

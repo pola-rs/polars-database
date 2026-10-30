@@ -517,7 +517,8 @@ def active_polars_queries(uri: str, marker: str = "") -> int:
     return int(
         pl.read_database_uri(
             "SELECT COUNT(*) AS n FROM pg_stat_activity "
-            f"WHERE application_name = 'polars' AND state = 'active'{like}",
+            "WHERE application_name = 'polars' AND backend_type = 'client backend' "
+            f"AND state = 'active'{like}",
             uri,
         ).item()
     )
