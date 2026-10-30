@@ -424,16 +424,20 @@ _VOLATILE_NODES = tuple(
 def _is_volatile(node: Any, dialect: str | None, relations: set[str]) -> bool:
     if isinstance(node, _VOLATILE_NODES):
         return True
+    if (
+        dialect == "sqlite"
+        and _function_name(node) in _SQLITE_TIME_FUNCTIONS
+        and not any(True for _ in node.iter_expressions())
+    ):
+        # `datetime()`, `unixepoch()`: without a time value, the current time
+        return True
     if isinstance(node, exp.Anonymous):
         name = node.name.lower()
         return name in _VOLATILE_FUNCTIONS or (
             dialect == "clickhouse" and name.startswith("rand")
         )
     if isinstance(node, exp.Literal) and node.is_string:
-        # SQLite's `datetime('now')`, Postgres' `'now'::timestamp`
-        return node.name.strip().lower() in ("now", "today") and isinstance(
-            node.parent, (exp.Func, exp.Cast)
-        )
+        return _is_current_time_literal(node)
     if isinstance(node, exp.Dot):
         # Oracle `DBMS_RANDOM.RANDOM()`, `DBMS_CRYPTO.RANDOMBYTES(…)`
         return node.this.name.lower() in ("dbms_random", "dbms_crypto")
@@ -448,6 +452,92 @@ def _is_volatile(node: Any, dialect: str | None, relations: set[str]) -> bool:
             "dbms_crypto",
         )
     return False
+
+
+# Text that names a time relative to now: Postgres' special date / time inputs, SQLite's
+# 'now' time value
+_CURRENT_TIME_TEXT = frozenset({"now", "today", "tomorrow", "yesterday"})
+# SQLite's date and time functions, whose time value may be 'now' (or left out)
+_SQLITE_TIME_FUNCTIONS = frozenset(
+    {"date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff"}
+)
+# Functions that read their text argument as a time: sqlglot's names for the SQLite ones
+# above and their kin (`datetime('now')` parses as `TS_OR_DS_TO_TIMESTAMP`), by name
+_TIME_FUNCTIONS = _SQLITE_TIME_FUNCTIONS | {
+    "ts_or_ds_to_timestamp",
+    "ts_or_ds_to_date",
+    "time_to_str",
+    "str_to_time",
+    "timestamp",
+    "to_timestamp",
+    "to_date",
+}
+
+
+def _function_name(node: Any) -> str:
+    if isinstance(node, exp.Anonymous):
+        return str(node.name).lower()
+    if isinstance(node, exp.Func):
+        return str(node.sql_name()).lower()
+    return ""
+
+
+def _is_current_time_literal(node: Any) -> bool:
+    """
+    A text literal that the database reads as the current time: `'now'::timestamp`,
+    SQLite's `datetime('now')`. Elsewhere such text is only text (`concat(s, 'now')`).
+    Compared with a column it may be a time too (Postgres casts `created < 'now'` to the
+    column's type), which the query alone doesn't tell: taken as one.
+    """
+    if node.name.strip().lower() not in _CURRENT_TIME_TEXT:
+        return False
+    parent = node.parent
+    if isinstance(parent, (exp.Cast, exp.TryCast)):
+        return bool(parent.to.is_type(*exp.DataType.TEMPORAL_TYPES))
+    if isinstance(parent, exp.Predicate):
+        return True
+    return _function_name(parent) in _TIME_FUNCTIONS
+
+
+def _top_level_order_by_without_limit(stmt: Any) -> bool:
+    """
+    An `ORDER BY` without a `LIMIT` at the query's top level, also inside parentheses
+    (`(SELECT … ORDER BY …)`): a database may drop it inside a derived table.
+    """
+    while True:
+        has_limit = any(
+            stmt.args.get(k) is not None for k in ("limit", "fetch", "offset")
+        )
+        if stmt.args.get("order") is not None and not has_limit:
+            return True
+        if not isinstance(stmt, (exp.Subquery, exp.Paren)):
+            return False
+        stmt = stmt.this
+
+
+def _nested_queries(stmt: Any) -> bool:
+    """
+    A CTE, a query inside the query (one not reached from the top only through
+    parentheses and set operations, `UNION`), or a parenthesised one with a `LIMIT` of
+    its own: MySQL may evaluate any of them when it plans the query.
+    """
+    if stmt.find(exp.CTE) is not None:
+        return True
+    top = [stmt]
+    top_selects = 0
+    while top:
+        node = top.pop()
+        if node is not stmt and any(
+            node.args.get(k) for k in ("limit", "fetch", "offset")
+        ):
+            return True
+        if isinstance(node, exp.Select):
+            top_selects += 1
+        elif isinstance(node, (exp.Subquery, exp.Paren)):
+            top.append(node.this)
+        elif isinstance(node, exp.SetOperation):
+            top.extend((node.this, node.expression))
+    return sum(1 for _ in stmt.find_all(exp.Select)) > top_selects
 
 
 def _relations(stmt: Any) -> set[str]:
@@ -471,6 +561,9 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
         "output_columns": None,
         "read_only": False,
         "repeatable": False,
+        "top_level_limit": False,
+        "nested_queries": False,
+        "side_effects": False,
         "body": None,
     }
     try:
@@ -503,19 +596,25 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
     facts["has_cte"] = stmt.args.get("with_") is not None or (
         stmt.args.get("with") is not None
     )
-    has_limit = any(stmt.args.get(k) is not None for k in ("limit", "fetch", "offset"))
-    has_top = isinstance(stmt, exp.Select) and stmt.args.get("limit") is not None
-    facts["top_level_order_by_without_limit"] = (
-        stmt.args.get("order") is not None and not has_limit and not has_top
+    facts["top_level_order_by_without_limit"] = _top_level_order_by_without_limit(stmt)
+    # what can't take another `LIMIT` after it
+    facts["top_level_limit"] = any(
+        stmt.args.get(k) for k in ("limit", "fetch", "offset", "locks")
     )
+    facts["nested_queries"] = _nested_queries(stmt)
     relations = _relations(stmt)
-    # anywhere in the query: a nested LIMIT without a unique ORDER BY picks rows too
-    facts["repeatable"] = stmt.find(
-        exp.Limit, exp.Fetch, exp.Offset, exp.TableSample
-    ) is None and not any(
+    volatile = any(
         _is_volatile(node, dialect, relations)
         for node in stmt.find_all(exp.Func, exp.Dot, exp.Column, exp.Literal)
     )
+    # anywhere in the query: a nested LIMIT without a unique ORDER BY picks rows too
+    facts["repeatable"] = (
+        stmt.find(exp.Limit, exp.Fetch, exp.Offset, exp.TableSample) is None
+        and not volatile
+    )
+    # Running it may change something: a volatile function (`nextval`), or one sqlglot
+    # doesn't know, which may be the user's own (a stored function that writes).
+    facts["side_effects"] = volatile or stmt.find(exp.Anonymous) is not None
     selects = stmt.selects
     if selects and not any(isinstance(s, exp.Star) or s.is_star for s in selects):
         facts["output_columns"] = [s.alias_or_name for s in selects]

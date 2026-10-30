@@ -285,6 +285,15 @@ pub struct QueryFacts {
     /// Returns the same rows each time it runs on the same data: no `LIMIT` / `OFFSET` /
     /// `FETCH` / `TOP` (which pick rows), no `TABLESAMPLE`, no random functions.
     pub repeatable: bool,
+    /// A `LIMIT` / `OFFSET` / `FETCH` (or a lock clause) ends the query: it can't take
+    /// another `LIMIT`.
+    pub top_level_limit: bool,
+    /// A CTE, a query inside the query (not just parenthesised or in a `UNION`), or a
+    /// parenthesised one with a `LIMIT` of its own.
+    pub nested_queries: bool,
+    /// Running it may change something: it calls a volatile function (`nextval`), or one
+    /// the parser doesn't know (a user's function may write).
+    pub side_effects: bool,
     /// The query without the semicolons and comments after its last token, if it parses.
     pub body: Option<PlSmallStr>,
 }

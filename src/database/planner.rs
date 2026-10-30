@@ -184,9 +184,54 @@ struct QueryDiscovery {
     volatile: bool,
     /// A MySQL-dialect query with a top-level `ORDER BY` and no `LIMIT`.
     mariadb_order_by: bool,
+    /// It parses, and a `LIMIT` (or a lock clause) ends it (`QueryFacts::top_level_limit`).
+    top_level_limit: bool,
+    /// It parses, and has a CTE or a subquery (`QueryFacts::nested_queries`).
+    nested_queries: bool,
+    /// It parses, and running it may change something (`QueryFacts::side_effects`).
+    side_effects: bool,
+    /// Every session is read-only ([`read_only_session`]): the database refuses a write.
+    read_only_session: bool,
+    /// The SQL that finds its schema without running it, where the usual probe would
+    /// (MySQL: [`mysql_query_probe`]).
+    probe: Option<String>,
 }
 
 const MARIADB_ORDER_BY: &str = "MariaDB ignores the ORDER BY of a query inside a derived table";
+
+/// The schema probe of a MySQL query: the query with a `LIMIT 0` of its own.
+///
+/// MySQL and MariaDB evaluate a derived table of one row (`SELECT NEXTVAL(s)`, an
+/// aggregate) when they plan a query, before a `WHERE 1 = 0` (or a `LIMIT 0`) around it
+/// applies: the usual probe would run the query, and the read then runs it again. The
+/// query's own `LIMIT 0` doesn't run it, unless such a derived table is inside it (a CTE,
+/// a subquery, a parenthesised query with a `LIMIT` on MariaDB), or MariaDB parenthesises
+/// a query that ends in a `LIMIT`. A query that may
+/// change something (`QueryDiscovery::side_effects`) must not run twice: it is refused
+/// then, unless every session is read-only.
+fn mysql_query_probe(
+    session: &mut dyn DatabaseSession,
+    sql: &str,
+    query: &QueryDiscovery,
+) -> PolarsResult<String> {
+    let sql = wrappable(sql);
+    let (probe, may_run) = if query.parses && !query.top_level_limit {
+        (format!("{sql} LIMIT 0"), query.nested_queries)
+    } else {
+        // `(SELECT … LIMIT 5) LIMIT 0`
+        let may_run = query.nested_queries || (query.side_effects && is_mariadb(session));
+        (format!("({sql}) LIMIT 0"), may_run)
+    };
+    polars_ensure!(
+        !(may_run && query.side_effects && !query.read_only_session),
+        InvalidOperation:
+        "this query calls a function that may change something (a volatile one, or one \
+        that isn't known, e.g. a stored function), inside a CTE or a subquery: MySQL would \
+        run it to find the query's schema, and the read would run it again; pass schema=..., \
+        or connect with a URI and a driver whose sessions are read-only (e.g. driver=\"pymysql\")"
+    );
+    Ok(probe)
+}
 
 /// Whether the MySQL-dialect server is a MariaDB.
 fn is_mariadb(session: &mut dyn DatabaseSession) -> bool {
@@ -297,6 +342,11 @@ pub fn resolve_scan(
                 && facts
                     .as_ref()
                     .is_ok_and(|f| f.top_level_order_by_without_limit),
+            top_level_limit: facts.as_ref().is_ok_and(|f| f.parses && f.top_level_limit),
+            nested_queries: facts.as_ref().is_ok_and(|f| f.parses && f.nested_queries),
+            side_effects: facts.as_ref().is_ok_and(|f| f.parses && f.side_effects),
+            read_only_session,
+            probe: None,
         };
         if let Some(reason) = blocker
             && pushdown_disabled.is_none()
@@ -353,6 +403,11 @@ pub fn resolve_scan(
             }
             pushdown_disabled = Some(MARIADB_ORDER_BY.into());
         }
+        if let DatabaseRelation::Query { sql } = &options.relation
+            && dialect == DialectName::Mysql
+        {
+            query.probe = Some(mysql_query_probe(session.as_mut(), sql, &query)?);
+        }
         // The catalog first: some declared types are read as text (`text_conversion`), and
         // discovery must select them the same way the scan will.
         let discover = |session: &mut dyn DatabaseSession, options: &DatabaseScanOptions| {
@@ -408,7 +463,14 @@ pub fn resolve_scan(
             let from = quoted_relation(dialect, &options.relation);
             // Python drivers refuse DDL, ConnectorX runs each statement on its own connection.
             let temp_tables = matches!(backend.kind, BackendKind::Adbc { .. });
-            info = catalog::query_info(session.as_mut(), dialect, &from, &names, temp_tables);
+            info = catalog::query_info(
+                session.as_mut(),
+                dialect,
+                &from,
+                query.probe.as_deref(),
+                &names,
+                temp_tables,
+            );
             // Only where a table's types are declared ones too: SQLite and DuckDB tables
             // are typed by their values.
             if matches!(
@@ -1030,11 +1092,14 @@ fn discover_schema(
     info: &CatalogInfo,
 ) -> PolarsResult<(Schema, PlHashSet<PlSmallStr>)> {
     let is_query = matches!(options.relation, DatabaseRelation::Query { .. });
-    let probe = format!(
-        "SELECT {} FROM {} WHERE 1 = 0",
-        select_list.map_or_else(|| "*".to_string(), |s| fixed_select_list(dialect, s)),
-        quoted_relation(dialect, &options.relation)
-    );
+    let probe = match query.probe.as_ref().filter(|_| is_query) {
+        Some(probe) => probe.clone(),
+        None => format!(
+            "SELECT {} FROM {} WHERE 1 = 0",
+            select_list.map_or_else(|| "*".to_string(), |s| fixed_select_list(dialect, s)),
+            quoted_relation(dialect, &options.relation)
+        ),
+    };
     let first_batch = |session: &mut dyn DatabaseSession, sql: &str| {
         if verbose() {
             eprintln!("[scan_database]: schema from: {sql}");
@@ -1083,8 +1148,8 @@ fn discover_schema(
 
     // Row-wise drivers can't type columns of an empty result, and SQLite has no column
     // types at all (ADBC calls every column of an empty result Int64). Type them from a
-    // sample, which runs a query: not one known to be volatile (`nextval`). SQLite's
-    // functions can't write.
+    // sample, which runs a query: not one known to be volatile (`nextval`), nor one that
+    // may write where the session doesn't refuse it. SQLite's functions can't write.
     let sample_types = dialect == DialectName::Sqlite;
     let sampled = schema
         .iter()
@@ -1092,7 +1157,9 @@ fn discover_schema(
         .map(|(name, _)| name.clone())
         .collect::<PlHashSet<_>>();
     let untyped = !sampled.is_empty();
-    let may_sample = !is_query || !query.volatile || sample_types;
+    let may_sample = !is_query
+        || sample_types
+        || !(query.volatile || (query.side_effects && !query.read_only_session));
     if untyped && !ran_query && may_sample && dialect.supports_limit() {
         let renderer = sql_renderer()?;
         // ConnectorX can't read a SQLite column whose values have several storage classes:

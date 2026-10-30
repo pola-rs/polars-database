@@ -909,10 +909,28 @@ def test_mysql_tls_check_rejects_a_plain_connection() -> None:
         ("tsql", "SELECT GETDATE()", False),
         ("oracle", "SELECT SYSTIMESTAMP FROM dual", False),
         ("clickhouse", "SELECT today()", False),
-        # a column named nextval; a string 'now'
+        # a column named nextval; text 'now' that isn't a time
         ("postgres", "SELECT t.nextval FROM t", True),
         ("oracle", "SELECT x.nextval FROM t x", True),
-        ("postgres", "SELECT id FROM t WHERE s = 'now'", True),
+        ("sqlite", "SELECT concat(s, 'now'), instr(s, 'now') FROM t", True),
+        (
+            "postgres",
+            "SELECT replace(s, 'today', ''), CAST('now' AS text) FROM t",
+            True,
+        ),
+        # compared with a column, 'now' may be cast to its type: taken as the time
+        ("postgres", "SELECT id FROM t WHERE created < 'now'", False),
+        (
+            "postgres",
+            "SELECT id FROM t WHERE d BETWEEN 'yesterday' AND 'tomorrow'",
+            False,
+        ),
+        ("postgres", "SELECT 'today'::date", False),
+        # SQLite's time functions without a time value
+        ("sqlite", "SELECT unixepoch()", False),
+        ("sqlite", "SELECT datetime(), date()", False),
+        ("sqlite", "SELECT julianday('now')", False),
+        ("sqlite", "SELECT unixepoch(ts) FROM t", True),
     ],
 )
 def test_volatile_functions_make_a_query_not_repeatable(

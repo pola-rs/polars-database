@@ -82,6 +82,9 @@ impl SqlRenderer for SqlglotRenderer {
                 output_columns: output_columns.map(|v| v.into_iter().map(Into::into).collect()),
                 read_only: get("read_only")?,
                 repeatable: get("repeatable")?,
+                top_level_limit: get("top_level_limit")?,
+                nested_queries: get("nested_queries")?,
+                side_effects: get("side_effects")?,
                 body: body.map(Into::into),
             })
         })

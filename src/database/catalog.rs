@@ -330,6 +330,7 @@ pub fn query_info(
     session: &mut dyn DatabaseSession,
     dialect: DialectName,
     from: &str,
+    probe: Option<&str>,
     columns: &[PlSmallStr],
     temp_tables: bool,
 ) -> CatalogInfo {
@@ -409,14 +410,16 @@ pub fn query_info(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
         let tmp = format!("pl_types_{}_{nanos}", std::process::id());
-        let created = format!("CREATE TEMPORARY TABLE {tmp} AS SELECT * FROM {from} LIMIT 0");
+        // `probe`: the query's own `LIMIT 0` (see `mysql_query_probe`)
+        let select = probe.map_or_else(|| format!("SELECT * FROM {from} LIMIT 0"), Into::into);
+        let created = format!("CREATE TEMPORARY TABLE {tmp} AS {select}");
         // The session is read-only, which also refuses a temporary table: the next
         // transaction may write (a driver inside a transaction refuses this; the types
         // then stay unknown). Some drivers report a statement without a result as an
         // error: the `SHOW` tells whether the table exists.
         //
-        // `LIMIT 0` doesn't run the query's rows, but a constant expression in it (e.g.
-        // `SLEEP()`, `GET_LOCK()`) is evaluated again here, outside the READ ONLY
+        // `LIMIT 0` doesn't run the query's rows, but a constant derived table in it (e.g.
+        // `SELECT SLEEP(1)` in a CTE) is evaluated again here, outside the READ ONLY
         // transaction. That is safe because discovery has run the same query under READ
         // ONLY first, and refused anything that writes: the planner keeps that order.
         let _ = session.query("SET TRANSACTION READ WRITE");

@@ -2356,8 +2356,13 @@ def test_mysql_query_order_by_is_kept(name: str) -> None:
         ],
     )
     try:
-        for driver in ["pymysql", "factory"]:
-            lf = _scan(name, driver, "SELECT id, x FROM fix_order ORDER BY x DESC")
+        for driver, query in [
+            ("pymysql", "SELECT id, x FROM fix_order ORDER BY x DESC"),
+            ("factory", "SELECT id, x FROM fix_order ORDER BY x DESC"),
+            # parenthesised, the order is on the inner query
+            ("pymysql", "((SELECT id, x FROM fix_order ORDER BY x DESC))"),
+        ]:
+            lf = _scan(name, driver, query)
             assert lf.head(3).collect()["x"].to_list() == [100, 99, 98]
             assert lf.collect()["x"].to_list() == list(range(100, 0, -1))
             out = lf.filter(pl.col("x") < 50).head(2).collect()
@@ -2854,3 +2859,96 @@ def test_mysql_query_dtypes_are_the_tables(driver: str) -> None:
         assert_frame_equal(df.drop(bit), tables.collect().sort("id").drop(bit))
     finally:
         _execute("mysql", [f"DROP TABLE IF EXISTS {table}"])
+
+
+@pytest.mark.parametrize("name", ["mysql", "mariadb"])
+def test_mysql_query_with_side_effects_runs_once(name: str) -> None:
+    # MySQL evaluates a derived table of one row (`SELECT f()`) before the schema
+    # probe's `WHERE 1 = 0` applies: a function that writes ran twice, a sequence
+    # advanced twice. Sessions that aren't read-only (ConnectorX, live) ran them.
+    pytest.importorskip("connectorx")
+    table = "rvf_once_log"
+    _execute(name, [f"DROP TABLE IF EXISTS {table}"])
+    try:
+        _execute(
+            name,
+            [
+                "DROP FUNCTION IF EXISTS rvf_once_bump",
+                f"CREATE TABLE {table} (id int AUTO_INCREMENT PRIMARY KEY)",
+                "CREATE FUNCTION rvf_once_bump() RETURNS INT MODIFIES SQL DATA "
+                f"DETERMINISTIC BEGIN INSERT INTO {table} VALUES (NULL); "
+                "RETURN LAST_INSERT_ID(); END",
+            ],
+        )
+    except Exception as e:
+        # MySQL with binary logging needs SUPER for a function that writes
+        _execute(name, [f"DROP TABLE IF EXISTS {table}"])
+        if "SUPER" not in str(e):
+            raise
+        # (without one: a query that takes a second runs once)
+        for driver in ["connectorx", "live"]:
+            start = time.monotonic()
+            _scan(name, driver, "SELECT SLEEP(1) AS x").collect()
+            assert time.monotonic() - start < 1.9, driver
+        return
+    server = SERVERS[name]
+    assert server.uri is not None and server.factory is not None
+    live = server.factory(server.uri)()
+    live.autocommit(True)
+    try:
+        cur = live.cursor()
+
+        def calls() -> int:
+            cur.execute(f"SELECT count(*) FROM {table}")
+            return int(cur.fetchone()[0])
+
+        expected = 0
+        for source, kw in [(server.uri, {"driver": "connectorx"}), (live, {})]:
+            # MariaDB evaluates `(SELECT f() LIMIT 1)` under a LIMIT 0 too
+            limited = "SELECT rvf_once_bump() AS x LIMIT 1"
+            for query in [
+                "SELECT rvf_once_bump() AS x",
+                "SELECT rvf_once_bump() AS x UNION ALL SELECT 0",
+                *([limited] if name == "mysql" else []),
+            ]:
+                for pushdown in [True, False]:
+                    pl.scan_database(query, source, pushdown=pushdown, **kw).collect()
+                    expected += 1
+                    assert calls() == expected, (query, pushdown)
+            # inside a CTE, MySQL evaluates it even under the query's own LIMIT 0
+            for query in [
+                "WITH c AS (SELECT rvf_once_bump() AS x) SELECT x FROM c",
+                "SELECT * FROM (SELECT rvf_once_bump() AS x) d",
+                "(SELECT rvf_once_bump() AS x LIMIT 1)",
+                *([limited] if name == "mariadb" else []),
+            ]:
+                with pytest.raises(
+                    pl.exceptions.InvalidOperationError,
+                    match="inside a CTE or a subquery",
+                ):
+                    pl.scan_database(query, source, **kw).collect()
+                assert calls() == expected
+            cte = "WITH c AS (SELECT rvf_once_bump() AS x) SELECT x FROM c"
+            df = pl.scan_database(cte, source, schema={"x": pl.Int64}, **kw).collect()
+            assert df.height == 1
+            expected += 1
+            assert calls() == expected
+        if name == "mariadb":
+            cur.execute("DROP SEQUENCE IF EXISTS rvf_once_seq")
+            cur.execute("CREATE SEQUENCE rvf_once_seq START WITH 1 NOCACHE")
+            for source, kw in [(server.uri, {"driver": "connectorx"}), (live, {})]:
+                v = pl.scan_database(
+                    "SELECT NEXTVAL(rvf_once_seq) AS v", source, **kw
+                ).collect()
+                cur.execute("SELECT next_not_cached_value FROM rvf_once_seq")
+                assert cur.fetchone()[0] == v.item() + 1
+    finally:
+        live.close()
+        _execute(
+            name,
+            [
+                f"DROP TABLE IF EXISTS {table}",
+                "DROP FUNCTION IF EXISTS rvf_once_bump",
+                "DROP SEQUENCE IF EXISTS rvf_once_seq" if name == "mariadb" else "DO 0",
+            ],
+        )
