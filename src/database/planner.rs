@@ -465,8 +465,8 @@ pub fn resolve_scan(
                 name: name.clone(),
                 dtype: dtype.clone(),
                 db_type: info.declared_type(name).map(Into::into).or_else(|| {
-                    // A query's result type, for the filter's checks (MySQL `YEAR`), where
-                    // the column is read as it is.
+                    // A query's result type, for the filter's checks, where the column is
+                    // read as it is; a DuckDB column's type, which its conversion needs.
                     info.compare_types
                         .get(name.as_str())
                         .filter(|t| {
@@ -478,7 +478,8 @@ pub fn resolve_scan(
                                 &dialect.quote_ident(name),
                             )
                             .is_some();
-                            info.types_required && !converted
+                            (info.types_required && !converted)
+                                || (dialect == DialectName::Duckdb && converted)
                         })
                         .map(|t| t.as_str().into())
                 }),
@@ -510,9 +511,11 @@ pub fn resolve_scan(
 
     // ConnectorX writes every decimal as `Decimal(38, 10)`, cutting digits beyond 10
     // places. A table's declared types say which columns to read as text; a query's
-    // decimal columns are read as text too, which needs the query wrapped.
+    // decimal columns are read as text too, which needs the query wrapped. On ClickHouse
+    // it reads no rows at all from a table with a decimal column: those are text too.
     if matches!(backend.kind, BackendKind::ConnectorX)
-        && matches!(options.relation, DatabaseRelation::Query { .. })
+        && (matches!(options.relation, DatabaseRelation::Query { .. })
+            || dialect == DialectName::Clickhouse)
     {
         let wrapped = read_wrapped(&options, &pushdown_disabled, &query);
         for c in columns.iter_mut().filter(|c| c.dtype.is_decimal()) {
@@ -579,6 +582,62 @@ pub fn resolve_scan(
         pushdown_disabled,
         bounds_cache: Default::default(),
     })
+}
+
+/// ConnectorX reads other row counts than there are from a ClickHouse array of `Nullable(…)`,
+/// `DateTime64` or decimal values (none, or more), and nothing tells: reading such a column
+/// is an error. Arrays of plain numbers, strings, dates and booleans read right.
+fn check_connectorx_arrays(
+    config: &DatabaseScanConfig,
+    columns: &[PlSmallStr],
+) -> PolarsResult<()> {
+    if !matches!(config.backend.kind, BackendKind::ConnectorX)
+        || config.dialect != DialectName::Clickhouse
+    {
+        return Ok(());
+    }
+    for c in columns.iter().filter_map(|c| config.column(c)) {
+        let wrong = match c.db_type.as_deref() {
+            Some(t) => super::schema::clickhouse_value_type(t)
+                .strip_prefix("array(")
+                .and_then(|r| r.strip_suffix(')'))
+                .is_some_and(|element| !connectorx_clickhouse_array_element(element)),
+            // a query's column whose type is unknown
+            None => matches!(c.dtype, DataType::List(_)),
+        };
+        polars_ensure!(
+            !wrong,
+            InvalidOperation:
+            "ConnectorX reads this ClickHouse array wrong (column '{}'), silently dropping \
+            or adding rows; pin another driver, e.g. driver=\"adbc\" or \"clickhouse_connect\"",
+            c.name
+        );
+    }
+    Ok(())
+}
+
+/// A ClickHouse array element type (lower-cased) ConnectorX reads right.
+fn connectorx_clickhouse_array_element(t: &str) -> bool {
+    let t = t
+        .strip_prefix("lowcardinality(")
+        .and_then(|r| r.strip_suffix(')'))
+        .unwrap_or(t);
+    matches!(
+        t,
+        "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "float32"
+            | "float64"
+            | "string"
+            | "date"
+            | "bool"
+    )
 }
 
 /// A dtype with its time zones (also in lists) as UTC.
@@ -730,6 +789,25 @@ fn column_conversion(
             }
         }
     }
+    // A Postgres `time` may be `24:00:00`, which isn't a time of day: Arrow drivers read it
+    // as NULL or `00:00:00`. It fails the read instead, naming the column (the text isn't
+    // a valid time; the `CASE` evaluates it only then).
+    if matches!(dialect, DialectName::Postgresql | DialectName::Redshift)
+        && declared_dtype(dialect, db_type) == Some(DataType::Time)
+    {
+        let msg = dialect.quote_str(&format!(
+            "column {column} holds 24:00:00, which is not a time of day"
+        ));
+        return Some(format!(
+            "CASE WHEN {column} = TIME '24:00:00' \
+            THEN CAST({msg} || LEFT(CAST({column} AS TEXT), 0) AS TIME) ELSE {column} END"
+        ));
+    }
+    if dialect == DialectName::Duckdb
+        && let Some(check) = duckdb_value_check(db_type, column)
+    {
+        return Some(check);
+    }
     // The ADBC MySQL driver sizes an `UNSIGNED` decimal one digit short, failing on values
     // with every digit used.
     if matches!(dialect, DialectName::Mysql | DialectName::Singlestore)
@@ -760,6 +838,31 @@ fn column_conversion(
     }
     let _ = backend;
     None
+}
+
+/// DuckDB values that Arrow can't carry fail the read, naming the column: `TIME
+/// '24:00:00'` (read as NULL), `±infinity` dates and timestamps (read as their raw
+/// `i64::MAX`), and `UHUGEINT` values beyond the `i128` of the `Decimal(38, 0)` they are
+/// read as (they wrap; `HUGEINT` always fits).
+fn duckdb_value_check(db_type: &str, column: &str) -> Option<String> {
+    let t = db_type.trim().to_ascii_uppercase();
+    let bad = match t.as_str() {
+        "TIME" => format!("{column} = TIME '24:00:00'"),
+        "DATE"
+        | "TIMESTAMP"
+        | "TIMESTAMP_S"
+        | "TIMESTAMP_MS"
+        | "TIMESTAMP_NS"
+        | "TIMESTAMP WITH TIME ZONE" => format!("isinf({column})"),
+        "UHUGEINT" => format!("{column} > {}", i128::MAX),
+        _ => return None,
+    };
+    let msg = DialectName::Duckdb.quote_str(&format!(
+        "column {column} holds a value Polars can't represent: "
+    ));
+    Some(format!(
+        "CASE WHEN {bad} THEN error({msg} || CAST({column} AS VARCHAR)) ELSE {column} END"
+    ))
 }
 
 /// A MySQL `DATE` / `DATETIME` / `TIMESTAMP`, which may hold zero dates.
@@ -1157,6 +1260,7 @@ pub fn compile_scan(
         );
     }
     columns.dedup();
+    check_connectorx_arrays(config, &columns)?;
 
     let (partitions, partitioning) = resolve_partitions(
         config,
@@ -1177,7 +1281,9 @@ pub fn compile_scan(
     let select: Vec<SqlSelectItem> = if columns.is_empty() {
         vec![SqlSelectItem::One]
     } else {
-        columns.iter().map(|c| select_item(config, c)).collect()
+        let mut items: Vec<_> = columns.iter().map(|c| select_item(config, c)).collect();
+        items.extend(utf8_checks(config, &columns));
+        items
     };
     let order_by: Vec<SqlOrderBy> = options
         .order_by
@@ -1275,6 +1381,38 @@ fn select_item(config: &DatabaseScanConfig, c: &PlSmallStr) -> SqlSelectItem {
     }
 }
 
+/// ClickHouse `String`s hold any bytes. ConnectorX silently stops reading at text that isn't
+/// valid UTF-8, and clickhouse_connect hex-encodes it: such text fails the read instead, as
+/// it does on ADBC. The checks are extra select items, which the cast to the schema drops.
+fn utf8_checks(config: &DatabaseScanConfig, columns: &[PlSmallStr]) -> Vec<SqlSelectItem> {
+    let dialect = config.dialect;
+    if dialect != DialectName::Clickhouse || matches!(config.backend.kind, BackendKind::Adbc { .. })
+    {
+        return vec![];
+    }
+    columns
+        .iter()
+        .filter(|c| config.schema.get(c) == Some(&DataType::String))
+        .enumerate()
+        .map(|(i, c)| {
+            let value = match select_item(config, c) {
+                SqlSelectItem::Expr { sql, .. } => sql,
+                _ => dialect.quote_ident(c),
+            };
+            let msg = dialect.quote_str(&format!(
+                "column '{c}' holds text that is not valid UTF-8; read it as hex({c}) in a query"
+            ));
+            SqlSelectItem::Expr {
+                // not `LowCardinality`, whose functions also run on its dictionary's default
+                sql: format!(
+                    "throwIf(NOT ifNull(isValidUTF8(CAST({value} AS Nullable(String))), 1), {msg})"
+                ),
+                alias: format!("__pl_utf8_{i}").into(),
+            }
+        })
+        .collect()
+}
+
 /// A scan without pushdown: the relation as given, one partition, everything else in Polars.
 fn compile_unwrapped(
     config: &DatabaseScanConfig,
@@ -1283,6 +1421,10 @@ fn compile_unwrapped(
 ) -> PolarsResult<CompiledScan> {
     let dialect = config.dialect;
     let order_by = &config.options.order_by;
+    check_connectorx_arrays(
+        config,
+        &config.schema.iter_names().cloned().collect::<Vec<_>>(),
+    )?;
     let (sql, count_sql) = match &config.options.relation {
         DatabaseRelation::Query { sql } => {
             polars_ensure!(
@@ -1293,11 +1435,18 @@ fn compile_unwrapped(
             );
             let sql = strip_statement_end(sql);
             // Columns read through a conversion (Oracle time zones) need the query wrapped.
-            let items = config
+            let mut items = config
                 .schema
                 .iter_names()
                 .map(|c| select_item(config, c))
                 .collect::<Vec<_>>();
+            if sql_renderer()
+                .and_then(|r| r.inspect_query(sql, dialect))
+                .is_ok_and(|f| wrap_blocker(&f, dialect).is_none())
+            {
+                let names = config.schema.iter_names().cloned().collect::<Vec<_>>();
+                items.extend(utf8_checks(config, &names));
+            }
             let read = if items
                 .iter()
                 .any(|i| matches!(i, SqlSelectItem::Expr { .. }))
@@ -1318,11 +1467,12 @@ fn compile_unwrapped(
         relation => {
             let from = quoted_relation(dialect, relation);
             // the select list applies the column conversions, as a pushed-down scan does
-            let items = config
-                .schema
-                .iter_names()
+            let names = config.schema.iter_names().cloned().collect::<Vec<_>>();
+            let mut items = names
+                .iter()
                 .map(|c| select_item(config, c))
                 .collect::<Vec<_>>();
+            items.extend(utf8_checks(config, &names));
             let list = if items
                 .iter()
                 .any(|i| matches!(i, SqlSelectItem::Expr { .. }))

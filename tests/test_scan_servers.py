@@ -2551,6 +2551,49 @@ needs_clickhouse = pytest.mark.skipif(
 
 
 @needs_clickhouse
+def test_clickhouse_connectorx_reads_every_row_or_fails() -> None:
+    # ConnectorX dropped rows silently: a table with a decimal, an array of nullable
+    # values; text that isn't UTF-8 stopped the read (clickhouse_connect hex-encoded it)
+    pytest.importorskip("connectorx")
+    table = "rvb_ch_rows"
+    _execute(
+        "clickhouse",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id Int32, d Decimal(38, 10), "
+            "a Array(Nullable(Int64)), ai Array(Int32), s String) "
+            "ENGINE = MergeTree ORDER BY id",
+            f"INSERT INTO {table} SELECT number, number / 2, [number, NULL], [1], "
+            "toString(number) FROM numbers(1000)",
+        ],
+    )
+    try:
+        lf = _scan("clickhouse", "connectorx", table).select("id", "d", "ai", "s")
+        assert lf.collect().height == 1000
+        query = _scan("clickhouse", "connectorx", f"SELECT id, d FROM {table}")
+        assert query.collect()["d"].sum() == Decimal("249750")
+        for source in [table, f"SELECT id, a FROM {table}"]:
+            with pytest.raises(pl.exceptions.InvalidOperationError, match="column 'a'"):
+                _scan("clickhouse", "connectorx", source).collect()
+        assert _scan("clickhouse", "adbc", table).collect().height == 1000
+        _execute(
+            "clickhouse", [f"INSERT INTO {table} VALUES (1000, 0, [], [], unhex('ff'))"]
+        )
+        for driver in ["connectorx", "clickhouse_connect"]:
+            for source in [table, f"SELECT id, s FROM {table}"]:
+                lf = _scan("clickhouse", driver, source).select("id", "s")
+                # (ConnectorX loses the message once the result streams)
+                with pytest.raises(
+                    pl.exceptions.ComputeError, match="not valid UTF-8|500 Internal"
+                ):
+                    lf.collect()
+                # without the column, the rows read
+                assert lf.select("id").collect().height == 1001
+    finally:
+        _execute("clickhouse", [f"DROP TABLE IF EXISTS {table}"])
+
+
+@needs_clickhouse
 def test_clickhouse_time_zones_and_nanoseconds_by_every_driver() -> None:
     # A zone keeps its case (it was lower-cased, and the driver's dtype used), and
     # DateTime64(7..9) keeps its nanoseconds (clickhouse_connect and ConnectorX cut them)
@@ -2706,6 +2749,75 @@ def test_mysql_live_connection_in_another_time_zone(module: str) -> None:
     finally:
         conn.close()
         _execute("mysql", [f"DROP TABLE IF EXISTS {table}"])
+
+
+@needs_postgres
+@pytest.mark.parametrize("driver", ["adbc", "connectorx", "psycopg", "pg8000"])
+def test_postgres_time_24_is_an_error(driver: str) -> None:
+    # Arrow drivers read it as NULL or 00:00:00
+    table = f"rvb_pg_time_{driver}"
+    _execute(
+        "postgres17",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id int, t time, t3 time(3))",
+            f"INSERT INTO {table} VALUES (1, '01:02:03.5', '01:02:03.125'), (2, NULL, NULL)",
+        ],
+    )
+    try:
+        for source in [table, f"SELECT id, t, t3 FROM {table}"]:
+            lf = _scan("postgres17", driver, source)
+            assert lf.collect_schema()["t3"] == pl.Time
+            assert lf.collect().height == 2
+        _execute("postgres17", [f"INSERT INTO {table} VALUES (3, '24:00:00', NULL)"])
+        for source in [table, f"SELECT id, t FROM {table}"]:
+            with pytest.raises(
+                pl.exceptions.PolarsError, match='column "t" holds 24:00:00'
+            ):
+                _scan("postgres17", driver, source).collect()
+    finally:
+        _execute("postgres17", [f"DROP TABLE IF EXISTS {table}"])
+
+
+@needs_postgres
+@pytest.mark.parametrize("driver", ["adbc", "connectorx", "psycopg", "pg8000"])
+def test_postgres_query_types_read_as_a_tables(driver: str) -> None:
+    # json was a Struct from a query on row drivers; numeric(5,2)[] failed on ADBC; a
+    # query's numeric planned another dtype on each driver
+    table = f"rvb_pg_qtypes_{driver}"
+    _execute(
+        "postgres17",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id int, j json, jb jsonb, a numeric(5,2)[], "
+            "n numeric(10,3), u numeric, i smallint)",
+            f"""INSERT INTO {table} VALUES (1, '{{"a": 0.1000000000000000055, "a": 2}}', """
+            """'[1, "x"]', '{1.5,NULL}', 1.5, 2.25, 3), (2, 'null', '"s"', NULL, NULL, NULL, NULL)""",
+        ],
+    )
+    try:
+        df = _scan("postgres17", driver, table).collect().sort("id")
+        assert df.schema["a"] == pl.List(pl.Decimal(5, 2))
+        assert df["j"].to_list() == ['{"a": 0.1000000000000000055, "a": 2}', "null"]
+        assert df["jb"].to_list() == ['[1, "x"]', '"s"']
+        for source in [
+            f"SELECT * FROM {table}",
+            f"SELECT * FROM {table} WHERE id > 10",
+        ]:
+            lf = _scan("postgres17", driver, source)
+            got = lf.collect().sort("id")
+            assert got.schema == lf.collect_schema()
+            # a query's numeric shows no precision (psycopg's description has it)
+            n = pl.Decimal(10, 3) if driver == "psycopg" else pl.Decimal(38, 9)
+            assert got.schema["n"] == n
+            assert got.schema["u"] == pl.Decimal(38, 9)
+            assert got.schema["i"] == pl.Int16
+            assert got.schema["j"] == pl.String
+            if got.height:
+                assert got["j"].to_list() == df["j"].to_list()
+                assert got["u"].to_list() == [Decimal("2.25"), None]
+    finally:
+        _execute("postgres17", [f"DROP TABLE IF EXISTS {table}"])
 
 
 @pytest.mark.skipif(SERVERS["mysql"].uri is None, reason="no MySQL URI")

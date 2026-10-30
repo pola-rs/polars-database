@@ -597,10 +597,35 @@ impl<O: StreamOwner> Iterator for AdbcBatches<O> {
 
 /// Checks the batches of a result for values the driver could not convert.
 pub fn check_batches(dialect: DialectName, batches: BatchIter) -> BatchIter {
-    if dialect != DialectName::Postgresql {
-        return batches;
+    Box::new(batches.map(move |df| {
+        df.and_then(|df| {
+            check_utf8(&df)?;
+            if dialect == DialectName::Postgresql {
+                check_postgres_infinity(&df)?;
+            }
+            Ok(df)
+        })
+    }))
+}
+
+/// An error for text that isn't valid UTF-8, before anything reads it as a string: drivers
+/// pass on what the database holds (SQLite's `CAST(X'FF' AS TEXT)`) without checking.
+fn check_utf8(df: &DataFrame) -> PolarsResult<()> {
+    for c in df.columns() {
+        if !c.dtype().is_string() {
+            continue;
+        }
+        let bytes = c.str()?.as_binary();
+        if bytes.downcast_iter().any(|a| a.validate_utf8().is_err()) {
+            polars_bail!(
+                ComputeError:
+                "column '{}' holds text that is not valid UTF-8, which a Polars String can't \
+                hold; read it as binary in a query, e.g. CAST(\"{}\" AS BLOB)",
+                c.name(), c.name()
+            );
+        }
     }
-    Box::new(batches.map(|df| df.and_then(|df| check_postgres_infinity(&df).map(|_| df))))
+    Ok(())
 }
 
 /// The earliest Postgres date and timestamp, 4714-11-24 BC (Julian day 0), from the Unix epoch.

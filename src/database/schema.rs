@@ -34,6 +34,8 @@ pub fn normalize_dtype(dtype: &DataType) -> DataType {
             let _ = ext;
             normalize_dtype(storage)
         },
+        // `numeric(p, s)[]`: the element too
+        DataType::List(inner) => DataType::List(Box::new(normalize_dtype(inner))),
         dt => dt.clone(),
     }
 }
@@ -86,6 +88,13 @@ pub fn declared_dtype(dialect: DialectName, db_type: &str) -> Option<DataType> {
             _ => TimeUnit::Microseconds,
         };
         return Some(DataType::Datetime(unit, tz));
+    }
+    // Postgres `time`: its `24:00:00` is checked on the way (see `column_conversion`).
+    if matches!(dialect, DialectName::Postgresql | DialectName::Redshift)
+        && (t == "time without time zone"
+            || (t.starts_with("time(") && t.ends_with(") without time zone")))
+    {
+        return Some(DataType::Time);
     }
     // Drivers disagree on the width of MySQL `YEAR` and `FLOAT` (4 bytes).
     if matches!(dialect, DialectName::Mysql | DialectName::Singlestore) {
@@ -182,12 +191,8 @@ pub fn cast_to_schema(
             )
         })?;
         let storage;
-        let col = if matches!(col.dtype(), DataType::Extension(_, _)) {
-            storage = col
-                .as_materialized_series()
-                .to_storage()
-                .clone()
-                .into_column();
+        let col = if has_extension(col.dtype()) {
+            storage = without_extensions(col.as_materialized_series())?.into_column();
             &storage
         } else {
             col
@@ -233,11 +238,42 @@ pub fn cast_to_schema(
     DataFrame::new(height, columns)
 }
 
+fn has_extension(dtype: &DataType) -> bool {
+    match dtype {
+        DataType::Extension(_, _) => true,
+        DataType::List(inner) => has_extension(inner),
+        _ => false,
+    }
+}
+
+/// A column with its extension types (ADBC Postgres `numeric`, also in arrays) as their
+/// storage.
+fn without_extensions(s: &Series) -> PolarsResult<Series> {
+    match s.dtype() {
+        DataType::Extension(_, _) => without_extensions(s.to_storage()),
+        DataType::List(inner) if has_extension(inner) => Ok(s
+            .list()?
+            .apply_to_inner(&|inner| without_extensions(&inner))?
+            .into_series()),
+        _ => Ok(s.clone()),
+    }
+}
+
 /// A decimal cast must not round an exact value (text or a decimal of a larger scale):
 /// unconstrained `numeric` / `NUMBER` are planned as `Decimal(38, 9)`, and a value with
 /// more digits is an error, not silently another number. Floats only approximate a
 /// decimal, so rounding them to the declared scale is their reading.
 fn check_decimal_exact(src: &Column, cast: &Column) -> PolarsResult<()> {
+    // `numeric(p, s)[]`: its elements
+    if let (DataType::List(_), DataType::List(_)) = (src.dtype(), cast.dtype()) {
+        let inner = |c: &Column| -> PolarsResult<Column> {
+            Ok(c.list()?
+                .get_inner()
+                .with_name(c.name().clone())
+                .into_column())
+        };
+        return check_decimal_exact(&inner(src)?, &inner(cast)?);
+    }
     let DataType::Decimal(_, scale) = cast.dtype() else {
         return Ok(());
     };
@@ -685,5 +721,10 @@ mod tests {
             declared_dtype(ora, "timestamp"),
             Some(DataType::Datetime(TimeUnit::Microseconds, None))
         );
+        assert_eq!(
+            declared_dtype(pg, "time(3) without time zone"),
+            Some(DataType::Time)
+        );
+        assert_eq!(declared_dtype(pg, "timestamp without time zone"), None);
     }
 }

@@ -1113,6 +1113,47 @@ def test_scan_duckdb_string_literal_with_nul(tmp_path: Path, driver: str) -> Non
         assert pushed is (driver == "duckdb")
 
 
+@pytest.mark.parametrize("driver", ["duckdb", "adbc"])
+def test_scan_duckdb_values_arrow_cant_carry(tmp_path: Path, driver: str) -> None:
+    # TIME '24:00:00' read as NULL, ±infinity as i64::MAX, the UHUGEINT maximum as -1
+    duckdb = pytest.importorskip("duckdb")
+    if driver == "adbc":
+        _skip_without_duckdb_adbc()
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE t (id INTEGER, tm TIME, ts TIMESTAMP, tns TIMESTAMP_NS, "
+            "tz TIMESTAMPTZ, d DATE, uh UHUGEINT)"
+        )
+        conn.execute(
+            "INSERT INTO t VALUES (1, '12:00:00', '2024-01-01', '2024-01-01', "
+            f"'2024-01-01 00:00:00+00', '2024-01-01', {2**127 - 1})"
+        )
+    for source in ["t", "SELECT * FROM t"]:
+        lf = pl.scan_database(source, f"duckdb:///{path}", driver=driver)
+        assert lf.collect()["uh"].cast(pl.String).item() == str(2**127 - 1)
+    values = {
+        "tm": "'24:00:00'",
+        "ts": "'infinity'",
+        "tns": "'-infinity'",
+        "tz": "'infinity'",
+        "d": "'-infinity'",
+        "uh": str(2**128 - 1),
+    }
+    with duckdb.connect(path) as conn:
+        for i, (column, value) in enumerate(values.items(), start=2):
+            conn.execute(f"INSERT INTO t (id, {column}) VALUES ({i}, {value})")
+    for source in ["t", "SELECT * FROM t"]:
+        lf = pl.scan_database(source, f"duckdb:///{path}", driver=driver)
+        for column in values:
+            with pytest.raises(
+                pl.exceptions.ComputeError,
+                match=f'column "{column}" holds a value Polars can\'t represent',
+            ):
+                lf.select(column).collect()
+        assert lf.select("id").collect().height == 7
+
+
 def test_scan_duckdb_timestamptz_is_planned_in_utc(tmp_path: Path) -> None:
     # DuckDB returns TIMESTAMPTZ in the session time zone, the machine's by default
     from datetime import datetime, timezone

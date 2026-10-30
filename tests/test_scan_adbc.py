@@ -51,6 +51,20 @@ def test_adbc_reads_edge_values(edge_db: str) -> None:
     assert_frame_equal(df.sort("id"), expected.sort("id"))
 
 
+def test_adbc_rejects_text_that_isnt_utf8(tmp_path: Path) -> None:
+    # the driver passed SQLite's bytes on: a Polars String must be UTF-8
+    path = tmp_path / "u.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE t (id INTEGER, s TEXT)")
+    conn.execute("INSERT INTO t VALUES (1, CAST(X'FF' AS TEXT)), (2, 'a')")
+    conn.commit()
+    conn.close()
+    for source in ["t", "SELECT * FROM t"]:
+        lf = pl.scan_database(source, f"sqlite:///{path}", driver="adbc")
+        with pytest.raises(pl.exceptions.ComputeError, match="'s' holds text that is"):
+            lf.collect()
+
+
 def test_adbc_stops_early(edge_db: str) -> None:
     # an early stop drops the stream before its end: the statement and connection close
     lf = pl.scan_database("t", edge_db, driver="adbc", batch_size=100).head(3)
@@ -59,7 +73,9 @@ def test_adbc_stops_early(edge_db: str) -> None:
 
 def test_adbc_reports_sql_errors(edge_db: str) -> None:
     with pytest.raises(pl.exceptions.ComputeError, match="no_such_column"):
-        pl.scan_database("SELECT no_such_column FROM t", edge_db, driver="adbc").collect()
+        pl.scan_database(
+            "SELECT no_such_column FROM t", edge_db, driver="adbc"
+        ).collect()
 
 
 def test_adbc_without_driver_manager(
