@@ -257,6 +257,10 @@ pub struct SqlQuery {
     pub filter: Vec<SqlExpr>,
     pub order_by: Vec<SqlOrderBy>,
     pub limit: Option<u64>,
+    /// Columns that `filter` and `order_by` reference through the relation (`"t"."c"`,
+    /// `"_pl"."c"`): a select item reads them through a conversion under the same name,
+    /// which `ORDER BY` (and ClickHouse's `WHERE`) resolves a bare name to.
+    pub qualified: Vec<PlSmallStr>,
 }
 
 impl SqlQuery {
@@ -267,6 +271,7 @@ impl SqlQuery {
             filter: vec![],
             order_by: vec![],
             limit: None,
+            qualified: vec![],
         }
     }
 }

@@ -977,25 +977,27 @@ fn zero_date_check(config: &DatabaseScanConfig, column: &str) -> Option<SqlExpr>
 
 /// An `ORDER BY` column. A MySQL date column is ordered by its values as read, zero
 /// dates as NULL: a date with a zero month or day (`2020-00-01`) sorts among the real
-/// dates otherwise. The conversion is written on the table's column, so it applies
+/// dates otherwise. The conversion is written on the relation's column, so it applies
 /// whether or not the column is selected. (An index on the column no longer gives the
 /// order then: the database sorts.)
+///
+/// Other columns are ordered by the relation's column too, not the select item of that
+/// name, which may be converted (e.g. to text, which sorts otherwise): see
+/// `SqlQuery::qualified`.
 fn order_by_expr(config: &DatabaseScanConfig, column: &PlSmallStr) -> SqlExpr {
-    match &config.options.relation {
-        relation @ DatabaseRelation::Table { .. } if zero_date_check(config, column).is_some() => {
-            let dialect = config.dialect;
-            let qualified = format!(
-                "{}.{}",
-                quoted_relation(dialect, relation),
-                dialect.quote_ident(column)
-            );
-            SqlExpr::Raw(format!(
-                "IF({}, NULL, {qualified})",
-                mysql_zero_date(&qualified)
-            ))
-        },
-        _ => SqlExpr::col(column.clone()),
+    if zero_date_check(config, column).is_none() {
+        return SqlExpr::col(column.clone());
     }
+    let dialect = config.dialect;
+    let relation = match &config.options.relation {
+        relation @ DatabaseRelation::Table { .. } => quoted_relation(dialect, relation),
+        DatabaseRelation::Query { .. } => dialect.quote_ident("_pl"),
+    };
+    let qualified = format!("{relation}.{}", dialect.quote_ident(column));
+    SqlExpr::Raw(format!(
+        "IF({}, NULL, {qualified})",
+        mysql_zero_date(&qualified)
+    ))
 }
 
 fn references(e: &SqlExpr, column: &str) -> bool {
@@ -1361,6 +1363,16 @@ pub fn compile_scan(
         })
         .collect();
     let limit = pushdown.limit.filter(|_| dialect.supports_limit());
+    // the columns read through a conversion, under their own name
+    let qualified: Vec<PlSmallStr> = select
+        .iter()
+        .filter_map(|item| match item {
+            SqlSelectItem::Expr { alias, .. } if config.schema.contains(alias) => {
+                Some(alias.clone())
+            },
+            _ => None,
+        })
+        .collect();
 
     let pushed: Vec<SqlExpr> = pushdown
         .filters
@@ -1384,6 +1396,7 @@ pub fn compile_scan(
             filter: filter.clone(),
             order_by: order_by.clone(),
             limit,
+            qualified: qualified.clone(),
         };
         let count = SqlQuery {
             columns: vec![SqlSelectItem::CountStar],
@@ -1391,6 +1404,7 @@ pub fn compile_scan(
             filter,
             order_by: vec![],
             limit: None,
+            qualified: vec![],
         };
         compiled.push(CompiledPartition {
             sql: renderer.render(&query, dialect)?,
@@ -1556,9 +1570,13 @@ fn compile_unwrapped(
                         ColumnNotFound: "order_by column '{c}' is not in the database source"
                     );
                 }
+                // the table's columns, not the select items that convert them
                 let cols = order_by
                     .iter()
-                    .map(|c| dialect.quote_ident(c))
+                    .map(|c| match order_by_expr(config, c) {
+                        SqlExpr::Raw(sql) => sql,
+                        _ => format!("{from}.{}", dialect.quote_ident(c)),
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 sql.push_str(&format!(" ORDER BY {cols}"));

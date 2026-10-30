@@ -222,7 +222,34 @@ def _from(f: Any) -> Any:
 _SUBQUERY_PLACEHOLDER = f"__polars_subquery_{secrets.token_hex(8)}__"
 
 
-def _ordered(o: Any, d: str | None) -> list[Any]:
+def _qualified(node: Any, columns: set[str], from_: Any) -> Any:
+    """
+    `node` with its references to `columns` qualified by the relation: a select item reads
+    them through a conversion under the same name, which `ORDER BY` (and ClickHouse's
+    `WHERE`) would resolve the name to.
+    """
+    if not columns:
+        return node
+    ((kind, x),) = from_.items()
+    if kind == "Table":
+        parts = [_ident(p) for p in x]
+        qualifier = {
+            "table": parts[-1],
+            "db": parts[-2] if len(parts) >= 2 else None,
+            "catalog": parts[-3] if len(parts) >= 3 else None,
+        }
+    else:
+        qualifier = {"table": _ident("_pl")}
+    for column in list(node.find_all(exp.Column)):
+        if not column.table and column.name in columns:
+            column.set("table", qualifier["table"].copy())
+            for k in ("db", "catalog"):
+                if qualifier.get(k) is not None:
+                    column.set(k, qualifier[k].copy())
+    return node
+
+
+def _ordered(o: Any, d: str | None, qualify: Any = lambda e: e) -> list[Any]:
     # NULLs where the dialect puts them by default, as range partitions expect
     # (`nulls_sort_first` in `partition.rs`)
     null_ordering = sqlglot.Dialect.get_or_raise(d).NULL_ORDERING
@@ -230,7 +257,7 @@ def _ordered(o: Any, d: str | None) -> list[Any]:
     nulls_first = (null_ordering == "nulls_are_small" and not desc) or (
         null_ordering == "nulls_are_large" and desc
     )
-    this = _expr(o["expr"], d)
+    this = qualify(_expr(o["expr"], d))
     if d is None:
         # an unknown database (FlightSQL, ODBC): its NULL order is unknown, and it may
         # not have `NULLS FIRST`. NULLs first on ASC, as range partitions expect
@@ -270,13 +297,18 @@ _NO_NULLS_CLAUSE = {"sqlite"}
 def build(query: dict[str, Any], dialect: str | None = None) -> Any:
     """Build the sqlglot expression of a `SqlQuery`."""
     d = dialect
+    columns = set(query.get("qualified") or ())
+
+    def qualify(e: Any) -> Any:
+        return _qualified(e, columns, query["from"])
+
     select = exp.Select(expressions=[_select_item(c) for c in query["columns"]])
     select = select.from_(_from(query["from"]), copy=False)
     if filters := query["filter"]:
-        select = select.where(*(_expr(f, d) for f in filters), copy=False)
+        select = select.where(*(qualify(_expr(f, d)) for f in filters), copy=False)
     if order_by := query["order_by"]:
         select = select.order_by(
-            *(e for o in order_by for e in _ordered(o, d)), copy=False
+            *(e for o in order_by for e in _ordered(o, d, qualify)), copy=False
         )
     if (limit := query["limit"]) is not None:
         select = select.limit(int(limit), copy=False)

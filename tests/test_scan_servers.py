@@ -3022,3 +3022,59 @@ def test_postgres_failed_lookup_keeps_the_users_transaction(module: str) -> None
             "postgres17",
             [f"DROP TABLE IF EXISTS {table}", f'DROP TABLE IF EXISTS "Rvf{module}"'],
         )
+
+
+def test_converted_columns_order_by_their_values() -> None:
+    # ORDER BY "n" sorted the select item of that name, read as text: 10, 100, -20, ...
+    values = ["10", "100", "-20", "2.5", "-5", "9"]
+    expected = sorted(values, key=Decimal)
+    cases = []
+    if POSTGRES is not None:
+        cases += [
+            ("postgres17", "rvf_ord", d, f"CREATE TABLE rvf_ord (id int, n {t})")
+            for d in ["psycopg", "adbc", "pg8000"]
+            for t in ["numeric"]
+        ]
+    if SERVERS["mysql"].uri is not None:
+        cases.append(
+            (
+                "mysql",
+                "rvf_ord",
+                "connectorx",
+                "CREATE TABLE rvf_ord (id int, n decimal(30,15))",
+            )
+        )
+    if SERVERS["clickhouse"].uri is not None:
+        cases.append(
+            (
+                "clickhouse",
+                "rvf_ord",
+                "connectorx",
+                "CREATE TABLE rvf_ord (id Int32, n Decimal(30, 15)) "
+                "ENGINE = MergeTree ORDER BY id",
+            )
+        )
+    # (ConnectorX reads no bounds of a ClickHouse decimal)
+    partitioned = {"partition_on": "n", "partition_num": 3}
+    if not cases:
+        pytest.skip("no Postgres, MySQL or ClickHouse URI")
+    for name, table, driver, create in cases:
+        if driver == "connectorx":
+            pytest.importorskip("connectorx")
+        _execute(
+            name,
+            [
+                f"DROP TABLE IF EXISTS {table}",
+                create,
+                f"INSERT INTO {table} VALUES "
+                + ", ".join(f"({i}, {v})" for i, v in enumerate(values)),
+            ],
+        )
+        try:
+            for source in [table, f"SELECT id, n FROM {table}"]:
+                for kw in [{}, {} if name == "clickhouse" else partitioned]:
+                    lf = _scan(name, driver, source, order_by="n", **kw)
+                    got = [Decimal(str(v)) for v in lf.collect()["n"].to_list()]
+                    assert got == [Decimal(v) for v in expected], (name, driver, source)
+        finally:
+            _execute(name, [f"DROP TABLE IF EXISTS {table}"])
