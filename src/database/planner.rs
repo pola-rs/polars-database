@@ -1282,7 +1282,7 @@ fn resolve_partitions(
     let Some(dtype) = config.schema.get(&column) else {
         polars_bail!(ColumnNotFound: "partition column '{column}' is not in the database source");
     };
-    let Some(kind) = partition::range_kind(dtype) else {
+    let Some(mut kind) = partition::range_kind(dtype) else {
         if why == "auto" {
             return one();
         }
@@ -1292,6 +1292,10 @@ fn resolve_partitions(
             float or date column (use partition_predicates for other types)"
         );
     };
+
+    if matches!(kind, partition::RangeKind::Int) && config.maybe_mysql_year(&column) {
+        kind = partition::RangeKind::Year;
+    }
 
     let range = match range {
         Some(range) => {

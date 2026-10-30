@@ -389,24 +389,21 @@ impl Translator<'_> {
         {
             return false;
         }
-        if matches!(
-            self.dialect(),
-            DialectName::Mysql | DialectName::Singlestore
-        ) && self
-            .config
-            .column(name)
-            .is_some_and(|c| match c.db_type.as_deref() {
-                Some(t) => {
-                    let t = t.trim().to_ascii_lowercase();
-                    t == "year" || t.starts_with("year(")
-                },
-                // an integer of unknown type (`schema=`) may be a `YEAR`
-                None => c.dtype.is_integer(),
-            })
-        {
+        if self.config.maybe_mysql_year(name) {
             return !av.extract::<i64>().is_some_and(|y| (1..=99).contains(&y));
         }
         true
+    }
+
+    /// `b` is `value`. MySQL and SQLite hold booleans as integers, any of which but 0 Polars
+    /// reads as true, while `TRUE` is 1.
+    fn boolean_is(&self, name: &PlSmallStr, value: bool) -> SqlExpr {
+        let col = SqlExpr::col(name.clone());
+        if self.dialect().booleans_are_integers() {
+            let op = if value { SqlBinOp::NotEq } else { SqlBinOp::Eq };
+            return SqlExpr::binary(col, op, SqlExpr::lit(SqlLiteral::Int(0)));
+        }
+        SqlExpr::binary(col, SqlBinOp::Eq, SqlExpr::lit(SqlLiteral::Bool(value)))
     }
 
     /// Whether predicates on the column can be pushed at all (see `ColumnMeta::comparable`).
@@ -437,16 +434,8 @@ impl Translator<'_> {
                 if !self.comparable(name) {
                     return None;
                 }
-                (dtype == &DataType::Boolean && self.dialect().supports_boolean()).then(|| {
-                    (
-                        SqlExpr::binary(
-                            SqlExpr::col(name.clone()),
-                            SqlBinOp::Eq,
-                            SqlExpr::lit(SqlLiteral::Bool(true)),
-                        ),
-                        Class::Exact,
-                    )
-                })
+                (dtype == &DataType::Boolean && self.dialect().supports_boolean())
+                    .then(|| (self.boolean_is(name, true), Class::Exact))
             },
             Node::Not(inner) => {
                 // The negation of a superset is a subset: only exact expressions negate.
@@ -553,6 +542,10 @@ impl Translator<'_> {
 
     fn is_in(&self, e: &Node, values: &Series, nulls_equal: bool) -> Option<(SqlExpr, Class)> {
         let (name, dtype) = self.column(e)?;
+        // `IN (TRUE)` is `IN (1)` (see `boolean_is`)
+        if dtype == &DataType::Boolean && self.dialect().booleans_are_integers() {
+            return None;
+        }
 
         let mut has_null = false;
         let mut lits = Vec::with_capacity(values.len());
@@ -684,6 +677,22 @@ impl Translator<'_> {
             // `NUMBER` and `FLOAT` hold decimals that the f64 Polars reads only approximates.
             // No Oracle float comparison is pushed.
             dt if dt.is_float() && self.dialect() == DialectName::Oracle => None,
+            // MySQL's text protocol (PyMySQL, mysql.connector) sends a 4-byte `FLOAT` rounded
+            // to a few digits, which a Float64 holds as such, while the database compares the
+            // stored value. A Float64 whose type is unknown (a query's on a row driver,
+            // `schema=`) may be one.
+            DataType::Float64
+                if matches!(
+                    self.dialect(),
+                    DialectName::Mysql | DialectName::Singlestore
+                ) && self.config.column(name).is_some_and(|c| {
+                    c.db_type
+                        .as_deref()
+                        .is_none_or(|t| t.trim().to_ascii_lowercase().starts_with("float"))
+                }) =>
+            {
+                None
+            },
             dt if dt.is_float() => self
                 .dialect()
                 .float_comparisons_exact()
@@ -754,7 +763,16 @@ impl Translator<'_> {
             return None;
         }
         let class = self.leaf_class(name, dtype, op)?;
-        let mut expr = SqlExpr::binary(col(), bin_op, SqlExpr::lit(lit));
+        let mut expr = match lit {
+            // `b = TRUE` / `b <> FALSE`, as `boolean_is` writes them
+            SqlLiteral::Bool(v) if self.dialect().booleans_are_integers() => match bin_op {
+                SqlBinOp::Eq => self.boolean_is(name, v),
+                SqlBinOp::NotEq => self.boolean_is(name, !v),
+                // integers order otherwise than booleans
+                _ => return None,
+            },
+            lit => SqlExpr::binary(col(), bin_op, SqlExpr::lit(lit)),
+        };
         // `eq_missing` / `ne_missing` are never NULL, so their SQL must not be either: under
         // a NOT, a NULL would drop rows that Polars keeps.
         if op == CmpOp::NotEqMissing {

@@ -20,6 +20,9 @@ pub enum RangeKind {
     Int,
     Float,
     Date,
+    /// A MySQL `YEAR`: an integer that holds 0 or 1901-2155, compared with an integer 1-99
+    /// as a year (1970-2069).
+    Year,
 }
 
 /// Whether an ascending `ORDER BY` puts NULLs first in this dialect. Matches the renderer's
@@ -62,6 +65,11 @@ pub fn range_partitions(
         let v = lo + step * i as f64;
         let v = match kind {
             RangeKind::Int => v.ceil(),
+            // No value lies in 1-1900: 100 cuts where 1-99 would, read as itself.
+            RangeKind::Year => match v.ceil() {
+                v if (1.0..100.0).contains(&v) => 100.0,
+                v => v,
+            },
             // Years outside 1..9999 render as dates that databases can't parse. The outer
             // partitions are open-ended, so clamped cuts lose no rows.
             RangeKind::Date => v.ceil().clamp(MIN_DATE_DAYS as f64, MAX_DATE_DAYS as f64),
@@ -73,7 +81,7 @@ pub fn range_partitions(
     }
     let lit = |v: f64| -> SqlExpr {
         SqlExpr::Literal(match kind {
-            RangeKind::Int => SqlLiteral::Int(v as i128),
+            RangeKind::Int | RangeKind::Year => SqlLiteral::Int(v as i128),
             RangeKind::Float => SqlLiteral::Float(v),
             RangeKind::Date => SqlLiteral::Date(date_text(v as i32)),
         })
@@ -246,6 +254,27 @@ mod tests {
         );
         assert!(nulls_sort_first(DialectName::Mysql));
         assert!(!nulls_sort_first(DialectName::Postgresql));
+    }
+
+    #[test]
+    fn year_cuts_are_never_1_to_99() {
+        fn ints_in(e: &SqlExpr, out: &mut Vec<i128>) {
+            match e {
+                SqlExpr::Literal(SqlLiteral::Int(v)) => out.push(*v),
+                SqlExpr::Binary(l, _, r) => {
+                    ints_in(l, out);
+                    ints_in(r, out);
+                },
+                _ => {},
+            }
+        }
+        let mut cuts = vec![];
+        let parts = range_partitions(&"y".into(), 0.0, 2155.0, 40, RangeKind::Year, true);
+        for p in &parts {
+            ints_in(p.predicate.as_ref().unwrap(), &mut cuts);
+        }
+        assert!(cuts.contains(&100), "{cuts:?}");
+        assert!(!cuts.iter().any(|c| (1..100).contains(c)), "{cuts:?}");
     }
 
     #[test]

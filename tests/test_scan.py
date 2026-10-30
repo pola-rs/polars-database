@@ -1282,6 +1282,34 @@ def test_restored_setting_literals() -> None:
     assert _sql_str("a\\b", dialect="mysql") == "'a\\\\b'"
 
 
+@pytest.mark.parametrize("driver", ["adbc", "sqlite3"])
+def test_scan_sqlite_integer_booleans(tmp_path: Path, driver: str) -> None:
+    # SQLite booleans are integers: Polars reads any but 0 as true, `TRUE` is 1
+    pytest.importorskip({"adbc": "adbc_driver_sqlite"}.get(driver, driver))
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b BOOLEAN)")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?)", [(1, 1), (2, 2), (3, 0), (4, -1), (5, None)]
+        )
+        conn.commit()
+    schema = {"id": pl.Int64, "b": pl.Boolean}
+    lf = pl.scan_database("t", f"sqlite:///{path}", schema=schema, driver=driver)
+    _assert_filters_match(
+        lf,
+        [
+            pl.col("b"),
+            ~pl.col("b"),
+            pl.col("b") == True,  # noqa: E712
+            pl.col("b") != True,  # noqa: E712
+            pl.col("b") == False,  # noqa: E712
+            pl.col("b").eq_missing(False),
+            pl.col("b").ne_missing(True),
+        ],
+    )
+    assert '"b" <> 0' in lf.filter(pl.col("b")).explain()
+
+
 def test_scan_query_ending_in_a_semicolon_and_comments(shop_uri: str) -> None:
     pytest.importorskip("adbc_driver_sqlite")
     for query in [
@@ -1317,3 +1345,24 @@ def test_scan_now_dependent_query_isnt_partitioned(shop_uri: str) -> None:
     )
     with pytest.raises(pl.exceptions.InvalidOperationError, match="current time"):
         lf.collect()
+
+
+def test_scan_duckdb_session_null_order(tmp_path: Path) -> None:
+    # `order_by` writes its NULL order: a session's `default_null_order` doesn't move
+    # the NULLs between partitions
+    duckdb = pytest.importorskip("duckdb")
+    conn = duckdb.connect()
+    try:
+        conn.execute(
+            "CREATE TABLE t AS SELECT CASE WHEN range % 10 = 0 THEN NULL "
+            "ELSE range END AS k FROM range(100)"
+        )
+        conn.execute("SET default_null_order = 'nulls_first'")
+        for partition_num in [1, 4]:
+            lf = pl.scan_database(
+                "t", conn, order_by="k", partition_on="k", partition_num=partition_num
+            )
+            k = lf.collect()["k"].to_list()
+            assert k == sorted(v for v in k if v is not None) + [None] * 10
+    finally:
+        conn.close()

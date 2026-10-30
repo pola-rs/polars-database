@@ -87,7 +87,10 @@ pub fn declared_dtype(dialect: DialectName, db_type: &str) -> Option<DataType> {
         if t == "year" || t.starts_with("year(") {
             return Some(DataType::Int16);
         }
-        if t == "float" || t.starts_with("float ") {
+        // `FLOAT(M,D)` too: some drivers read it rounded to D places (a Float64), others
+        // as stored; cast to Float32, the rounded value is the stored one. (`FLOAT(p)` is
+        // shown as `float` or `double`.)
+        if t == "float" || t.starts_with("float ") || t.starts_with("float(") {
             return Some(DataType::Float32);
         }
     }

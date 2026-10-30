@@ -223,7 +223,8 @@ _SUBQUERY_PLACEHOLDER = f"__polars_subquery_{secrets.token_hex(8)}__"
 
 
 def _ordered(o: Any, d: str | None) -> list[Any]:
-    # NULLs where the dialect puts them anyway, so no emulation is generated
+    # NULLs where the dialect puts them by default, as range partitions expect
+    # (`nulls_sort_first` in `partition.rs`)
     null_ordering = sqlglot.Dialect.get_or_raise(d).NULL_ORDERING
     desc = bool(o["descending"])
     nulls_first = (null_ordering == "nulls_are_small" and not desc) or (
@@ -233,7 +234,6 @@ def _ordered(o: Any, d: str | None) -> list[Any]:
     if d is None:
         # an unknown database (FlightSQL, ODBC): its NULL order is unknown, and it may
         # not have `NULLS FIRST`. NULLs first on ASC, as range partitions expect
-        # (`nulls_sort_first` in `partition.rs`)
         is_null = exp.Case(
             ifs=[
                 exp.If(
@@ -247,7 +247,24 @@ def _ordered(o: Any, d: str | None) -> list[Any]:
             exp.Ordered(this=is_null, desc=desc, nulls_first=nulls_first),
             exp.Ordered(this=this, desc=desc, nulls_first=nulls_first),
         ]
-    return [exp.Ordered(this=this, desc=desc, nulls_first=nulls_first)]
+    ordered = exp.Ordered(this=this, desc=desc, nulls_first=nulls_first)
+    if d in _NO_NULLS_CLAUSE or (
+        sqlglot.Dialect.get_or_raise(d).generator_class.NULL_ORDERING_SUPPORTED is None
+    ):
+        # MySQL, SQL Server: no `NULLS FIRST`, and a NULL order no setting changes
+        return [ordered]
+    # Written even where it is the default, which sqlglot leaves out: a session setting
+    # may change the default (DuckDB's `default_null_order`, Snowflake's
+    # `DEFAULT_NULL_ORDERING`)
+    sql = ordered.sql(dialect=d)
+    if not sql.endswith(("NULLS FIRST", "NULLS LAST")):
+        sql += " NULLS FIRST" if nulls_first else " NULLS LAST"
+    return [_raw(sql)]
+
+
+# Dialects that have `NULLS FIRST` but get none: SQLite only since 3.30, and its NULL
+# order can't be changed
+_NO_NULLS_CLAUSE = {"sqlite"}
 
 
 def build(query: dict[str, Any], dialect: str | None = None) -> Any:

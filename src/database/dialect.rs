@@ -369,6 +369,11 @@ impl DialectName {
         !matches!(self, Self::Mssql | Self::Oracle | Self::Teradata)
     }
 
+    /// Whether booleans are integers (`TRUE` is 1), which may hold other values than 0 and 1.
+    pub fn booleans_are_integers(self) -> bool {
+        matches!(self, Self::Mysql | Self::Singlestore | Self::Sqlite)
+    }
+
     /// Longest `IN (…)` list pushed as-is. Longer lists become a `BETWEEN min AND max`
     /// superset.
     pub fn max_in_list(self) -> usize {

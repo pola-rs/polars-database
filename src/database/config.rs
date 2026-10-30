@@ -101,6 +101,22 @@ impl DatabaseScanConfig {
         self.columns.iter().find(|c| c.name == name)
     }
 
+    /// Whether a column may be a MySQL `YEAR`, which reads an integer 1-99 compared with it
+    /// as a year (2001-2069 and 1970-1999); 0 and every other integer compare as themselves.
+    /// An integer column whose type is unknown (`schema=`) may be one.
+    pub fn maybe_mysql_year(&self, column: &str) -> bool {
+        matches!(self.dialect, DialectName::Mysql | DialectName::Singlestore)
+            && self
+                .column(column)
+                .is_some_and(|c| match c.db_type.as_deref() {
+                    Some(t) => {
+                        let t = t.trim().to_ascii_lowercase();
+                        t == "year" || t.starts_with("year(")
+                    },
+                    None => c.dtype.is_integer(),
+                })
+    }
+
     /// Concurrent connections for a scan on this machine.
     pub fn max_connections(&self) -> usize {
         if self.options.connection.is_live() {

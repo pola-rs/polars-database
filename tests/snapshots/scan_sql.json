@@ -135,8 +135,8 @@
       "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t`"
     },
     "float_cmp": {
-      "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t` WHERE `f64` > 1.5"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t`"
     },
     "decimal_cmp": {
       "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
@@ -220,7 +220,7 @@
     },
     "bool_col": {
       "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t` WHERE `b` = TRUE"
+      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t` WHERE `b` <> 0"
     },
     "arithmetic": {
       "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
@@ -550,7 +550,7 @@
     },
     "or": {
       "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE (\"i16\" = 1) OR (\"b\" = TRUE)"
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE (\"i16\" = 1) OR (\"b\" <> 0)"
     },
     "date_cmp": {
       "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
@@ -562,7 +562,7 @@
     },
     "bool_col": {
       "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"b\" = TRUE"
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"b\" <> 0"
     },
     "arithmetic": {
       "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",

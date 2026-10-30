@@ -2369,6 +2369,81 @@ def test_mysql_query_order_by_is_kept(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", ["mysql", "mariadb"])
+def test_mysql_year_partitions(name: str) -> None:
+    # a cut of 1-99 would be read as a year 1970-2069
+    _execute(
+        name,
+        [
+            "DROP TABLE IF EXISTS fix_year_parts",
+            "CREATE TABLE fix_year_parts (id int, y year)",
+            "INSERT INTO fix_year_parts VALUES "
+            "(1, 0), (2, 2000), (3, 2155), (4, 1901), (5, NULL)",
+        ],
+    )
+    try:
+        for kw in [{}, {"partition_range": (0, 2155)}]:
+            lf = _scan(
+                name,
+                "pymysql",
+                "fix_year_parts",
+                partition_on="y",
+                partition_num=40,
+                **kw,
+            )
+            assert sorted(lf.collect()["id"].to_list()) == [1, 2, 3, 4, 5]
+    finally:
+        _execute(name, ["DROP TABLE IF EXISTS fix_year_parts"])
+
+
+@pytest.mark.parametrize("name", ["mysql", "mariadb"])
+def test_mysql_float_with_digits_and_integer_booleans(name: str) -> None:
+    # FLOAT(7,3): row drivers read it rounded, the database compares the stored
+    # value; booleans are integers, any of which but 0 is true
+    table = "fix_float_bool"
+    _execute(
+        name,
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id int, f2 FLOAT(7,3), b TINYINT(1))",
+            f"INSERT INTO {table} VALUES "
+            "(1, 1.234, 1), (2, 3.3, 2), (3, NULL, 0), (4, 2.5, -1), (5, 0.1, NULL)",
+        ],
+    )
+    drivers = ["pymysql", "mysql.connector", "adbc"]
+    try:
+        for driver in drivers if name == "mysql" else drivers[:1]:
+            for source in [table, f"SELECT * FROM {table}"]:
+                lf = _scan(name, driver, source)
+                _check_filters(
+                    lf,
+                    [
+                        pl.col("f2").is_in([1.234, 3.3]),
+                        pl.col("f2") == pl.lit(1.234, pl.Float32),
+                        pl.col("f2") == 1.234,
+                        pl.col("f2") > 2.5,
+                        pl.col("f2") <= 0.1,
+                    ],
+                )
+                schema = {"id": pl.Int32, "f2": pl.Float32, "b": pl.Boolean}
+                lf = _scan(name, driver, source, schema=schema)
+                _check_filters(
+                    lf,
+                    [
+                        pl.col("b"),
+                        ~pl.col("b"),
+                        pl.col("b") == True,  # noqa: E712
+                        pl.col("b") != True,  # noqa: E712
+                        pl.col("b") == False,  # noqa: E712
+                        pl.col("b").is_in([True]),
+                        pl.col("b") | (pl.col("id") == 3),
+                    ],
+                )
+                assert "<> 0" in lf.filter(pl.col("b")).explain()
+    finally:
+        _execute(name, [f"DROP TABLE IF EXISTS {table}"])
+
+
+@pytest.mark.parametrize("name", ["mysql", "mariadb"])
 def test_mysql_query_ending_in_comments(name: str) -> None:
     for query in [
         "SELECT id FROM edge WHERE id < 3 # a comment",
