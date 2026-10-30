@@ -568,6 +568,19 @@ pub fn resolve_scan(
         {
             oracle_query_timestamps(&info, &mut columns, &mut discovered);
         }
+        // A MySQL query's `FLOAT` (planned by its result type on row drivers, without a
+        // declared type) is read exactly too, where the query is wrapped.
+        if matches!(options.relation, DatabaseRelation::Query { .. })
+            && matches!(dialect, DialectName::Mysql | DialectName::Singlestore)
+            && read_wrapped(&options, &pushdown_disabled, &query)
+        {
+            for c in columns
+                .iter_mut()
+                .filter(|c| c.dtype == DataType::Float32 && c.db_type.is_none())
+            {
+                c.db_type = Some("float".into());
+            }
+        }
         schema = Arc::new(discovered);
     }
 
@@ -595,12 +608,19 @@ pub fn resolve_scan(
     }
 
     // ConnectorX can't read a SQLite column whose values have several storage classes
-    // (`'abc'` and `1`), which a String (or a Float64: `1` and `1.5`) column may hold.
+    // (`'abc'` and `1`), which a String (or a Float64: `1` and `1.5`) column may hold. It
+    // reads a column by its declared type where the values' class allows: a `BOOLEAN`'s
+    // integers as booleans (2 as true), and it fails on a `DATE` / `BLOB` / … column's
+    // integers. An expression has no declared type: its values are read by their class,
+    // as the other drivers read them.
     if matches!(backend.kind, BackendKind::ConnectorX) && dialect == DialectName::Sqlite {
         for c in columns.iter_mut() {
             match c.dtype {
                 DataType::String => c.db_type = Some(CONNECTORX_SQLITE_TEXT.into()),
                 DataType::Float64 => c.db_type = Some(CONNECTORX_SQLITE_REAL.into()),
+                DataType::Int64 | DataType::Binary => {
+                    c.db_type = Some(CONNECTORX_SQLITE_VALUE.into())
+                },
                 _ => {},
             }
         }
@@ -772,6 +792,9 @@ const CONNECTORX_DECIMAL: &str = "<connectorx decimal>";
 /// converted to text / reals, as the other drivers read them.
 const CONNECTORX_SQLITE_TEXT: &str = "<connectorx sqlite text>";
 const CONNECTORX_SQLITE_REAL: &str = "<connectorx sqlite real>";
+/// The `db_type` of a SQLite Int64 / Binary column read through ConnectorX: its values as
+/// they are, without the column's declared type.
+const CONNECTORX_SQLITE_VALUE: &str = "<connectorx sqlite value>";
 
 /// SQL that converts a column of a declared type where the backend can't read it as is, or
 /// `None` to select it as it is. `setup_runs`: the session setup runs (see `resolve_scan`).
@@ -782,8 +805,15 @@ fn column_conversion(
     db_type: &str,
     column: &str,
 ) -> Option<String> {
+    if db_type == CONNECTORX_DECIMAL && dialect == DialectName::Oracle {
+        return Some(oracle_number_text(column));
+    }
     if db_type == CONNECTORX_DECIMAL || db_type == CONNECTORX_SQLITE_TEXT {
         return Some(dialect.cast_to_text(column));
+    }
+    if db_type == CONNECTORX_SQLITE_VALUE {
+        // `+x` is `x`, of any class, but an expression
+        return Some(format!("+{column}"));
     }
     if db_type == CONNECTORX_SQLITE_REAL {
         // a text value stays text, and fails the read as it does with other drivers
@@ -808,6 +838,10 @@ fn column_conversion(
         {
             return Some(format!("toString({column}, 'UTC')"));
         }
+        // in arrays (any deep), as their nanoseconds since the epoch
+        if !matches!(backend, BackendKind::Adbc { .. }) && t.starts_with("array(") {
+            return clickhouse_array_nanoseconds(db_type, column, 0);
+        }
     }
     // Read as text and parse the exact value; the planned dtype stays the declared decimal.
     // ConnectorX reads decimals with at most 10 decimal places, dropping digits; an
@@ -818,32 +852,34 @@ fn column_conversion(
             || DataType::Decimal(p, scale) == super::schema::UNCONSTRAINED_DECIMAL)
     {
         if dialect == DialectName::Oracle {
-            // the session (a live connection's) may write a decimal comma
-            return Some(format!(
-                "TO_CHAR({column}, 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''')"
-            ));
+            return Some(oracle_number_text(column));
         }
         return Some(dialect.cast_to_text(column));
     }
     // Oracle returns `TIMESTAMP WITH LOCAL TIME ZONE` in the session's time zone (a live
     // connection's is the user's), and drivers drop the offset of `TIMESTAMP WITH TIME
     // ZONE`, keeping the wall-clock time: read both as UTC, which the planned dtype says
-    // they are. oracledb reads 7 to 9 fractional digits as microseconds, and wraps a
-    // value outside the nanosecond range: they are read as text (`SYYYY` writes a BC
-    // year as negative, which fails the parse).
+    // they are (the cast keeps the column's fractional digits: its default precision is
+    // 6). oracledb reads 7 to 9 fractional digits as microseconds, and wraps a value outside
+    // the nanosecond range: they are read as text (`SYYYY` writes a BC year as negative,
+    // which fails the parse), in the Gregorian calendar whatever the session's
+    // `NLS_CALENDAR` (a live connection's may be another).
     if dialect == DialectName::Oracle {
         let t = db_type.trim().to_ascii_lowercase();
         if t.starts_with("timestamp") {
+            let precision = super::schema::oracle_timestamp_precision(&t);
             let utc = if t.contains("local time zone") {
-                format!("SYS_EXTRACT_UTC(CAST({column} AS TIMESTAMP WITH TIME ZONE))")
+                let p = precision.unwrap_or(6);
+                format!("SYS_EXTRACT_UTC(CAST({column} AS TIMESTAMP({p}) WITH TIME ZONE))")
             } else if t.contains("time zone") {
                 format!("SYS_EXTRACT_UTC({column})")
             } else {
                 column.to_string()
             };
-            if super::schema::oracle_timestamp_precision(&t).is_some_and(|p| p > 6) {
+            if precision.is_some_and(|p| p > 6) {
                 return Some(format!(
-                    "TRIM(TO_CHAR({utc}, 'SYYYY-MM-DD HH24:MI:SS.FF9'))"
+                    "TRIM(TO_CHAR({utc}, 'SYYYY-MM-DD HH24:MI:SS.FF9', \
+                    'NLS_CALENDAR=GREGORIAN'))"
                 ));
             }
             if utc != column {
@@ -853,17 +889,27 @@ fn column_conversion(
     }
     // A Postgres `time` may be `24:00:00`, which isn't a time of day: Arrow drivers read it
     // as NULL or `00:00:00`. It fails the read instead, naming the column (the text isn't
-    // a valid time; the `CASE` evaluates it only then).
-    if matches!(dialect, DialectName::Postgresql | DialectName::Redshift)
-        && declared_dtype(dialect, db_type) == Some(DataType::Time)
-    {
+    // a valid time; the `CASE` evaluates it only then). In a `time[]`, any element.
+    if matches!(dialect, DialectName::Postgresql | DialectName::Redshift) {
         let msg = dialect.quote_str(&format!(
             "column {column} holds 24:00:00, which is not a time of day"
         ));
-        return Some(format!(
-            "CASE WHEN {column} = TIME '24:00:00' \
-            THEN CAST({msg} || LEFT(CAST({column} AS TEXT), 0) AS TIME) ELSE {column} END"
-        ));
+        let fail = format!("CAST({msg} || LEFT(CAST({column} AS TEXT), 0) AS TIME)");
+        match declared_dtype(dialect, db_type) {
+            Some(DataType::Time) => {
+                return Some(format!(
+                    "CASE WHEN {column} = TIME '24:00:00' THEN {fail} ELSE {column} END"
+                ));
+            },
+            // `ANY` looks at every element, of every dimension
+            Some(DataType::List(inner)) if *inner == DataType::Time => {
+                return Some(format!(
+                    "CASE WHEN TIME '24:00:00' = ANY({column}) THEN ARRAY[{fail}] \
+                    ELSE {column} END"
+                ));
+            },
+            _ => {},
+        }
     }
     if dialect == DialectName::Duckdb
         && let Some(check) = duckdb_value_check(db_type, column)
@@ -878,6 +924,25 @@ fn column_conversion(
         && declared_dtype(dialect, db_type).is_some_and(|d| d.is_decimal())
     {
         return Some(dialect.cast_to_text(column));
+    }
+    // MySQL's text protocol (PyMySQL, mysql.connector) and ADBC send a `FLOAT` rounded to
+    // 6 significant digits (1234.567 reads 1234.57); as a `DOUBLE`, its stored value.
+    if matches!(dialect, DialectName::Mysql | DialectName::Singlestore)
+        && declared_dtype(dialect, db_type) == Some(DataType::Float32)
+    {
+        return Some(format!("CAST({column} AS DOUBLE)"));
+    }
+    // MySQL `TIME` is a duration: Python drivers read it as one (`timedelta`), Arrow
+    // drivers as a time of day, which fails (ConnectorX) or wraps beyond 24 hours. As
+    // microseconds, any value.
+    if matches!(dialect, DialectName::Mysql | DialectName::Singlestore)
+        && !matches!(backend, BackendKind::Python { .. })
+        && declared_dtype(dialect, db_type) == Some(DataType::Duration(TimeUnit::Microseconds))
+    {
+        return Some(format!(
+            "IF({column} < TIME '00:00:00', -1, 1) * ((HOUR({column}) * 3600 \
+            + MINUTE({column}) * 60 + SECOND({column})) * 1000000 + MICROSECOND({column}))"
+        ));
     }
     // MySQL zero dates (`'0000-00-00'`, and dates with a zero month or day) are no date:
     // read them as NULL, as Connector/J's `zeroDateTimeBehavior=convertToNull` does. Drivers
@@ -898,33 +963,154 @@ fn column_conversion(
         };
         return Some(format!("IF({}, NULL, {value})", mysql_zero_date(column)));
     }
-    let _ = backend;
     None
 }
 
+/// A ClickHouse array (of arrays) of `DateTime64(7..9)` as the elements' nanoseconds since
+/// the epoch, which the cast to the planned `List(Datetime("ns"))` reads exactly; `None`
+/// for another type.
+fn clickhouse_array_nanoseconds(db_type: &str, x: &str, depth: usize) -> Option<String> {
+    let t = super::schema::clickhouse_value_type(db_type);
+    if t.starts_with("array(") {
+        let written = db_type.trim();
+        let open = written.find('(')?;
+        // `Nullable(Array(…))` can't be: the wrappers are only around the element
+        let inner = written[open + 1..].strip_suffix(')')?;
+        let v = format!("pl_x{depth}");
+        let element = clickhouse_array_nanoseconds(inner, &v, depth + 1)?;
+        return Some(format!("arrayMap({v} -> {element}, {x})"));
+    }
+    declared_dtype(DialectName::Clickhouse, db_type)
+        .is_some_and(|d| matches!(d, DataType::Datetime(TimeUnit::Nanoseconds, _)))
+        .then(|| format!("toUnixTimestamp64Nano({x})"))
+}
+
+/// An Oracle `NUMBER` as text, whatever the session's NLS settings (a live connection's
+/// may write a decimal comma). `TM9` writes every digit; no calendar applies.
+fn oracle_number_text(column: &str) -> String {
+    format!("TO_CHAR({column}, 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''')")
+}
+
 /// DuckDB values that Arrow can't carry fail the read, naming the column: `TIME
-/// '24:00:00'` (read as NULL), `±infinity` dates and timestamps (read as their raw
-/// `i64::MAX`), and `UHUGEINT` values beyond the `i128` of the `Decimal(38, 0)` they are
-/// read as (they wrap; `HUGEINT` always fits).
+/// '24:00:00'` and `TIMETZ '24:00:00+00'` (read as NULL), `±infinity` dates and
+/// timestamps (read as their raw `i64::MAX`), and `UHUGEINT` values beyond the `i128` of
+/// the `Decimal(38, 0)` they are read as (they wrap; `HUGEINT` always fits). Also inside
+/// lists, arrays, structs, maps and unions.
 fn duckdb_value_check(db_type: &str, column: &str) -> Option<String> {
-    let t = db_type.trim().to_ascii_uppercase();
-    let bad = match t.as_str() {
-        "TIME" => format!("{column} = TIME '24:00:00'"),
-        "DATE"
-        | "TIMESTAMP"
-        | "TIMESTAMP_S"
-        | "TIMESTAMP_MS"
-        | "TIMESTAMP_NS"
-        | "TIMESTAMP WITH TIME ZONE" => format!("isinf({column})"),
-        "UHUGEINT" => format!("{column} > {}", i128::MAX),
-        _ => return None,
-    };
+    let bad = duckdb_bad_value(db_type, column, 0)?;
     let msg = DialectName::Duckdb.quote_str(&format!(
         "column {column} holds a value Polars can't represent: "
     ));
     Some(format!(
         "CASE WHEN {bad} THEN error({msg} || CAST({column} AS VARCHAR)) ELSE {column} END"
     ))
+}
+
+/// SQL that is true where the DuckDB value `x` of type `t` is (or holds) a value Arrow
+/// can't carry (see [`duckdb_value_check`]); `None` if no value of the type can be one.
+/// Lists are searched with a list comprehension, which every DuckDB version since 0.8
+/// reads (its lambda syntax changed in 1.3).
+fn duckdb_bad_value(t: &str, x: &str, depth: usize) -> Option<String> {
+    let t = t.trim();
+    let starts = |p: &str| t.get(..p.len()).is_some_and(|s| s.eq_ignore_ascii_case(p));
+    // `T[]` (a list), `T[n]` (an array)
+    if t.ends_with(']')
+        && let Some(open) = t.rfind('[')
+    {
+        let v = format!("pl_x{depth}");
+        let bad = duckdb_bad_value(&t[..open], &v, depth + 1)?;
+        return Some(format!("len([1 FOR {v} IN {x} IF {bad}]) > 0"));
+    }
+    // (a NULL check is no error: `NULL OR TRUE` is true)
+    let any = |checks: Vec<String>| {
+        (!checks.is_empty()).then(|| {
+            checks
+                .iter()
+                .map(|c| format!("({c})"))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        })
+    };
+    for (prefix, extract) in [("STRUCT(", "struct_extract"), ("UNION(", "union_extract")] {
+        if starts(prefix) {
+            let fields = t[prefix.len()..].strip_suffix(')')?;
+            let checks = split_top_level(fields)
+                .into_iter()
+                .filter_map(|field| {
+                    let (name, ft) = duckdb_field(field)?;
+                    let value = format!("{extract}({x}, {})", DialectName::Duckdb.quote_str(&name));
+                    duckdb_bad_value(ft, &value, depth)
+                })
+                .collect();
+            return any(checks);
+        }
+    }
+    if starts("MAP(") {
+        let parts = split_top_level(t["MAP(".len()..].strip_suffix(')')?);
+        let [k, v] = parts.as_slice() else {
+            return None;
+        };
+        let checks = [(k, "map_keys"), (v, "map_values")]
+            .into_iter()
+            .filter_map(|(ft, f)| duckdb_bad_value(&format!("{ft}[]"), &format!("{f}({x})"), depth))
+            .collect();
+        return any(checks);
+    }
+    Some(match t.to_ascii_uppercase().as_str() {
+        "TIME" => format!("{x} = TIME '24:00:00'"),
+        // read as the local time of day, its offset dropped
+        "TIME WITH TIME ZONE" | "TIMETZ" => format!("CAST({x} AS TIME) = TIME '24:00:00'"),
+        "DATE"
+        | "TIMESTAMP"
+        | "TIMESTAMP_S"
+        | "TIMESTAMP_MS"
+        | "TIMESTAMP_NS"
+        | "TIMESTAMP WITH TIME ZONE" => format!("isinf({x})"),
+        "UHUGEINT" => format!("{x} > {}", i128::MAX),
+        _ => return None,
+    })
+}
+
+/// The parts of a type's argument list, split at its top-level commas.
+fn split_top_level(s: &str) -> Vec<&str> {
+    let (mut parts, mut depth, mut quoted, mut start) = (vec![], 0usize, false, 0);
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '(' | '[' if !quoted => depth += 1,
+            ')' | ']' if !quoted => depth = depth.saturating_sub(1),
+            ',' if !quoted && depth == 0 => {
+                parts.push(s[start..i].trim());
+                start = i + 1;
+            },
+            _ => {},
+        }
+    }
+    parts.push(s[start..].trim());
+    parts
+}
+
+/// A DuckDB struct (or union) field, `name TYPE` or `"a name" TYPE`: its name and type.
+fn duckdb_field(field: &str) -> Option<(String, &str)> {
+    let field = field.trim();
+    if let Some(rest) = field.strip_prefix('"') {
+        // `""` is a quote in the name
+        let mut end = 0;
+        let bytes = rest.as_bytes();
+        while end < bytes.len() {
+            if bytes[end] == b'"' {
+                if bytes.get(end + 1) == Some(&b'"') {
+                    end += 2;
+                    continue;
+                }
+                return Some((rest[..end].replace("\"\"", "\""), &rest[end + 1..]));
+            }
+            end += 1;
+        }
+        return None;
+    }
+    let (name, t) = field.split_once(char::is_whitespace)?;
+    Some((name.to_string(), t))
 }
 
 /// A MySQL `DATE` / `DATETIME` / `TIMESTAMP`, which may hold zero dates.
@@ -1464,18 +1650,36 @@ fn select_item(config: &DatabaseScanConfig, c: &PlSmallStr) -> SqlSelectItem {
 
 /// ClickHouse `String`s hold any bytes. ConnectorX silently stops reading at text that isn't
 /// valid UTF-8, and clickhouse_connect hex-encodes it: such text fails the read instead, as
-/// it does on ADBC. The checks are extra select items, which the cast to the schema drops.
+/// it does on ADBC; also in arrays (of arrays). The checks are extra select items, which the
+/// cast to the schema drops.
 fn utf8_checks(config: &DatabaseScanConfig, columns: &[PlSmallStr]) -> Vec<SqlSelectItem> {
     let dialect = config.dialect;
     if dialect != DialectName::Clickhouse || matches!(config.backend.kind, BackendKind::Adbc { .. })
     {
         return vec![];
     }
+    // names that are none of the source's columns (nor of the query's, which are the same)
+    let mut taken: PlHashSet<PlSmallStr> = config.schema.iter_names().cloned().collect();
+    let mut fresh = |i: usize| {
+        let mut name = PlSmallStr::from(format!("__pl_utf8_{i}"));
+        while taken.contains(&name) {
+            name = format!("_{name}").into();
+        }
+        taken.insert(name.clone());
+        name
+    };
     columns
         .iter()
-        .filter(|c| config.schema.get(c) == Some(&DataType::String))
+        .filter_map(|c| {
+            let mut dtype = config.schema.get(c)?;
+            let mut nested = false;
+            while let DataType::List(inner) = dtype {
+                (dtype, nested) = (inner, true);
+            }
+            (*dtype == DataType::String).then_some((c, nested))
+        })
         .enumerate()
-        .map(|(i, c)| {
+        .map(|(i, (c, nested))| {
             let value = match select_item(config, c) {
                 SqlSelectItem::Expr { sql, .. } => sql,
                 _ => dialect.quote_ident(c),
@@ -1483,12 +1687,16 @@ fn utf8_checks(config: &DatabaseScanConfig, columns: &[PlSmallStr]) -> Vec<SqlSe
             let msg = dialect.quote_str(&format!(
                 "column '{c}' holds text that is not valid UTF-8; read it as hex({c}) in a query"
             ));
+            // not `LowCardinality`, whose functions also run on its dictionary's default
+            let valid = |x: &str| format!("ifNull(isValidUTF8(CAST({x} AS Nullable(String))), 1)");
+            let valid = if nested {
+                format!("arrayAll(pl_s -> {}, arrayFlatten({value}))", valid("pl_s"))
+            } else {
+                valid(&value)
+            };
             SqlSelectItem::Expr {
-                // not `LowCardinality`, whose functions also run on its dictionary's default
-                sql: format!(
-                    "throwIf(NOT ifNull(isValidUTF8(CAST({value} AS Nullable(String))), 1), {msg})"
-                ),
-                alias: format!("__pl_utf8_{i}").into(),
+                sql: format!("throwIf(NOT {valid}, {msg})"),
+                alias: fresh(i),
             }
         })
         .collect()
@@ -1864,6 +2072,32 @@ mod tests {
             },
             false
         ));
+    }
+
+    #[test]
+    fn duckdb_nested_values_are_checked() {
+        let bad = |t: &str| duckdb_bad_value(t, "\"c\"", 0);
+        assert_eq!(bad("INTEGER[]"), None);
+        assert_eq!(bad("STRUCT(a INTEGER, b VARCHAR)"), None);
+        assert_eq!(
+            bad("TIMESTAMP[]").unwrap(),
+            "len([1 FOR pl_x0 IN \"c\" IF isinf(pl_x0)]) > 0"
+        );
+        assert_eq!(
+            bad("DATE[][]").unwrap(),
+            "len([1 FOR pl_x0 IN \"c\" IF len([1 FOR pl_x1 IN pl_x0 IF isinf(pl_x1)]) > 0]) > 0"
+        );
+        assert_eq!(
+            bad(r#"STRUCT("a ""b," TIME, n INTEGER, m MAP(VARCHAR, UHUGEINT))"#).unwrap(),
+            format!(
+                "(struct_extract(\"c\", 'a \"b,') = TIME '24:00:00') OR \
+                ((len([1 FOR pl_x0 IN map_values(struct_extract(\"c\", 'm')) \
+                IF pl_x0 > {}]) > 0))",
+                i128::MAX
+            )
+        );
+        assert!(bad("TIME WITH TIME ZONE").is_some());
+        assert!(bad("STRUCT(t TIMESTAMP_NS)[2]").is_some());
     }
 
     #[test]

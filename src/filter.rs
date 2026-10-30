@@ -677,19 +677,19 @@ impl Translator<'_> {
             // `NUMBER` and `FLOAT` hold decimals that the f64 Polars reads only approximates.
             // No Oracle float comparison is pushed.
             dt if dt.is_float() && self.dialect() == DialectName::Oracle => None,
-            // MySQL's text protocol (PyMySQL, mysql.connector) sends a 4-byte `FLOAT` rounded
-            // to a few digits, which a Float64 holds as such, while the database compares the
-            // stored value. A Float64 whose type is unknown (a query's on a row driver,
-            // `schema=`) may be one.
-            DataType::Float64
-                if matches!(
+            // MySQL's text protocol (PyMySQL, mysql.connector) and ADBC send a 4-byte `FLOAT`
+            // rounded to 6 digits, while the database compares the stored value. A `FLOAT`
+            // column is read exactly (as a `DOUBLE`, see `column_conversion`); a float whose
+            // type is unknown (a query's on a row driver, `schema=`) may be one read rounded.
+            dt if dt.is_float()
+                && matches!(
                     self.dialect(),
                     DialectName::Mysql | DialectName::Singlestore
-                ) && self.config.column(name).is_some_and(|c| {
-                    c.db_type
-                        .as_deref()
-                        .is_none_or(|t| t.trim().to_ascii_lowercase().starts_with("float"))
-                }) =>
+                )
+                && self
+                    .config
+                    .column(name)
+                    .is_some_and(|c| c.db_type.is_none()) =>
             {
                 None
             },

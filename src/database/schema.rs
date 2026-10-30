@@ -108,11 +108,11 @@ pub fn declared_dtype(dialect: DialectName, db_type: &str) -> Option<DataType> {
             return Some(DataType::Float32);
         }
     }
-    // MySQL `TIME` is read as a duration by some drivers.
+    // MySQL `TIME` is a duration (-838:59:59 to 838:59:59), not a time of day.
     if matches!(dialect, DialectName::Mysql | DialectName::Singlestore)
         && (t == "time" || t.starts_with("time("))
     {
-        return Some(DataType::Time);
+        return Some(DataType::Duration(TimeUnit::Microseconds));
     }
     // MySQL `TIMESTAMP` is stored in UTC (the session time zone is UTC); `DATETIME` is naive.
     if matches!(dialect, DialectName::Mysql | DialectName::Singlestore)
@@ -405,28 +405,37 @@ fn parse_temporal(col: &Column, dtype: &DataType) -> PolarsResult<Option<Column>
         // the conversions write it: Oracle and ClickHouse time zones).
         DataType::Datetime(tu, tz) => {
             let raise = StringChunked::from_slice(PlSmallStr::EMPTY, &["raise"]);
-            // The parse overflows outside the nanosecond range (1677 to 2262): a value is
-            // checked by its microseconds first (a second's margin).
-            if *tu == TimeUnit::Nanoseconds {
+            let naive = if *tu == TimeUnit::Nanoseconds {
+                // The parse overflows near the ends of the nanosecond range (1677 to
+                // 2262): the microseconds are parsed, and the 7th to 9th fractional
+                // digits added. A value outside the range is an error.
                 let us = ca.as_datetime(None, TimeUnit::Microseconds, true, false, None, &raise)?;
-                let range = i64::MIN / 1000 + 1_000_000..=i64::MAX / 1000 - 1_000_000;
-                if let Some(i) = us
-                    .physical()
-                    .iter()
-                    .position(|v| v.is_some_and(|v| !range.contains(&v)))
-                {
-                    polars_bail!(
-                        SchemaMismatch:
-                        "database column '{}' has the value {}, outside the range of {dtype} \
-                        (1677 to 2262); read the column with schema_overrides={{'{}': \
-                        pl.Datetime('us')}}",
-                        col.name(), ca.get(i).unwrap_or_default(), col.name()
-                    );
+                let mut ns = Vec::with_capacity(ca.len());
+                for (i, (v, text)) in us.physical().iter().zip(ca.iter()).enumerate() {
+                    let Some(v) = v else {
+                        ns.push(None);
+                        continue;
+                    };
+                    // (in i128: the last microsecond before the minimum starts below it)
+                    let ns_value = v as i128 * 1000 + sub_microsecond_ns(text) as i128;
+                    let Ok(v) = i64::try_from(ns_value) else {
+                        polars_bail!(
+                            SchemaMismatch:
+                            "database column '{}' has the value {}, outside the range of \
+                            {dtype} (1677 to 2262); read the column with \
+                            schema_overrides={{'{}': pl.Datetime('us')}}",
+                            col.name(), ca.get(i).unwrap_or_default(), col.name()
+                        );
+                    };
+                    ns.push(Some(v));
                 }
-            }
-            let naive = ca
-                .as_datetime(None, *tu, true, false, None, &raise)?
-                .into_series();
+                Int64Chunked::from_iter_options(col.name().clone(), ns.into_iter())
+                    .into_datetime(TimeUnit::Nanoseconds, None)
+                    .into_series()
+            } else {
+                ca.as_datetime(None, *tu, true, false, None, &raise)?
+                    .into_series()
+            };
             match tz {
                 Some(_) => naive.cast(dtype)?,
                 None => naive,
@@ -448,6 +457,24 @@ fn parse_temporal(col: &Column, dtype: &DataType) -> PolarsResult<Option<Column>
         );
     }
     Ok(Some(parsed.into_column()))
+}
+
+/// The nanoseconds of a timestamp's text beyond its microseconds: its 7th to 9th
+/// fractional digits.
+fn sub_microsecond_ns(text: Option<&str>) -> i64 {
+    let digits = || {
+        let digits = text?
+            .rsplit_once('.')?
+            .1
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .chain(std::iter::repeat('0'))
+            .skip(6)
+            .take(3)
+            .collect::<String>();
+        digits.parse::<i64>().ok()
+    };
+    digits().unwrap_or(0)
 }
 
 /// A ClickHouse type without its `Nullable(…)` and `LowCardinality(…)` wrappers, lower-cased.
@@ -619,6 +646,22 @@ mod tests {
         assert!(e.to_string().contains("outside the range"), "{e}");
         assert!(cast("1600-01-01 00:00:00.5").is_err());
         assert!(cast("-2000-01-01 00:00:00").is_err());
+        // the ends of the range are exact, to the nanosecond
+        let value = |v: &str| {
+            cast(v).unwrap()[0]
+                .as_materialized_series()
+                .to_physical_repr()
+                .i64()
+                .unwrap()
+                .get(0)
+        };
+        assert_eq!(value("2262-04-11 23:47:16.854775807"), Some(i64::MAX));
+        assert_eq!(value("2262-04-11 23:47:16.5"), Some(i64::MAX - 354775807));
+        assert!(cast("2262-04-11 23:47:16.854775808").is_err());
+        assert_eq!(value("1677-09-21 00:12:43.145224192"), Some(i64::MIN));
+        assert_eq!(value("1677-09-21 00:12:43.9"), Some(i64::MIN + 754775808));
+        assert!(cast("1677-09-21 00:12:43.145224191").is_err());
+        assert_eq!(value("1969-12-31 23:59:59.999999999"), Some(-1));
     }
 
     #[test]

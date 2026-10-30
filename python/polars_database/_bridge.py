@@ -1388,8 +1388,8 @@ _POSTGRES_ARRAY_OIDS = {
 
 # MySQL field types (`cursor.description` of PyMySQL, MySQLdb and mysql.connector), as a
 # table's declared types are read (`declared_dtype`): a query's columns read the same.
-# These drivers read every integer as an Int64, `FLOAT` as a Python float, `TIME` as a
-# duration: the values are cast. Integers are `(signed, unsigned)` (see `_mysql_unsigned`).
+# These drivers read every integer as an Int64, `FLOAT` as a Python float: the values are
+# cast. Integers are `(signed, unsigned)` (see `_mysql_unsigned`).
 # Others (strings, which may be binary; decimals; `BIT`) are typed from values.
 _MYSQL_FIELD_DTYPES = {
     1: ("Int8", "UInt8"),  # TINY
@@ -1401,7 +1401,7 @@ _MYSQL_FIELD_DTYPES = {
     8: ("Int64", "UInt64"),  # LONGLONG
     9: ("Int32", "UInt32"),  # INT24
     10: "Date",  # DATE
-    11: "Time",  # TIME
+    11: "Duration",  # TIME (a duration, not a time of day)
     12: "Datetime",  # DATETIME
     13: "Int16",  # YEAR
     14: "Date",  # NEWDATE

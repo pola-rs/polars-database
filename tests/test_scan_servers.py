@@ -591,7 +591,8 @@ EDGE_TYPES = {
         "bin": pl.Binary,
         "nu": pl.Decimal(30, 12),
         "tstz": pl.Datetime("us", "UTC"),
-        "t": pl.Time,
+        # a duration, not a time of day
+        "t": pl.Duration("us"),
     },
     "oracle": {
         "j": pl.String,
@@ -2402,16 +2403,18 @@ def test_mysql_year_partitions(name: str) -> None:
 
 @pytest.mark.parametrize("name", ["mysql", "mariadb"])
 def test_mysql_float_with_digits_and_integer_booleans(name: str) -> None:
-    # FLOAT(7,3): row drivers read it rounded, the database compares the stored
-    # value; booleans are integers, any of which but 0 is true
+    # FLOAT(7,3) and FLOAT: row drivers and ADBC read them rounded (FLOAT to 6
+    # digits), the database compares the stored value; booleans are integers, any of
+    # which but 0 is true
     table = "fix_float_bool"
     _execute(
         name,
         [
             f"DROP TABLE IF EXISTS {table}",
-            f"CREATE TABLE {table} (id int, f2 FLOAT(7,3), b TINYINT(1))",
-            f"INSERT INTO {table} VALUES "
-            "(1, 1.234, 1), (2, 3.3, 2), (3, NULL, 0), (4, 2.5, -1), (5, 0.1, NULL)",
+            f"CREATE TABLE {table} (id int, f2 FLOAT(7,3), b TINYINT(1), f FLOAT)",
+            f"INSERT INTO {table} VALUES (1, 1.234, 1, 1234.567), "
+            "(2, 3.3, 2, 0.1), (3, NULL, 0, NULL), (4, 2.5, -1, 99.9995), "
+            "(5, 0.1, NULL, 1.5)",
         ],
     )
     drivers = ["pymysql", "mysql.connector", "adbc"]
@@ -2419,6 +2422,12 @@ def test_mysql_float_with_digits_and_integer_booleans(name: str) -> None:
         for driver in drivers if name == "mysql" else drivers[:1]:
             for source in [table, f"SELECT * FROM {table}"]:
                 lf = _scan(name, driver, source)
+                f = lf.collect().sort("id")["f"]
+                assert f.dtype == pl.Float32
+                stored = pl.Series(
+                    [1234.567, 0.1, None, 99.9995, 1.5], dtype=pl.Float32
+                )
+                assert f.to_list() == stored.to_list()
                 _check_filters(
                     lf,
                     [
@@ -2427,9 +2436,17 @@ def test_mysql_float_with_digits_and_integer_booleans(name: str) -> None:
                         pl.col("f2") == 1.234,
                         pl.col("f2") > 2.5,
                         pl.col("f2") <= 0.1,
+                        pl.col("f") == pl.lit(1234.567, pl.Float32),
+                        pl.col("f") > 1234.5699,
+                        pl.col("f") < pl.lit(99.9995, pl.Float32),
                     ],
                 )
-                schema = {"id": pl.Int32, "f2": pl.Float32, "b": pl.Boolean}
+                schema = {
+                    "id": pl.Int32,
+                    "f2": pl.Float32,
+                    "b": pl.Boolean,
+                    "f": pl.Float32,
+                }
                 lf = _scan(name, driver, source, schema=schema)
                 _check_filters(
                     lf,
@@ -2759,27 +2776,42 @@ def test_mysql_live_connection_in_another_time_zone(module: str) -> None:
 @needs_postgres
 @pytest.mark.parametrize("driver", ["adbc", "connectorx", "psycopg", "pg8000"])
 def test_postgres_time_24_is_an_error(driver: str) -> None:
-    # Arrow drivers read it as NULL or 00:00:00
+    # Arrow drivers read it as NULL or 00:00:00, also in a time[] (ADBC)
     table = f"rvb_pg_time_{driver}"
+    # (ConnectorX can't read a time[] at all)
+    arrays = driver != "connectorx"
     _execute(
         "postgres17",
         [
             f"DROP TABLE IF EXISTS {table}",
-            f"CREATE TABLE {table} (id int, t time, t3 time(3))",
-            f"INSERT INTO {table} VALUES (1, '01:02:03.5', '01:02:03.125'), (2, NULL, NULL)",
+            f"CREATE TABLE {table} (id int, t time, t3 time(3)"
+            + (", ta time[])" if arrays else ")"),
+            f"INSERT INTO {table} (id, t, t3) VALUES (1, '01:02:03.5', '01:02:03.125'), "
+            "(2, NULL, NULL)",
         ],
     )
     try:
-        for source in [table, f"SELECT id, t, t3 FROM {table}"]:
+        for source in [table, f"SELECT * FROM {table}"]:
             lf = _scan("postgres17", driver, source)
             assert lf.collect_schema()["t3"] == pl.Time
             assert lf.collect().height == 2
-        _execute("postgres17", [f"INSERT INTO {table} VALUES (3, '24:00:00', NULL)"])
-        for source in [table, f"SELECT id, t FROM {table}"]:
-            with pytest.raises(
-                pl.exceptions.PolarsError, match='column "t" holds 24:00:00'
-            ):
-                _scan("postgres17", driver, source).collect()
+        _execute("postgres17", [f"INSERT INTO {table} (id, t) VALUES (3, '24:00:00')"])
+        if arrays:
+            _execute(
+                "postgres17",
+                [
+                    f"UPDATE {table} SET ta = '{{01:00:00,NULL}}' WHERE id = 1",
+                    # in an array, of any dimension
+                    f"INSERT INTO {table} (id, ta) VALUES "
+                    "(4, '{{01:00:00},{24:00:00}}')",
+                ],
+            )
+        for column in ["t", "ta"] if arrays else ["t"]:
+            for source in [table, f"SELECT id, {column} FROM {table}"]:
+                with pytest.raises(
+                    pl.exceptions.PolarsError, match=f'column "{column}" holds 24:00:00'
+                ):
+                    _scan("postgres17", driver, source).select(column).collect()
     finally:
         _execute("postgres17", [f"DROP TABLE IF EXISTS {table}"])
 
@@ -3078,3 +3110,180 @@ def test_converted_columns_order_by_their_values() -> None:
                     assert got == [Decimal(v) for v in expected], (name, driver, source)
         finally:
             _execute(name, [f"DROP TABLE IF EXISTS {table}"])
+
+
+@pytest.mark.skipif(SERVERS["oracle"].uri is None, reason="no Oracle URI")
+@ORACLE_GROUP
+def test_oracle_numbers_order_and_timestamps_in_another_calendar() -> None:
+    # ORDER BY "N" sorted TO_CHAR(N); TIMESTAMP(9) WITH LOCAL TIME ZONE was cut to
+    # microseconds; TO_CHAR followed a live session's NLS_CALENDAR (543 years later)
+    from datetime import datetime
+
+    table = "rvf_ora_cal"
+    _execute(
+        "oracle",
+        [
+            f"BEGIN EXECUTE IMMEDIATE 'DROP TABLE {table}'; "
+            "EXCEPTION WHEN OTHERS THEN NULL; END;",
+            f'CREATE TABLE {table} ("id" NUMBER(5), n NUMBER, ts TIMESTAMP(9), '
+            "ltz TIMESTAMP(9) WITH LOCAL TIME ZONE)",
+        ]
+        + [
+            f"INSERT INTO {table} VALUES ({i}, {n}, "
+            "TIMESTAMP '2024-01-02 03:04:05.123456789', "
+            "TIMESTAMP '2024-01-02 03:04:05.123456789 +00:00')"
+            for i, n in enumerate(["10", "100", "-20", "2.5", "-5", "9"])
+        ],
+    )
+    server = SERVERS["oracle"]
+    assert server.uri is not None and server.factory is not None
+    live = server.factory(server.uri)()
+    try:
+        cur = live.cursor()
+        cur.execute("ALTER SESSION SET NLS_CALENDAR = 'Thai Buddha'")
+        cur.execute("ALTER SESSION SET TIME_ZONE = '+05:00'")
+        for source in [table.upper(), f'SELECT "id", n, ts, ltz FROM {table}']:
+            for conn in [live, server.factory(server.uri)]:
+                for kw in [{}, {"partition_on": "N", "partition_num": 3}]:
+                    lf = pl.scan_database(source, conn, order_by="N", **kw)
+                    df = lf.collect()
+                    assert df["N"].cast(pl.Float64).to_list() == [
+                        -20.0,
+                        -5.0,
+                        2.5,
+                        9.0,
+                        10.0,
+                        100.0,
+                    ]
+                    assert df["TS"][0] == datetime(2024, 1, 2, 3, 4, 5, 123456)
+                    assert df["TS"].dt.nanosecond()[0] == 123456789
+                    assert df.schema["LTZ"] == pl.Datetime("ns", "UTC")
+                    assert df["LTZ"].dt.nanosecond()[0] == 123456789
+                    assert df["LTZ"].dt.replace_time_zone(None)[0] == datetime(
+                        2024, 1, 2, 3, 4, 5, 123456
+                    )
+    finally:
+        live.close()
+        _execute(
+            "oracle",
+            [
+                f"BEGIN EXECUTE IMMEDIATE 'DROP TABLE {table}'; EXCEPTION WHEN OTHERS THEN NULL; END;"
+            ],
+        )
+
+
+@needs_clickhouse
+def test_clickhouse_arrays_of_text_and_nanoseconds() -> None:
+    # an array element that isn't UTF-8 made ConnectorX return 1 row of 5, and
+    # clickhouse_connect hex-encode it; clickhouse_connect cut Array(DateTime64(9)) to
+    # microseconds. A real column named like the UTF-8 checks collided with them.
+    from datetime import datetime
+
+    table = "rvf_ch_arrays"
+    _execute(
+        "clickhouse",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id Int32, a Array(String), "
+            "t Array(DateTime64(9, 'UTC')), s String, __pl_utf8_0 String) "
+            "ENGINE = MergeTree ORDER BY id",
+            f"INSERT INTO {table} SELECT number, [toString(number)], "
+            "[toDateTime64('2200-01-01 00:00:00.123456789', 9, 'UTC')], 'x', "
+            "toString(number) FROM numbers(5)",
+        ],
+    )
+    try:
+        frames = []
+        for driver in ["adbc", "clickhouse_connect", "connectorx"]:
+            for source in [table, f"SELECT * FROM {table}"]:
+                lf = _scan("clickhouse", driver, source)
+                if driver == "connectorx":
+                    lf = lf.drop("t")  # ConnectorX can't read it: an error
+                df = lf.filter(pl.col("__pl_utf8_0") != "3").collect().sort("id")
+                assert df["id"].to_list() == [0, 1, 2, 4]
+                frames.append(df.drop("t", strict=False))
+                if driver != "connectorx":
+                    assert df.schema["t"] == pl.List(pl.Datetime("ns", "UTC"))
+                    t = df["t"].explode()
+                    assert t.dt.nanosecond().to_list() == [123456789] * 4
+                    assert t[0].replace(tzinfo=None) == datetime(
+                        2200, 1, 1, 0, 0, 0, 123456
+                    )
+        for df in frames:
+            assert_frame_equal(df, frames[0])
+        _execute(
+            "clickhouse",
+            [f"INSERT INTO {table} VALUES (5, ['ok', unhex('ff')], [], 'x', 'y')"],
+        )
+        for driver in ["connectorx", "clickhouse_connect"]:
+            for source in [table, f"SELECT id, a FROM {table}"]:
+                lf = _scan("clickhouse", driver, source).select("id", "a")
+                with pytest.raises(
+                    pl.exceptions.ComputeError, match="not valid UTF-8|500 Internal"
+                ):
+                    lf.collect()
+    finally:
+        _execute("clickhouse", [f"DROP TABLE IF EXISTS {table}"])
+
+
+@pytest.mark.parametrize("name", ["mysql", "mariadb"])
+def test_mysql_time_is_a_duration(name: str) -> None:
+    # TIME is a duration (-838:59:59 to 838:59:59): a query's TIME was planned as a
+    # time of day, which TIMEDIFF, SEC_TO_TIME or '25:30:00' failed
+    from datetime import timedelta
+
+    table = "rvf_my_time"
+    _execute(
+        name,
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id int, t time(6), t0 time)",
+            f"INSERT INTO {table} VALUES (1, '12:00:00.5', '12:00:00'), "
+            "(2, '25:30:00', '838:59:59'), (3, '-01:00:00.25', '-838:59:59'), "
+            "(4, NULL, NULL)",
+        ],
+    )
+    expected = [
+        timedelta(hours=12, microseconds=500000),
+        timedelta(hours=25, minutes=30),
+        -timedelta(hours=1, microseconds=250000),
+        None,
+    ]
+    drivers = ["pymysql", "adbc", "connectorx", "mysql.connector"]
+    try:
+        for driver in drivers if name == "mysql" else ["pymysql", "connectorx"]:
+            if driver == "connectorx":
+                pytest.importorskip("connectorx")
+            sources = [table]
+            # ConnectorX has no query types: it reads a TIME as a time of day
+            if driver != "connectorx":
+                sources.append(f"SELECT * FROM {table}")
+            for source in sources:
+                lf = _scan(name, driver, source)
+                df = lf.collect().sort("id")
+                assert lf.collect_schema()["t"] == pl.Duration("us")
+                assert df["t"].to_list() == expected, (driver, source)
+                assert df["t0"][1] == timedelta(hours=838, minutes=59, seconds=59)
+                _check_filters(
+                    lf,
+                    [
+                        pl.col("t") > timedelta(hours=1),
+                        pl.col("t") < timedelta(0),
+                        pl.col("t").is_null(),
+                    ],
+                )
+            if driver != "connectorx":
+                q = (
+                    "SELECT 1 AS id, TIMEDIFF(TIMESTAMP '2024-01-01 00:00:00', "
+                    "TIMESTAMP '2024-01-01 01:00:00') AS td, "
+                    "SEC_TO_TIME(-5) AS st, MAKETIME(-2, 0, 0) AS mt"
+                )
+                df = _scan(name, driver, q).collect()
+                assert df.row(0) == (
+                    1,
+                    -timedelta(hours=1),
+                    -timedelta(seconds=5),
+                    -timedelta(hours=2),
+                ), driver
+    finally:
+        _execute(name, [f"DROP TABLE IF EXISTS {table}"])

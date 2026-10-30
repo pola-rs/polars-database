@@ -4,7 +4,7 @@ import io
 import os
 import sqlite3
 from contextlib import closing
-from datetime import date
+from datetime import date, datetime, time
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote
@@ -1505,3 +1505,78 @@ def test_scan_plain_params_are_copied() -> None:
         assert [df["x"].to_list() for df in out] == [[1], [1], [1]]
     finally:
         conn.close()
+
+
+def test_scan_sqlite_declared_types_through_connectorx(tmp_path: Path) -> None:
+    # ConnectorX read a BOOLEAN's 2 and -1 as true, and failed on a DATE's or a
+    # BLOB's integers: every driver reads the values by their storage class
+    pytest.importorskip("connectorx")
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, b BOOLEAN, d DATE, ts TIMESTAMP, "
+            "bl BLOB, i INT)"
+        )
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (1, None, None, None, None, b"\x01"),
+                (2, 2, 20240101, 5, 7, b""),
+                (3, -1, 1, 2, 8, None),
+                (4, 0, None, None, None, b"\x02"),
+            ],
+        )
+        conn.commit()
+    uri = f"sqlite:///{path}"
+    for source in ["t", "SELECT * FROM t"]:
+        expected = pl.scan_database(source, uri, driver="sqlite3").collect()
+        assert expected["b"].to_list() == [None, 2, -1, 0]
+        lf = pl.scan_database(source, uri, driver="connectorx")
+        assert_frame_equal(lf.collect(), expected)
+        _assert_filters_match(lf, [pl.col("b") == 1, pl.col("b") != 0, pl.col("d") > 1])
+
+
+def test_scan_duckdb_nested_values_arrow_cant_carry(tmp_path: Path) -> None:
+    # lists, structs and maps of infinities, 24:00:00 and UHUGEINT values
+    # beyond i128 read i64::MAX, NULL or -1; a TIMETZ of 24:00:00 read NULL
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    values = {
+        "lts": ("TIMESTAMP[]", "['2024-01-01'::TIMESTAMP]", "['infinity'::TIMESTAMP]"),
+        "lld": ("DATE[][]", "[['2024-01-01'::DATE]]", "[[NULL, '-infinity'::DATE]]"),
+        "st": (
+            'STRUCT(a TIMESTAMPTZ, "b c" INTEGER)',
+            "{'a': '2024-01-01 00:00:00+00', 'b c': 1}",
+            "{'a': 'infinity', 'b c': 1}",
+        ),
+        "ls": ("STRUCT(t TIME)[]", "[{'t': '12:00:00'}]", "[{'t': '24:00:00'}]"),
+        "m": (
+            "MAP(VARCHAR, DATE)",
+            "MAP {'k': '2024-01-01'::DATE}",
+            "MAP {'k': 'infinity'::DATE}",
+        ),
+        "luh": ("UHUGEINT[]", "[1]", f"[{2**128 - 1}]"),
+        "ttz": ("TIMETZ", "'12:00:00+00'", "'24:00:00+00'"),
+    }
+    with duckdb.connect(path) as conn:
+        columns = ", ".join(f'"{c}" {t}' for c, (t, _, _) in values.items())
+        conn.execute(f"CREATE TABLE t (id INTEGER, {columns})")
+        good = ", ".join(v for _, v, _ in values.values())
+        conn.execute(f"INSERT INTO t VALUES (1, {good})")
+    for source in ["t", "SELECT * FROM t"]:
+        df = pl.scan_database(source, f"duckdb:///{path}").collect()
+        assert df["lts"].to_list() == [[datetime(2024, 1, 1)]]
+        assert df["ls"].to_list() == [[{"t": time(12)}]]
+        assert df["ttz"].to_list() == [time(12)]
+    with duckdb.connect(path) as conn:
+        for i, (column, (_, _, bad)) in enumerate(values.items(), start=2):
+            conn.execute(f'INSERT INTO t (id, "{column}") VALUES ({i}, {bad})')
+    for source in ["t", "SELECT * FROM t"]:
+        lf = pl.scan_database(source, f"duckdb:///{path}")
+        for column in values:
+            with pytest.raises(
+                pl.exceptions.ComputeError,
+                match=f'column "{column}" holds a value Polars can\'t represent',
+            ):
+                lf.select(column).collect()
+        assert lf.select("id").collect().height == 1 + len(values)
