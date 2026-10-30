@@ -1863,9 +1863,8 @@ class _AdbcSession:
     """
     An ADBC connection opened through `adbc_driver_manager`.
 
-    Used when `POLARS_DATABASE_ADBC_LOADER=python`. Rust finds the driver and builds
-    the options, as for its own loader; results go back as the driver's Arrow C
-    stream, which Rust reads without the GIL.
+    Rust finds the driver and builds the options; results go back as the driver's
+    Arrow C stream, which Rust reads without the GIL.
     """
 
     def __init__(
@@ -1880,13 +1879,13 @@ class _AdbcSession:
             from adbc_driver_manager._lib import ArrowArrayStreamHandle
         except ImportError:
             msg = (
-                "POLARS_DATABASE_ADBC_LOADER=python needs adbc_driver_manager: "
+                "ADBC drivers are loaded through adbc_driver_manager: "
                 "pip install adbc-driver-manager"
             )
             raise ModuleNotFoundError(msg) from None
         if not hasattr(ArrowArrayStreamHandle, "__arrow_c_stream__"):
             msg = (
-                "POLARS_DATABASE_ADBC_LOADER=python needs a newer adbc_driver_manager "
+                "ADBC drivers need a newer adbc_driver_manager "
                 f"(found {_version('adbc_driver_manager')}): "
                 "pip install -U adbc-driver-manager"
             )
@@ -1898,8 +1897,8 @@ class _AdbcSession:
         ).keys()
         if reserved:
             msg = (
-                f"connect option(s) {sorted(reserved)} can't be used with "
-                "POLARS_DATABASE_ADBC_LOADER=python"
+                f"connect option(s) {sorted(reserved)} can't be used with ADBC: "
+                "adbc_driver_manager reads them as its own arguments"
             )
             raise ValueError(msg)
         kwargs: dict[str, Any] = {"driver": driver, **dict(options)}
@@ -1991,7 +1990,7 @@ class _AdbcSession:
                     try:
                         self._conn.cancel()
                     except NotSupportedError:
-                        # an ADBC 1.0 driver: it can't cancel, as with the Rust loader
+                        # an ADBC 1.0 driver: it can't cancel
                         return
         except Exception as e:
             # nothing running: nothing to cancel
@@ -2011,6 +2010,18 @@ class _AdbcSession:
                 self._conn.close()
             finally:
                 self._db.close()
+
+
+def has_adbc_driver_manager() -> bool:
+    """Whether `adbc_driver_manager` is installed, at a version `_AdbcSession` can use."""
+    try:
+        # the package first, as `_AdbcSession` imports it: a cached `_lib` alone is found
+        # without it
+        import adbc_driver_manager  # noqa: F401
+        from adbc_driver_manager._lib import ArrowArrayStreamHandle
+    except ImportError:
+        return False
+    return hasattr(ArrowArrayStreamHandle, "__arrow_c_stream__")
 
 
 def adbc_connect(

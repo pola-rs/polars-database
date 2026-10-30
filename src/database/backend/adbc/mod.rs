@@ -1,25 +1,15 @@
-//! The ADBC backend: loads ADBC driver shared libraries and reads query results as Arrow C
-//! streams.
+//! The ADBC backend: finds ADBC drivers and reads query results as Arrow C streams.
 //!
 //! Drivers are found through ADBC driver manifests (see [`manifest`]) or given as a library
-//! path. Two loaders can then drive them, chosen by `POLARS_DATABASE_ADBC_LOADER`
-//! ([`AdbcLoader`]):
-//!
-//! - `rust` (the default): no driver manager. The library is `dlopen`ed and initialised
-//!   through its `AdbcDriverInit`-style entrypoint, and called through its C ABI.
-//! - `python`: Python's `adbc_driver_manager`, through the Python bridge.
-//!
-//! Both get the same database and statement options ([`connect_options`],
-//! [`batch_size_option`]) and import results the same way ([`import_stream`]), so they return
-//! the same data. Drivers are never unloaded: Go drivers hang on unload.
+//! path, and loaded and called through Python's `adbc_driver_manager`, over the Python bridge
+//! ([`PythonDriverBridge::adbc_connect`]). This module builds the database and statement
+//! options ([`connect_options`], [`batch_size_option`]) and imports the result streams
+//! ([`import_stream`]).
 
-mod ffi;
 pub mod manifest;
 
-use std::ffi::{CStr, CString, c_int, c_void};
-use std::path::{Path, PathBuf};
-use std::ptr;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::ffi::{CStr, CString};
+use std::sync::Arc;
 
 use polars_arrow::array::{Array, StructArray};
 use polars_arrow::datatypes::ArrowDataType;
@@ -27,10 +17,9 @@ use polars_arrow::ffi::{ArrowArrayStream, ArrowArrayStreamReader};
 use polars_core::frame::DataFrame;
 use polars_error::{PolarsResult, polars_bail, polars_ensure, polars_err};
 
-use self::ffi::*;
 pub use self::manifest::{FoundDriver, find_driver, manifest_search_dirs};
 use super::{
-    BackendCapabilities, BackendChoice, BatchIter, CancelHandle, DatabaseBackend, DatabaseSession,
+    BackendCapabilities, BackendChoice, BatchIter, DatabaseBackend, DatabaseSession,
     PythonDriverBridge,
 };
 use crate::database::connection::{
@@ -39,220 +28,12 @@ use crate::database::connection::{
 };
 use crate::database::dialect::DialectName;
 
-/// An initialised driver. Never unloaded.
-pub struct LoadedDriver {
-    /// Boxed so its address is stable: handles point at it through `private_driver`.
-    table: Box<AdbcDriver>,
-    /// The ADBC API version the driver was initialised with.
-    api_version: c_int,
-    library: PathBuf,
-    entrypoint: String,
-}
-
-// SAFETY: the function table is immutable after init, and ADBC drivers must be usable from any
-// thread (handles are not shared between threads, except for cancel).
-unsafe impl Send for LoadedDriver {}
-unsafe impl Sync for LoadedDriver {}
-
-impl LoadedDriver {
-    pub fn library(&self) -> &Path {
-        &self.library
-    }
-
-    pub fn entrypoint(&self) -> &str {
-        &self.entrypoint
-    }
-
-    /// Whether the driver implements ADBC 1.1 (cancel, option getters, …).
-    pub fn is_1_1(&self) -> bool {
-        self.api_version >= ADBC_VERSION_1_1_0
-    }
-
-    fn table_ptr(&self) -> *mut AdbcDriver {
-        &*self.table as *const AdbcDriver as *mut AdbcDriver
-    }
-
-    fn check(&self, status: AdbcStatusCode, error: &AdbcError, what: &str) -> PolarsResult<()> {
-        if status == ADBC_STATUS_OK {
-            return Ok(());
-        }
-        let message = error
-            .describe()
-            .unwrap_or_else(|| "no error message".into());
-        Err(polars_err!(
-            ComputeError: "ADBC {what} failed ({}) in '{}': {message}",
-            status_name(status), self.library.display()
-        ))
-    }
-}
-
-macro_rules! driver_fn {
-    ($driver:expr, $name:ident) => {
-        $driver.table.$name.ok_or_else(|| {
-            polars_err!(
-                ComputeError: "ADBC driver '{}' does not implement {}",
-                $driver.library.display(), stringify!($name)
-            )
-        })?
-    };
-}
-
-/// Loaded drivers by (library, manifest entrypoint).
-type DriverCache = polars_utils::aliases::PlHashMap<(PathBuf, Option<String>), Arc<LoadedDriver>>;
-
-static LOADED_DRIVERS: LazyLock<Mutex<DriverCache>> = LazyLock::new(Default::default);
-
-/// The init symbol derived from a library file name, as the ADBC driver manager does it:
-/// `libadbc_driver_sqlite.so.1.0` → `AdbcDriverSqliteInit`, `proprietary_driver.dll` →
-/// `AdbcProprietaryDriverInit`.
-pub fn default_entrypoint(library: &str) -> String {
-    let filename = library.rsplit(['/', '\\']).next().unwrap_or(library);
-    let stem = filename.split('.').next().unwrap_or(filename);
-    let stem = stem.strip_prefix("lib").unwrap_or(stem);
-    let mut out: String = stem
-        .split(['-', '_'])
-        .filter(|t| !t.is_empty())
-        .map(|t| {
-            let mut c = t.chars();
-            let first = c.next().unwrap().to_ascii_uppercase();
-            std::iter::once(first).chain(c).collect::<String>()
-        })
-        .collect();
-    if !out.starts_with("Adbc") {
-        out.insert_str(0, "Adbc");
-    }
-    out.push_str("Init");
-    out
-}
-
-/// Loads and initialises a driver library, or returns the one already loaded.
-pub fn load_driver(found: &FoundDriver) -> PolarsResult<Arc<LoadedDriver>> {
-    let key_path = found
-        .library
-        .canonicalize()
-        .unwrap_or_else(|_| found.library.clone());
-    let key = (key_path, found.entrypoint.clone());
-    let mut cache = LOADED_DRIVERS.lock().unwrap();
-    if let Some(d) = cache.get(&key) {
-        return Ok(d.clone());
-    }
-    let driver = Arc::new(load_driver_uncached(found)?);
-    cache.insert(key, driver.clone());
-    Ok(driver)
-}
-
-fn load_driver_uncached(found: &FoundDriver) -> PolarsResult<LoadedDriver> {
-    let path = &found.library;
-    // SAFETY: loading a library runs its initialisers; the user asked for this driver.
-    let lib = unsafe { libloading::Library::new(path.as_path()) }.map_err(|e| {
-        polars_err!(ComputeError: "could not load ADBC driver library '{}': {e}", path.display())
-    })?;
-
-    let mut candidates = vec![];
-    candidates.extend(found.entrypoint.clone());
-    candidates.push(default_entrypoint(&path.to_string_lossy()));
-    candidates.push("AdbcDriverInit".to_string());
-    candidates.dedup();
-
-    let mut init: Option<(AdbcDriverInitFunc, String)> = None;
-    for name in &candidates {
-        // SAFETY: the symbol is an `AdbcDriverInitFunc` by the ADBC convention.
-        if let Ok(sym) = unsafe { lib.get::<AdbcDriverInitFunc>(name.as_str()) } {
-            init = Some((*sym, name.clone()));
-            break;
-        }
-    }
-    let Some((init, entrypoint)) = init else {
-        polars_bail!(
-            ComputeError: "ADBC driver library '{}' exports none of the entrypoints {:?}",
-            path.display(), candidates
-        )
-    };
-
-    let mut api_version = ADBC_VERSION_1_1_0;
-    let mut table = Box::new(AdbcDriver::empty());
-    let mut error = AdbcError::new();
-    let mut status = unsafe {
-        init(
-            api_version,
-            &mut *table as *mut AdbcDriver as *mut c_void,
-            &mut error,
-        )
-    };
-    if status == ADBC_STATUS_NOT_IMPLEMENTED {
-        api_version = ADBC_VERSION_1_0_0;
-        *table = AdbcDriver::empty();
-        error.reset();
-        status = unsafe {
-            init(
-                api_version,
-                &mut *table as *mut AdbcDriver as *mut c_void,
-                &mut error,
-            )
-        };
-    }
-    if status != ADBC_STATUS_OK {
-        let message = error.describe().unwrap_or_default();
-        polars_bail!(
-            ComputeError: "ADBC driver '{}' failed to initialise ({}) via '{entrypoint}': {message}",
-            path.display(), status_name(status)
-        );
-    }
-    drop(error);
-
-    // Never unloaded: Go drivers hang on unload, and other threads may still run driver code.
-    std::mem::forget(lib);
-
-    Ok(LoadedDriver {
-        table,
-        api_version,
-        library: path.clone(),
-        entrypoint,
-    })
-}
-
-/// Which code loads and calls ADBC drivers, from `POLARS_DATABASE_ADBC_LOADER`.
-///
-/// Not part of the plan: the data comes from the driver, whichever code calls it, so each
-/// machine that opens a connection may use its own setting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AdbcLoader {
-    /// Polars' own C-ABI binding.
-    Rust,
-    /// Python's `adbc_driver_manager`.
-    Python,
-}
-
-impl AdbcLoader {
-    /// Read whenever a backend is instantiated, so it can be switched between scans.
-    pub fn from_env() -> PolarsResult<Self> {
-        match std::env::var("POLARS_DATABASE_ADBC_LOADER").as_deref() {
-            Err(_) | Ok("" | "rust") => Ok(Self::Rust),
-            Ok("python") => Ok(Self::Python),
-            Ok(other) => polars_bail!(
-                InvalidOperation:
-                "POLARS_DATABASE_ADBC_LOADER must be 'rust' or 'python', got '{other}'"
-            ),
-        }
-    }
-}
-
-impl std::fmt::Display for AdbcLoader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Rust => "the Rust ADBC loader",
-            Self::Python => "adbc_driver_manager (Python)",
-        })
-    }
-}
-
-enum Loader {
-    Rust(Arc<LoadedDriver>),
-    Python(Arc<dyn PythonDriverBridge>),
-}
+const ADBC_OPTION_URI: &CStr = c"uri";
+const ADBC_OPTION_USERNAME: &CStr = c"username";
+const ADBC_OPTION_PASSWORD: &CStr = c"password";
 
 pub struct AdbcBackend {
-    loader: Loader,
+    bridge: Arc<dyn PythonDriverBridge>,
     found: FoundDriver,
     choice: BackendChoice,
 }
@@ -289,36 +70,25 @@ impl AdbcBackend {
                 super::resolve::adbc_install_hint(driver)
             )
         };
-        let which = AdbcLoader::from_env()?;
-        let loader = match which {
-            AdbcLoader::Rust => Loader::Rust(load_driver(&found)?),
-            AdbcLoader::Python => {
-                let Some(bridge) = super::python_bridge() else {
-                    polars_bail!(
-                        ComputeError:
-                        "POLARS_DATABASE_ADBC_LOADER=python needs Python, which is not available \
-                        on this machine"
-                    )
-                };
-                Loader::Python(bridge.clone())
-            },
+        let Some(bridge) = super::python_bridge().filter(|b| b.has_adbc_driver_manager()) else {
+            polars_bail!(
+                ComputeError:
+                "ADBC drivers are loaded through Python's adbc_driver_manager, which is not \
+                installed on this machine: pip install adbc-driver-manager"
+            )
         };
         if polars_core::config::verbose() {
             eprintln!(
-                "[scan_database]: {} ('{}') is loaded through {which}",
+                "[scan_database]: {} ('{}') is loaded through adbc_driver_manager",
                 choice.kind,
                 found.library.display()
             );
         }
         Ok(Self {
-            loader,
+            bridge: bridge.clone(),
             found,
             choice,
         })
-    }
-
-    pub fn found(&self) -> &FoundDriver {
-        &self.found
     }
 
     /// Opens a connection, like [`DatabaseBackend::connect`].
@@ -333,18 +103,9 @@ impl AdbcBackend {
             .iter()
             .map(|(k, v)| Ok((cstring(k, "option key")?, cstring(v, k)?)))
             .collect::<PolarsResult<Vec<_>>>()?;
-        let session: PolarsResult<Box<dyn DatabaseSession>> = match &self.loader {
-            Loader::Rust(driver) => Conn::open(driver.clone(), &options).map(|conn| {
-                Box::new(AdbcSession {
-                    conn: Arc::new(conn),
-                    dialect,
-                    execute_options,
-                }) as _
-            }),
-            Loader::Python(bridge) => {
-                bridge.adbc_connect(&self.found, &options, dialect, &execute_options)
-            },
-        };
+        let session = self
+            .bridge
+            .adbc_connect(&self.found, &options, dialect, &execute_options);
         // Some drivers quote the URI or rejected options, credentials included.
         session.map_err(|e| {
             let secrets = secrets(&options);
@@ -387,7 +148,7 @@ fn redact(message: &str, secrets: &[String]) -> String {
     scrub_secrets(message, secrets)
 }
 
-/// The database options for a connection, `uri` first. The same for every loader.
+/// The database options for a connection, `uri` first.
 pub fn connect_options(
     spec: &ConnectionSpec,
     dialect: DialectName,
@@ -462,22 +223,14 @@ impl DatabaseBackend for AdbcBackend {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
-        let mut caps = BackendCapabilities::ARROW_NATIVE
+        // `CANCEL` also for ADBC 1.0 drivers: the driver manager answers their cancel with an
+        // error, which the cancel path tolerates.
+        BackendCapabilities::ARROW_NATIVE
             | BackendCapabilities::STREAMING
             | BackendCapabilities::NO_GIL
-            | BackendCapabilities::SESSION_SETUP;
-        match &self.loader {
-            Loader::Rust(driver) => {
-                if driver.is_1_1() {
-                    caps |= BackendCapabilities::CANCEL;
-                }
-            },
-            // The driver manager answers a cancel on an ADBC 1.0 driver with an error.
-            Loader::Python(_) => {
-                caps |= BackendCapabilities::NEEDS_PYTHON | BackendCapabilities::CANCEL
-            },
-        }
-        caps
+            | BackendCapabilities::SESSION_SETUP
+            | BackendCapabilities::CANCEL
+            | BackendCapabilities::NEEDS_PYTHON
     }
 
     fn connect(
@@ -746,225 +499,6 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
-/// A database and its one connection. Shared by the session, its result streams and its
-/// cancel handle, so it lives until all of them are gone.
-struct Conn {
-    driver: Arc<LoadedDriver>,
-    database: *mut AdbcDatabase,
-    connection: *mut AdbcConnection,
-    /// The statement currently executing, for cancel.
-    active: Mutex<Option<StmtPtr>>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct StmtPtr(*mut AdbcStatement);
-unsafe impl Send for StmtPtr {}
-
-// SAFETY: the connection is used by one thread at a time (the session is `&mut`, and result
-// streams are consumed in order); ADBC allows cancel from another thread.
-unsafe impl Send for Conn {}
-unsafe impl Sync for Conn {}
-
-impl Conn {
-    fn open(driver: Arc<LoadedDriver>, options: &[(CString, CString)]) -> PolarsResult<Self> {
-        let d = &*driver;
-        let mut error = AdbcError::new();
-
-        let database = Box::into_raw(Box::new(AdbcDatabase::empty()));
-        let connection = Box::into_raw(Box::new(AdbcConnection::empty()));
-        // From here on, `Drop` cleans up whatever was initialised.
-        let conn = Conn {
-            driver: driver.clone(),
-            database,
-            connection,
-            active: Mutex::new(None),
-        };
-
-        unsafe {
-            let status = driver_fn!(d, DatabaseNew)(database, &mut error);
-            d.check(status, &error, "DatabaseNew")?;
-            (*database).private_driver = d.table_ptr();
-            let set = driver_fn!(d, DatabaseSetOption);
-            for (k, v) in options {
-                error.reset();
-                let status = set(database, k.as_ptr(), v.as_ptr(), &mut error);
-                d.check(
-                    status,
-                    &error,
-                    &format!("setting database option '{}'", k.to_string_lossy()),
-                )?;
-            }
-            error.reset();
-            let status = driver_fn!(d, DatabaseInit)(database, &mut error);
-            d.check(status, &error, "DatabaseInit")?;
-
-            error.reset();
-            let status = driver_fn!(d, ConnectionNew)(connection, &mut error);
-            d.check(status, &error, "ConnectionNew")?;
-            (*connection).private_driver = d.table_ptr();
-            error.reset();
-            let status = driver_fn!(d, ConnectionInit)(connection, database, &mut error);
-            d.check(status, &error, "ConnectionInit")?;
-        }
-        Ok(conn)
-    }
-
-    fn cancel(&self) -> PolarsResult<()> {
-        let d = &*self.driver;
-        let active = self.active.lock().unwrap();
-        let mut error = AdbcError::new();
-        let mut status = ADBC_STATUS_NOT_IMPLEMENTED;
-        unsafe {
-            if let (Some(stmt), Some(cancel)) = (*active, d.table.StatementCancel) {
-                status = cancel(stmt.0, &mut error);
-            }
-            if status == ADBC_STATUS_NOT_IMPLEMENTED
-                && let Some(cancel) = d.table.ConnectionCancel
-            {
-                error.reset();
-                status = cancel(self.connection, &mut error);
-            }
-        }
-        // Nothing running: nothing to cancel.
-        if status == ADBC_STATUS_INVALID_STATE {
-            return Ok(());
-        }
-        d.check(status, &error, "cancel")
-    }
-}
-
-impl Drop for Conn {
-    fn drop(&mut self) {
-        let t = &self.driver.table;
-        let mut error = AdbcError::new();
-        unsafe {
-            if !(*self.connection).private_data.is_null()
-                && let Some(release) = t.ConnectionRelease
-            {
-                release(self.connection, &mut error);
-                error.reset();
-            }
-            if !(*self.database).private_data.is_null()
-                && let Some(release) = t.DatabaseRelease
-            {
-                release(self.database, &mut error);
-            }
-            drop(Box::from_raw(self.connection));
-            drop(Box::from_raw(self.database));
-        }
-    }
-}
-
-/// An open statement. Released on drop.
-struct Stmt {
-    conn: Arc<Conn>,
-    ptr: *mut AdbcStatement,
-}
-
-unsafe impl Send for Stmt {}
-
-impl Stmt {
-    fn new(conn: Arc<Conn>) -> PolarsResult<Self> {
-        let d = &*conn.driver;
-        let ptr = Box::into_raw(Box::new(AdbcStatement::empty()));
-        let stmt = Stmt {
-            conn: conn.clone(),
-            ptr,
-        };
-        let mut error = AdbcError::new();
-        unsafe {
-            let status = driver_fn!(d, StatementNew)(conn.connection, ptr, &mut error);
-            d.check(status, &error, "StatementNew")?;
-            (*ptr).private_driver = d.table_ptr();
-        }
-        Ok(stmt)
-    }
-
-    fn driver(&self) -> &LoadedDriver {
-        &self.conn.driver
-    }
-
-    fn set_option(&self, key: &CStr, value: &CStr) -> PolarsResult<()> {
-        let d = self.driver();
-        let mut error = AdbcError::new();
-        let status = unsafe {
-            driver_fn!(d, StatementSetOption)(self.ptr, key.as_ptr(), value.as_ptr(), &mut error)
-        };
-        d.check(
-            status,
-            &error,
-            &format!("setting statement option '{}'", key.to_string_lossy()),
-        )
-    }
-
-    fn set_sql(&self, sql: &str) -> PolarsResult<()> {
-        let d = self.driver();
-        let sql = cstring(sql, "query")?;
-        let mut error = AdbcError::new();
-        let status =
-            unsafe { driver_fn!(d, StatementSetSqlQuery)(self.ptr, sql.as_ptr(), &mut error) };
-        d.check(status, &error, "StatementSetSqlQuery")
-    }
-
-    /// Runs the statement. With `out` null, no result set is expected.
-    fn execute(&self, out: *mut ArrowArrayStream) -> PolarsResult<()> {
-        let d = self.driver();
-        let execute = driver_fn!(d, StatementExecuteQuery);
-        *self.conn.active.lock().unwrap() = Some(StmtPtr(self.ptr));
-        let mut error = AdbcError::new();
-        let mut rows_affected: i64 = -1;
-        let status = unsafe { execute(self.ptr, out, &mut rows_affected, &mut error) };
-        if out.is_null() {
-            *self.conn.active.lock().unwrap() = None;
-        }
-        d.check(status, &error, "query")
-    }
-}
-
-impl Drop for Stmt {
-    fn drop(&mut self) {
-        {
-            let mut active = self.conn.active.lock().unwrap();
-            if *active == Some(StmtPtr(self.ptr)) {
-                *active = None;
-            }
-        }
-        unsafe {
-            if !(*self.ptr).private_data.is_null()
-                && let Some(release) = self.conn.driver.table.StatementRelease
-            {
-                let mut error = AdbcError::new();
-                release(self.ptr, &mut error);
-            }
-            drop(Box::from_raw(self.ptr));
-        }
-    }
-}
-
-/// A connection to a database through an ADBC driver.
-pub struct AdbcSession {
-    conn: Arc<Conn>,
-    dialect: DialectName,
-    execute_options: Vec<(CString, CString)>,
-}
-
-impl AdbcSession {
-    fn prepare(&self, sql: &str, batch_size: Option<usize>) -> PolarsResult<Stmt> {
-        let stmt = Stmt::new(self.conn.clone())?;
-        if let Some(n) = batch_size
-            && let Some((key, value)) = batch_size_option(self.dialect, n)
-        {
-            // A hint: drivers that reject it still work.
-            let _ = stmt.set_option(key, &CString::new(value).unwrap());
-        }
-        for (k, v) in &self.execute_options {
-            stmt.set_option(k, v)?;
-        }
-        stmt.set_sql(sql)?;
-        Ok(stmt)
-    }
-}
-
 /// The statement option that bounds the batch size, for drivers known to have one. A hint:
 /// drivers that reject it still work.
 pub fn batch_size_option(dialect: DialectName, rows: usize) -> Option<(&'static CStr, String)> {
@@ -979,48 +513,9 @@ pub fn batch_size_option(dialect: DialectName, rows: usize) -> Option<(&'static 
     }
 }
 
-impl DatabaseSession for AdbcSession {
-    fn execute(&mut self, sql: &str, batch_size: Option<usize>) -> PolarsResult<BatchIter> {
-        let stmt = self.prepare(sql, batch_size)?;
-        let stream = Box::into_raw(Box::new(ArrowArrayStream::empty()));
-        let result = stmt.execute(stream);
-        // SAFETY: allocated above; the driver only wrote into it.
-        let stream = unsafe { Box::from_raw(stream) };
-        result?;
-        // SAFETY: the driver returned a valid C stream.
-        let batches = unsafe { import_stream(stream, stmt) }?;
-        Ok(check_batches(self.dialect, batches))
-    }
-
-    fn execute_update(&mut self, sql: &str) -> PolarsResult<()> {
-        let stmt = self.prepare(sql, None)?;
-        stmt.execute(ptr::null_mut())
-    }
-
-    fn cancel_handle(&self) -> Option<CancelHandle> {
-        if !self.conn.driver.is_1_1() {
-            return None;
-        }
-        let conn = self.conn.clone();
-        Some(Arc::new(move || conn.cancel()))
-    }
-}
-
 /// What a result stream needs kept alive until it is released: its statement, and through
 /// it the connection.
-pub trait StreamOwner: Send + 'static {
-    /// The driver's error for a failed stream operation, when it carries more than the
-    /// stream's own `get_last_error`.
-    fn stream_error(&self, _stream: *mut ArrowArrayStream) -> Option<polars_error::PolarsError> {
-        None
-    }
-}
-
-impl StreamOwner for Stmt {
-    fn stream_error(&self, stream: *mut ArrowArrayStream) -> Option<polars_error::PolarsError> {
-        stream_error(self, stream)
-    }
-}
+pub trait StreamOwner: Send + 'static {}
 
 /// The batches of a query's result stream, as `DataFrame`s. `owner` is dropped after the
 /// stream is released.
@@ -1031,43 +526,22 @@ pub unsafe fn import_stream(
     stream: Box<ArrowArrayStream>,
     owner: impl StreamOwner,
 ) -> PolarsResult<BatchIter> {
-    // The heap address stays valid while the reader owns the box.
-    let stream_ptr = &*stream as *const ArrowArrayStream as *mut ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::try_new(stream) }?;
     // Before any array is imported or built: those of these types would panic.
     check_arrow_types(&reader.field().dtype)?;
     Ok(Box::new(AdbcBatches {
         reader: Some(reader),
-        stream_ptr,
-        owner,
+        _owner: owner,
         yielded: false,
     }))
-}
-
-/// The driver's error for a failed stream operation (ADBC 1.1), which carries more than the
-/// stream's own `get_last_error`.
-fn stream_error(stmt: &Stmt, stream: *mut ArrowArrayStream) -> Option<polars_error::PolarsError> {
-    let d = stmt.driver();
-    let f = d.table.ErrorFromArrayStream?;
-    let mut status = ADBC_STATUS_OK;
-    let error = unsafe { f(stream, &mut status) };
-    if error.is_null() {
-        return None;
-    }
-    // Owned by the stream: borrowed, never released here.
-    let message = unsafe { &*error }.describe()?;
-    Some(polars_err!(
-        ComputeError: "ADBC query failed ({}) in '{}': {message}",
-        status_name(status), d.library.display()
-    ))
 }
 
 /// The batches of one query, as `DataFrame`s.
 struct AdbcBatches<O> {
     // Field order is drop order: the stream is released before its statement.
     reader: Option<ArrowArrayStreamReader<Box<ArrowArrayStream>>>,
-    stream_ptr: *mut ArrowArrayStream,
-    owner: O,
+    /// Only kept alive.
+    _owner: O,
     yielded: bool,
 }
 
@@ -1090,9 +564,8 @@ impl<O: StreamOwner> Iterator for AdbcBatches<O> {
                     return Some(batch_to_df(array));
                 },
                 Some(Err(e)) => {
-                    let err = self.owner.stream_error(self.stream_ptr).unwrap_or(e);
                     self.reader = None;
-                    return Some(Err(err));
+                    return Some(Err(e));
                 },
                 None => {
                     let reader = self.reader.take()?;
@@ -1293,98 +766,6 @@ mod tests {
         // nested
         let list = ts(-9222425352054775809).implode().unwrap().into_series();
         assert!(check_postgres_infinity(&df(list)).is_err());
-    }
-
-    #[test]
-    fn entrypoints() {
-        assert_eq!(
-            default_entrypoint("/x/libadbc_driver_sqlite.so"),
-            "AdbcDriverSqliteInit"
-        );
-        assert_eq!(
-            default_entrypoint("libadbc_driver_sqlite.so.2.0.0"),
-            "AdbcDriverSqliteInit"
-        );
-        assert_eq!(
-            default_entrypoint("C:\\d\\adbc_driver_sqlite.dll"),
-            "AdbcDriverSqliteInit"
-        );
-        assert_eq!(
-            default_entrypoint("proprietary_driver.dll"),
-            "AdbcProprietaryDriverInit"
-        );
-        assert_eq!(
-            default_entrypoint("libadbc-driver-flight-sql.dylib"),
-            "AdbcDriverFlightSqlInit"
-        );
-    }
-
-    /// Reads through ADBC with no Python in the process: the Rust-only path workers use.
-    /// Set `POLARS_TEST_ADBC_SQLITE_LIBRARY` (and for the servers
-    /// `POLARS_TEST_ADBC_POSTGRES_LIBRARY` + `POLARS_TEST_POSTGRES_URI`,
-    /// `POLARS_TEST_ADBC_MYSQL_LIBRARY` + `POLARS_TEST_MYSQL_URI`) to run it.
-    #[test]
-    fn reads_without_python() {
-        use polars_core::prelude::DataType;
-
-        use crate::database::backend::{BackendChoice, BackendKind};
-
-        let read = |lib_var: &str, uri: &str, dialect: DialectName, sql: &str| {
-            let Ok(lib) = std::env::var(lib_var) else {
-                return None;
-            };
-            let choice = BackendChoice {
-                kind: BackendKind::Adbc {
-                    driver: lib.as_str().into(),
-                },
-                version: None,
-                location: None,
-                reason: "test".into(),
-            };
-            let backend = AdbcBackend::load(&lib, None, choice).unwrap();
-            let spec = ConnectionSpec::new(ConnectionTarget::Uri(uri.into()));
-            let mut session = backend.open(&spec, dialect).unwrap();
-            Some(session.query(sql).unwrap())
-        };
-
-        if let Some(df) = read(
-            "POLARS_TEST_ADBC_SQLITE_LIBRARY",
-            "sqlite://",
-            DialectName::Sqlite,
-            "SELECT 1 AS a, 'x' AS b, 1.5 AS c, NULL AS d",
-        ) {
-            assert_eq!(df.shape(), (1, 4));
-            assert_eq!(df.column("a").unwrap().dtype(), &DataType::Int64);
-            assert_eq!(df.column("b").unwrap().dtype(), &DataType::String);
-        }
-        // Every column of `edge_types` (JSON, UUID, binary, NUMERIC, tz, time) imports.
-        for (lib, uri, dialect) in [
-            (
-                "POLARS_TEST_ADBC_POSTGRES_LIBRARY",
-                "POLARS_TEST_POSTGRES_URI",
-                DialectName::Postgresql,
-            ),
-            (
-                "POLARS_TEST_ADBC_MYSQL_LIBRARY",
-                "POLARS_TEST_MYSQL_URI",
-                DialectName::Mysql,
-            ),
-        ] {
-            let Ok(uri) = std::env::var(uri) else {
-                continue;
-            };
-            let edge = dialect.quote_ident("edge_types");
-            if let Some(df) = read(lib, &uri, dialect, &format!("SELECT * FROM {edge}")) {
-                assert_eq!(df.shape(), (3, 7), "{dialect}");
-                for c in df.columns().iter().filter(|c| c.name() != "id") {
-                    assert!(
-                        c.null_count() >= 1,
-                        "{dialect}: {} has no NULL row",
-                        c.name()
-                    );
-                }
-            }
-        }
     }
 
     #[test]

@@ -21,7 +21,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 bitflags = { workspace = true }
 chrono = { workspace = true }
-libloading = { workspace = true }
 # A private copy of Polars, statically linked: only Arrow C data, the contract structs and JSON
 # documents cross the plugin boundary, so this does not couple the plugin to the host's Polars
 # version.

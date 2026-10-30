@@ -83,7 +83,14 @@ pub fn candidates(dialect: DialectName) -> Vec<BackendKind> {
 /// Install hint for a backend, for error messages.
 pub fn install_hint(kind: &BackendKind) -> String {
     match kind {
-        BackendKind::Adbc { driver } => adbc_install_hint(driver),
+        BackendKind::Adbc { driver } if has_adbc_driver_manager() => adbc_install_hint(driver),
+        BackendKind::Adbc { driver } if adbc_driver_installed(kind, driver) => {
+            "pip install adbc-driver-manager".into()
+        },
+        BackendKind::Adbc { driver } => format!(
+            "pip install adbc-driver-manager, and: {}",
+            adbc_install_hint(driver)
+        ),
         BackendKind::ConnectorX => "pip install connectorx".into(),
         BackendKind::Sqlalchemy => {
             "pip install sqlalchemy  (plus the dialect's DB-API driver)".into()
@@ -155,9 +162,21 @@ pub struct CandidateStatus {
     pub probe: Option<ProbeResult>,
 }
 
+/// Whether ADBC drivers can be loaded here: through Python's `adbc_driver_manager`.
+fn has_adbc_driver_manager() -> bool {
+    python_bridge().is_some_and(|b| b.has_adbc_driver_manager())
+}
+
+/// Whether an ADBC driver is installed, whether or not it can be loaded.
+fn adbc_driver_installed(kind: &BackendKind, driver: &str) -> bool {
+    adbc::find_driver(driver).is_some() || python_bridge().and_then(|b| b.probe(kind)).is_some()
+}
+
 /// Probes one backend on this machine. Cheap and side-effect free.
 pub fn probe(kind: &BackendKind) -> Option<ProbeResult> {
     match kind {
+        // The driver alone can't be loaded: unavailable, so another backend is picked.
+        BackendKind::Adbc { .. } if !has_adbc_driver_manager() => None,
         BackendKind::Adbc { driver } => {
             if let Some(found) = adbc::find_driver(driver) {
                 return Some(ProbeResult {
@@ -359,6 +378,16 @@ pub fn resolve_backend(
     if let Some(pin) = pin {
         let kind = parse_driver_pin(&pin, dialect)?;
         let Some(found) = probe(&kind) else {
+            if let BackendKind::Adbc { driver } = &kind
+                && adbc_driver_installed(&kind, driver)
+            {
+                polars_bail!(
+                    ComputeError:
+                    "the pinned database driver '{kind}' is installed, but ADBC drivers are \
+                    loaded through Python's adbc_driver_manager, which is not installed\n  \
+                    install it with: pip install adbc-driver-manager"
+                )
+            }
             polars_bail!(
                 ComputeError:
                 "the pinned database driver '{kind}' is not installed\n  install it with: {}",

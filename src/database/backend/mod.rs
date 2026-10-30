@@ -19,7 +19,7 @@ use super::dialect::DialectName;
 /// Which backend moves the bytes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BackendKind {
-    /// An ADBC driver, loaded from Rust.
+    /// An ADBC driver, found by Rust and loaded through Python's `adbc_driver_manager`.
     Adbc { driver: PlSmallStr },
     /// ConnectorX (Python package).
     ConnectorX,
@@ -42,10 +42,6 @@ impl BackendKind {
             ("python", m) if !m.is_empty() => Self::Python { module: m.into() },
             _ => polars_bail!(InvalidOperation: "invalid database backend: '{s}'"),
         })
-    }
-
-    pub fn needs_python(&self) -> bool {
-        !matches!(self, Self::Adbc { .. })
     }
 
     /// Whether statements run in a session that later queries share, so that the dialect's
@@ -193,9 +189,12 @@ pub trait PythonDriverBridge: Send + Sync {
         batch_size: Option<usize>,
     ) -> PolarsResult<Box<dyn DatabaseSession>>;
 
-    /// Opens an ADBC connection through Python's `adbc_driver_manager`
-    /// (`POLARS_DATABASE_ADBC_LOADER=python`). `options` are the database options, `uri`
-    /// first; `execute_options` are set on every statement.
+    /// Whether Python's `adbc_driver_manager` is installed, at a version that can load ADBC
+    /// drivers for [`Self::adbc_connect`].
+    fn has_adbc_driver_manager(&self) -> bool;
+
+    /// Opens an ADBC connection through Python's `adbc_driver_manager`. `options` are the
+    /// database options, `uri` first; `execute_options` are set on every statement.
     fn adbc_connect(
         &self,
         driver: &adbc::FoundDriver,

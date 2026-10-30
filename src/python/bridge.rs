@@ -6,9 +6,8 @@
 //! driver the eager `read_database` supports is reachable. The DataFrames cross as Arrow C
 //! streams (`__arrow_c_stream__`): this module is not built with the Polars of the session.
 //!
-//! ADBC drivers can also be called through Python's `adbc_driver_manager`
-//! (`POLARS_DATABASE_ADBC_LOADER=python`). Those sessions return the driver's Arrow C stream,
-//! which is imported without the GIL, like the Rust loader's.
+//! ADBC drivers are loaded and called through Python's `adbc_driver_manager`. Those sessions
+//! return the driver's Arrow C stream, which is imported without the GIL.
 
 use std::ffi::CString;
 use std::sync::Arc;
@@ -202,6 +201,14 @@ impl PythonDriverBridge for PyDriverBridge {
             }) as Box<dyn DatabaseSession>)
         })
         .map_err(|e| scrubbed_err(e, &secrets))
+    }
+
+    fn has_adbc_driver_manager(&self) -> bool {
+        Python::attach(|py| {
+            bridge_module(py)
+                .and_then(|m| m.call_method0("has_adbc_driver_manager")?.extract())
+                .unwrap_or(false)
+        })
     }
 
     fn adbc_connect(
