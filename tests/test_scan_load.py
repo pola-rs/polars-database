@@ -297,14 +297,15 @@ def test_negative_slice_with_more_partitions_than_sessions(driver: str) -> None:
     assert _run(code, 60).stdout.split() == ["30000", "20"]
 
 
-@pytest.mark.parametrize("driver", ["psycopg2", "sqlalchemy", "live"])
+@pytest.mark.parametrize("driver", ["psycopg2", "sqlalchemy"])
 def test_python_drivers_stream(driver: str) -> None:
-    # head(10) of 5M rows: a buffering cursor would fetch everything first
+    # head(10) of 5M rows: a buffering cursor would fetch everything first. Live
+    # connections read whole results: Polars may release a read after `collect()`
+    # returned, and a late FETCH would land in the user's next transaction
     source = {
         "psycopg2": f"{_uri()!r}, driver='psycopg2'",
         "sqlalchemy": f"{_uri()!r}.replace('postgresql://', 'postgresql+psycopg://'),"
         " driver='sqlalchemy'",
-        "live": f"__import__('psycopg').connect({_uri()!r})",
     }[driver]
     code = (
         "import re, polars as pl\n"
