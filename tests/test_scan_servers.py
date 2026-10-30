@@ -2952,3 +2952,73 @@ def test_mysql_query_with_side_effects_runs_once(name: str) -> None:
                 "DROP SEQUENCE IF EXISTS rvf_once_seq" if name == "mariadb" else "DO 0",
             ],
         )
+
+
+@needs_postgres
+@pytest.mark.parametrize("module", ["psycopg", "pg8000", "sqlalchemy"])
+def test_postgres_failed_lookup_keeps_the_users_transaction(module: str) -> None:
+    # A failed statement in the user's transaction (the lookup of a name that isn't
+    # there, a query that fails) aborted it: their writes were lost, and the next
+    # lookup failed with InFailedSqlTransaction, hiding the error
+    pytest.importorskip(module)
+    assert POSTGRES is not None
+    table = f"rvf_tx_{module}"
+    _execute(
+        "postgres17",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f'DROP TABLE IF EXISTS "Rvf{module}"',
+            f"CREATE TABLE {table} (k int)",
+            f'CREATE TABLE "Rvf{module}" (id int)',
+            f'INSERT INTO "Rvf{module}" VALUES (1)',
+        ],
+    )
+    if module == "sqlalchemy":
+        import sqlalchemy
+
+        engine = sqlalchemy.create_engine(_sqlalchemy_url(POSTGRES, "psycopg"))
+        conn: Any = engine.connect()
+
+        def run(sql: str) -> Any:
+            result = conn.exec_driver_sql(sql)
+            return (
+                [tuple(r) for r in result.fetchall()] if result.returns_rows else None
+            )
+    else:
+        import importlib
+
+        engine = None
+        if module == "pg8000":
+            p = _parts(POSTGRES)
+            conn = importlib.import_module("pg8000").connect(**p)
+        else:
+            conn = importlib.import_module(module).connect(POSTGRES)
+
+        def run(sql: str) -> Any:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql)
+                return [tuple(r) for r in cur.fetchall()] if cur.description else None
+            finally:
+                cur.close()
+
+    try:
+        run(f"INSERT INTO {table} VALUES (1)")
+        # found by the name as written, after the folded name's lookup failed
+        assert pl.scan_database(f"Rvf{module}", conn).collect().height == 1
+        with pytest.raises(pl.exceptions.ComputeError, match="does not exist"):
+            pl.scan_database("rvf_no_such_table", conn).collect()
+        with pytest.raises(pl.exceptions.ComputeError, match="division by zero"):
+            pl.scan_database("SELECT 1 / 0 AS x", conn).collect()
+        # the transaction goes on, with the user's write
+        run(f"INSERT INTO {table} VALUES (2)")
+        assert run(f"SELECT count(*) FROM {table}") == [(2,)]
+        conn.commit()
+    finally:
+        conn.close()
+        if engine is not None:
+            engine.dispose()
+        _execute(
+            "postgres17",
+            [f"DROP TABLE IF EXISTS {table}", f'DROP TABLE IF EXISTS "Rvf{module}"'],
+        )

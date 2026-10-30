@@ -124,7 +124,10 @@ fn range_of(obj: &Bound<'_, PyAny>) -> PyResult<(Scalar, Scalar)> {
 /// A stable identity of `params=`, for scan deduplication: the `repr` of plain values, which
 /// shows them whole. Any other object's (a NumPy array's elides its middle) is the object
 /// itself, which the scan holds, so two scans merge only if they share it.
-fn params_key(params: &Bound<'_, PyAny>) -> PyResult<PlSmallStr> {
+///
+/// Plain values are copied (deeply): the scan runs with the values its key was taken of,
+/// whatever the caller's list or dict holds by then.
+fn params_key<'py>(params: Bound<'py, PyAny>) -> PyResult<(PlSmallStr, Bound<'py, PyAny>)> {
     fn plain(v: &Bound<'_, PyAny>) -> PyResult<bool> {
         if v.is_none()
             || v.is_exact_instance_of::<PyBool>()
@@ -155,10 +158,15 @@ fn params_key(params: &Bound<'_, PyAny>) -> PyResult<PlSmallStr> {
         let module = v.get_type().module()?;
         Ok(matches!(module.to_str()?, "decimal" | "datetime"))
     }
-    Ok(if plain(params)? {
-        params.repr()?.to_string().into()
+    Ok(if plain(&params)? {
+        let params = params
+            .py()
+            .import("copy")?
+            .call_method1("deepcopy", (params,))?;
+        (params.repr()?.to_string().into(), params)
     } else {
-        format!("<object at {:#x}>", params.as_ptr() as usize).into()
+        let key = format!("<object at {:#x}>", params.as_ptr() as usize).into();
+        (key, params)
     })
 }
 
@@ -200,6 +208,13 @@ fn scan_resolver<'py>(
 ) -> PyResult<Bound<'py, PyCapsule>> {
     register();
 
+    let (query_params_key, query_params) = match params {
+        Some(p) => {
+            let (key, p) = params_key(p.into_bound(py))?;
+            (Some(key), Some(Arc::new(PythonObject(p.unbind()))))
+        },
+        None => (None, None),
+    };
     let target = match connection_kind {
         "uri" => ConnectionTarget::Uri(connection.extract::<String>(py)?.into()),
         "odbc" => ConnectionTarget::Odbc(connection.extract::<String>(py)?.into()),
@@ -218,11 +233,8 @@ fn scan_resolver<'py>(
             .map(|(k, v)| (k.into(), v.into()))
             .collect(),
         credential_provider: credential_provider.map(|p| Arc::new(PythonObject(p))),
-        query_params_key: params
-            .as_ref()
-            .map(|p| params_key(p.bind(py)))
-            .transpose()?,
-        query_params: params.map(|p| Arc::new(PythonObject(p))),
+        query_params_key,
+        query_params,
         python_options: python_options.map(|p| Arc::new(PythonObject(p))),
     };
 

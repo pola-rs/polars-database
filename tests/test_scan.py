@@ -1483,3 +1483,25 @@ def test_scan_numpy_params_arent_merged() -> None:
         assert both.collect()["id"].to_list() == [1999, 4999]
     finally:
         conn.close()
+
+
+def test_scan_plain_params_are_copied() -> None:
+    # the key and the values run are the ones the scan was built with, whatever the
+    # caller's list holds by then
+    duckdb = pytest.importorskip("duckdb")
+    conn = duckdb.connect()
+    try:
+        query = "SELECT ?::INTEGER AS x"
+        p: list[Any] = [1]
+        a = pl.scan_database(query, conn, params=p, partition_on=None)
+        p[0] = 2
+        b = pl.scan_database(query, conn, params=[1], partition_on=None)
+        nested: dict[str, Any] = {"x": [1]}
+        c = pl.scan_database(
+            "SELECT $x[1]::INTEGER AS x", conn, params=nested, partition_on=None
+        )
+        nested["x"][0] = 3
+        out = pl.collect_all([a, b, c])
+        assert [df["x"].to_list() for df in out] == [[1], [1], [1]]
+    finally:
+        conn.close()

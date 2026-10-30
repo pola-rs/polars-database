@@ -1179,6 +1179,32 @@ def _transaction_idle(conn: Any) -> bool | None:
     return None
 
 
+def _postgres_family(conn: Any) -> bool:
+    """Whether a connection is a Postgres one, where a failed statement aborts the
+    transaction it runs in."""
+    module = _module_of(conn)
+    if module in ("psycopg", "psycopg2", "pg8000"):
+        return True
+    if module == "sqlalchemy":
+        dialect = getattr(getattr(conn, "dialect", None), "name", "")
+        return dialect in ("postgresql", "redshift")
+    return False
+
+
+def _run_statement(conn: Any, sql: str) -> None:
+    """Run a statement without a result on a connection, a SQLAlchemy one too."""
+    if callable(exec_driver_sql := _exec_driver_sql(conn)):
+        options = {"no_parameters": True, "stream_results": False}
+        exec_driver_sql(sql, execution_options=options).close()
+        return
+    cursor = conn.cursor()
+    try:
+        cursor.execute(sql)
+    finally:
+        with contextlib.suppress(Exception):
+            cursor.close()
+
+
 def _unbuffered_mysql(conn: Any, module: str) -> bool:
     """Whether a MySQL-family connection's cursors stream their result (unbuffered)."""
     with contextlib.suppress(Exception):
@@ -1528,6 +1554,7 @@ class _Session:
         cx: Any = None
         frames: Iterator[DataFrame] | None = None
         idle = False
+        savepoint: str | None = None
         try:
             # driver calls hold the lock, yields don't: other scans of the same live
             # connection interleave their calls, and none waits for another's consumer
@@ -1539,7 +1566,15 @@ class _Session:
                 # the user runs statements on the connection again: a ROLLBACK then
                 # could end theirs. So the result is read whole and the transaction it
                 # opened rolled back here, before any batch is handed over.
-                idle = not self.owned and _transaction_idle(self.conn) is True
+                status = None if self.owned else _transaction_idle(self.conn)
+                idle = status is True
+                if status is False and _postgres_family(self.conn):
+                    # In the user's transaction, a failed statement (a catalog lookup
+                    # of a name that isn't there, a bad query) would abort it, their
+                    # writes lost: it runs in a savepoint, rolled back to on an error.
+                    name = f"polars_scan_{next(_CURSOR_IDS)}"
+                    _run_statement(self.conn, f"SAVEPOINT {name}")
+                    savepoint = name
                 cursor = self._server_cursor(batch_size)
                 cx = ConnectionExecutor(cursor if cursor is not None else self.conn)
                 cx_cursor = cx.cursor if cx.cursor is not cursor else None
@@ -1608,6 +1643,11 @@ class _Session:
                         with contextlib.suppress(Exception):
                             cx.result.close()
                     self.conn.rollback()
+                if savepoint is not None:
+                    # read whole by the client-side cursor already
+                    frames = iter(list(frames))
+                    _run_statement(self.conn, f"RELEASE SAVEPOINT {savepoint}")
+                    savepoint = None
             empty = True
             while True:
                 with state.lock:
@@ -1625,6 +1665,10 @@ class _Session:
             if (self.owned and not self._aborted) or idle:
                 with state.lock, contextlib.suppress(Exception):
                     self.conn.rollback()
+            elif savepoint is not None:
+                with state.lock, contextlib.suppress(Exception):
+                    _run_statement(self.conn, f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    _run_statement(self.conn, f"RELEASE SAVEPOINT {savepoint}")
             raise
         finally:
             # Also runs when the reader stops early and drops this generator, which
