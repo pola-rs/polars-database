@@ -85,6 +85,7 @@ impl SqlRenderer for SqlglotRenderer {
                 top_level_limit: get("top_level_limit")?,
                 nested_queries: get("nested_queries")?,
                 side_effects: get("side_effects")?,
+                side_effects_outside_rows: get("side_effects_outside_rows")?,
                 body: body.map(Into::into),
             })
         })

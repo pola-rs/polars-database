@@ -1165,12 +1165,13 @@ def test_scan_duckdb_types_read_as_text(tmp_path: Path, driver: str) -> None:
     with duckdb.connect(path) as conn:
         conn.execute(
             "CREATE TABLE t (id INTEGER, b BIT, v VARINT, iv INTERVAL, "
-            "u UNION(n INTEGER, s VARCHAR))"
+            "u UNION(n INTEGER, s VARCHAR), lb BIT[], st STRUCT(a INTERVAL))"
         )
         conn.execute(
             "INSERT INTO t VALUES (1, '0101', "
-            "123456789012345678901234567890123456789012, INTERVAL 3 DAY, 1), "
-            "(2, '1', -1, NULL, 'x')"
+            "123456789012345678901234567890123456789012, INTERVAL 3 DAY, 1, "
+            "['11'::BIT], {'a': INTERVAL 1 DAY}), "
+            "(2, '1', -1, NULL, 'x', NULL, NULL)"
         )
     # (a query's columns are probed as the driver reads them: an INTERVAL fails there)
     for source in ["t"]:
@@ -1181,6 +1182,8 @@ def test_scan_duckdb_types_read_as_text(tmp_path: Path, driver: str) -> None:
         assert df["v"].to_list() == ["123456789012345678901234567890123456789012", "-1"]
         assert df["iv"].to_list() == ["3 days", None]
         assert df["u"].to_list() == ["1", "x"]
+        assert df["lb"].to_list() == ["[11]", None]
+        assert df["st"].to_list() == ["{'a': 1 day}", None]
 
 
 @pytest.mark.parametrize("driver", _SQLITE_DRIVERS)

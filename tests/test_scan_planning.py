@@ -949,6 +949,21 @@ def test_mysql_tls_check_rejects_a_plain_connection() -> None:
         # rows numbered or picked in no set order
         ("postgres", "SELECT row_number() OVER () AS rn, id FROM t", False),
         ("postgres", "SELECT lag(x) OVER (ORDER BY ts) FROM t", False),
+        (
+            "postgres",
+            "SELECT sum(x) OVER (ORDER BY y ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+            False,
+        ),
+        ("oracle", "SELECT id FROM t WHERE ROWNUM <= 5", False),
+        # windows that treat ties alike; a function of its argument
+        (
+            "postgres",
+            "SELECT sum(x) OVER (PARTITION BY g), count(*) OVER () FROM t",
+            True,
+        ),
+        ("postgres", "SELECT rank() OVER (ORDER BY a) FROM t", True),
+        ("mysql", "SELECT UNIX_TIMESTAMP(d) FROM t", True),
+        ("mysql", "SELECT UNIX_TIMESTAMP() FROM t", False),
         ("postgres", "SELECT DISTINCT ON (a) a, b FROM t", False),
         ("postgres", "SELECT DISTINCT a FROM t", True),
         ("duckdb", "SELECT any_value(a), first(b) FROM t GROUP BY c", False),

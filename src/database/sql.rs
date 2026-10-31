@@ -299,6 +299,9 @@ pub struct QueryFacts {
     /// Running it may change something: it calls a volatile function (`nextval`), or one
     /// the parser doesn't know (a user's function may write).
     pub side_effects: bool,
+    /// Such a function is in a set operation, a query without `FROM`, or a condition,
+    /// where MariaDB runs it under a `LIMIT 0`.
+    pub side_effects_outside_rows: bool,
     /// The query without the semicolons and comments after its last token, if it parses.
     pub body: Option<PlSmallStr>,
 }

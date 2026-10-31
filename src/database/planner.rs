@@ -186,8 +186,12 @@ struct QueryDiscovery {
     mariadb_order_by: bool,
     /// It parses, and a `LIMIT` (or a lock clause) ends it (`QueryFacts::top_level_limit`).
     top_level_limit: bool,
+    /// It parses, and has a CTE or a subquery (`QueryFacts::nested_queries`).
+    nested_queries: bool,
     /// It parses, and running it may change something (`QueryFacts::side_effects`).
     side_effects: bool,
+    /// `QueryFacts::side_effects_outside_rows`.
+    side_effects_outside_rows: bool,
     /// Every session is read-only ([`read_only_session`]): the database refuses a write.
     read_only_session: bool,
     /// The SQL that finds its schema without running it, where the usual probe would
@@ -205,8 +209,14 @@ const MARIADB_ORDER_BY: &str = "MariaDB ignores the ORDER BY of a query inside a
 /// query's own `LIMIT 0` avoids most of that, but not all: a derived table inside it (a
 /// CTE, a subquery), and on MariaDB a constant `WHERE`, a `HAVING` or a `UNION` branch,
 /// still run. A query that may change something (`QueryDiscovery::side_effects`) must not
-/// run twice: it is refused, unless every session is read-only.
-fn mysql_query_probe(sql: &str, query: &QueryDiscovery) -> PolarsResult<String> {
+/// run twice: it is refused then, unless every session is read-only.
+fn mysql_query_probe(
+    session: &mut dyn DatabaseSession,
+    sql: &str,
+    query: &QueryDiscovery,
+) -> PolarsResult<String> {
+    // a MySQL executable comment (`/*! … */`) may call anything; sqlglot drops it
+    let hidden = sql.contains("/*!");
     let sql = wrappable(sql);
     let probe = if query.parses && !query.top_level_limit {
         format!("{sql} LIMIT 0")
@@ -214,12 +224,16 @@ fn mysql_query_probe(sql: &str, query: &QueryDiscovery) -> PolarsResult<String> 
         // `(SELECT … LIMIT 5) LIMIT 0`
         format!("({sql}) LIMIT 0")
     };
-    // MariaDB evaluates a constant `WHERE`, a `HAVING` and `UNION` branches under a `LIMIT
-    // 0` too. A query sqlglot can't parse may call anything, and so may a MySQL executable
-    // comment (`/*! … */`), which sqlglot drops.
-    let may_change = !query.parses || query.side_effects || sql.contains("/*!");
+    // A query sqlglot can't parse may call anything.
+    let may_change = hidden || query.side_effects || !query.parses;
+    // MariaDB runs a function in a set operation, a query without FROM or a condition,
+    // and may run anything in a query that doesn't parse, or one parenthesised with a LIMIT
+    let mariadb_runs = !query.parses || query.side_effects_outside_rows || query.top_level_limit;
+    let may_run = hidden
+        || query.nested_queries
+        || (may_change && mariadb_runs && !query.read_only_session && is_mariadb(session));
     polars_ensure!(
-        !(may_change && !query.read_only_session),
+        !(may_run && may_change && !query.read_only_session),
         InvalidOperation:
         "this query calls a function that may change something (a volatile one, or one \
         that isn't known, e.g. a stored function), or can't be inspected: MySQL may run it \
@@ -300,7 +314,7 @@ pub fn resolve_scan(
         // Each partition runs the query again: it must pick the same rows every time.
         if let Ok(facts) = &facts
             && facts.parses
-            && !repeatable(facts, read_only_session)
+            && !repeatable(facts, dialect, read_only_session)
             && matches!(
                 options.partitioning,
                 PartitionSpec::Column { .. } | PartitionSpec::Predicates(_)
@@ -335,14 +349,18 @@ pub fn resolve_scan(
             pure_read: read_only_session
                 || facts
                     .as_ref()
-                    .is_ok_and(|f| f.parses && f.read_only && repeatable(f, false)),
+                    .is_ok_and(|f| f.parses && f.read_only && repeatable(f, dialect, false)),
             volatile: facts.as_ref().is_ok_and(|f| f.parses && !f.repeatable),
             mariadb_order_by: dialect == DialectName::Mysql
                 && facts
                     .as_ref()
                     .is_ok_and(|f| f.top_level_order_by_without_limit),
             top_level_limit: facts.as_ref().is_ok_and(|f| f.parses && f.top_level_limit),
+            nested_queries: facts.as_ref().is_ok_and(|f| f.parses && f.nested_queries),
             side_effects: facts.as_ref().is_ok_and(|f| f.parses && f.side_effects),
+            side_effects_outside_rows: facts
+                .as_ref()
+                .is_ok_and(|f| f.parses && f.side_effects_outside_rows),
             read_only_session,
             probe: None,
         };
@@ -404,7 +422,7 @@ pub fn resolve_scan(
         if let DatabaseRelation::Query { sql } = &options.relation
             && dialect == DialectName::Mysql
         {
-            query.probe = Some(mysql_query_probe(sql, &query)?);
+            query.probe = Some(mysql_query_probe(session.as_mut(), sql, &query)?);
         }
         // The catalog first: some declared types are read as text (`text_conversion`), and
         // discovery must select them the same way the scan will.
@@ -1893,11 +1911,17 @@ fn compile_unwrapped(
     })
 }
 
-/// Whether a query returns the same rows, and changes nothing, each time it runs: it may
-/// change something (a function sqlglot doesn't know, which may write) only where the
-/// session refuses a write.
-fn repeatable(facts: &QueryFacts, read_only_session: bool) -> bool {
-    facts.repeatable && (!facts.side_effects || read_only_session)
+/// Whether a query returns the same rows, and changes nothing, each time it runs. Where a
+/// function called in a `SELECT` may write (Postgres, MySQL), one sqlglot doesn't know may
+/// be such a function: then only where the session refuses a write. (SQLite's functions
+/// can't write; SQL Server's and ClickHouse's can't in a query; Oracle's only in an
+/// autonomous transaction.)
+fn repeatable(facts: &QueryFacts, dialect: DialectName, read_only_session: bool) -> bool {
+    let functions_write = matches!(
+        dialect,
+        DialectName::Postgresql | DialectName::Mysql | DialectName::Singlestore
+    );
+    facts.repeatable && (!facts.side_effects || !functions_write || read_only_session)
 }
 
 /// Whether the source returns the same rows each time it runs. A query that can't be
@@ -1911,6 +1935,7 @@ fn query_repeatable(config: &DatabaseScanConfig) -> bool {
                 !f.parses
                     || repeatable(
                         &f,
+                        config.dialect,
                         read_only_session(
                             config.dialect,
                             &config.backend.kind,

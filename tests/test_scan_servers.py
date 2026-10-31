@@ -2942,15 +2942,24 @@ def test_mysql_query_with_side_effects_runs_once(name: str) -> None:
             # MySQL may evaluate the function to find the schema: inside a CTE, and on
             # MariaDB in a constant WHERE, a HAVING or a UNION branch, even under the
             # query's own LIMIT 0. Refused without a schema where sessions can write.
-            for query in [
+            flat = [
                 "SELECT rvf_once_bump() AS x",
                 "SELECT rvf_once_bump() AS x UNION ALL SELECT 0",
                 "SELECT 1 AS x FROM DUAL WHERE rvf_once_bump() > 0",
-                "WITH c AS (SELECT rvf_once_bump() AS x) SELECT x FROM c",
-                "SELECT * FROM (SELECT rvf_once_bump() AS x) d",
                 "(SELECT rvf_once_bump() AS x LIMIT 1)",
                 "SELECT rvf_once_bump() AS x LIMIT 1",
-            ]:
+            ]
+            nested = [
+                "WITH c AS (SELECT rvf_once_bump() AS x) SELECT x FROM c",
+                "SELECT * FROM (SELECT rvf_once_bump() AS x) d",
+            ]
+            for query in flat + nested:
+                if name == "mysql" and query in flat:
+                    # MySQL doesn't run them under the query's own LIMIT 0
+                    pl.scan_database(query, source, **kw).collect()
+                    expected += 1
+                    assert calls() == expected, query
+                    continue
                 with pytest.raises(
                     pl.exceptions.InvalidOperationError, match="schema="
                 ):
@@ -3631,3 +3640,33 @@ def test_engine_partitions_are_cancelled_on_an_early_stop() -> None:
                 "DROP FUNCTION IF EXISTS rvc_pg_slow_fn(int)",
             ],
         )
+
+
+@pytest.mark.parametrize("name", ["mysql", "mariadb"])
+def test_mysql_builtin_functions_and_executable_comments(name: str) -> None:
+    # built-ins sqlglot doesn't know were refused on writable sessions; a trailing
+    # executable comment was dropped
+    pytest.importorskip("connectorx")
+    for driver in ["connectorx", "live"]:
+        lf = _scan(name, driver, "SELECT id, CRC32(CAST(id AS CHAR)) AS c FROM edge")
+        assert lf.collect().height > 0
+    lf = _scan(name, "pymysql", "SELECT id FROM edge /*! WHERE id = 1 */")
+    assert lf.collect()["id"].to_list() == [1]
+
+
+@needs_postgres
+def test_sqlalchemy_orm_session_left_outside_a_transaction() -> None:
+    # an idle ORM Session was left in the scan's transaction
+    sa = pytest.importorskip("sqlalchemy")
+    orm = pytest.importorskip("sqlalchemy.orm")
+    pytest.importorskip("psycopg")
+    assert POSTGRES is not None
+    engine = sa.create_engine(
+        POSTGRES.replace("postgresql://", "postgresql+psycopg://")
+    )
+    try:
+        with orm.Session(engine) as session:
+            assert pl.scan_database("SELECT 1 AS a", session).collect()["a"].item() == 1
+            assert not session.in_transaction()
+    finally:
+        engine.dispose()

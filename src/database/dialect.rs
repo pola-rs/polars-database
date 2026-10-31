@@ -317,10 +317,15 @@ impl DialectName {
             Self::Oracle if t.starts_with("interval") => Some(format!("TO_CHAR({column})")),
             // Bit strings and arbitrary-precision integers reach Arrow as their internal
             // bytes, intervals and unions as types Polars can't read: their text form
+            // (also inside lists, arrays, structs and maps: the whole value is text then)
             Self::Duckdb
-                if matches!(t, "bit" | "bitstring" | "varint" | "bignum")
-                    || t.starts_with("interval")
-                    || t.starts_with("union(") =>
+                if t.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .any(|w| {
+                        matches!(
+                            w,
+                            "bit" | "bitstring" | "varint" | "bignum" | "interval" | "union"
+                        )
+                    }) =>
             {
                 Some(format!("CAST({column} AS VARCHAR)"))
             },

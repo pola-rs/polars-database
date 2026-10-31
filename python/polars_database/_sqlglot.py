@@ -465,6 +465,9 @@ def _is_volatile(node: Any, dialect: str | None, relations: set[str]) -> bool:
         return True
     if isinstance(node, exp.Anonymous):
         name = node.name.lower()
+        if name == "unix_timestamp":
+            # of its argument, if it has one
+            return not node.expressions
         return name in _VOLATILE_FUNCTIONS or (
             dialect == "clickhouse" and name.startswith("rand")
         )
@@ -585,14 +588,43 @@ _ARBITRARY_FUNCTIONS = frozenset(
 )
 
 
-def _picks_arbitrary_rows(stmt: Any) -> bool:
+# Window functions whose value depends on the order of rows that tie (`row_number() OVER
+# ()`; an order is taken as not unique); rank(), and aggregates over the default frame,
+# treat ties alike
+_ROW_ORDER_WINDOWS = frozenset(
+    {"row_number", "ntile", "first_value", "last_value", "nth_value", "lag", "lead"}
+)
+
+
+def _picks_arbitrary_rows(stmt: Any, dialect: str | None) -> bool:
     """
     Whether the query may give other rows, or number them otherwise, each time it runs: a
-    window function (`row_number() OVER ()`; its order is taken as not unique), `DISTINCT
-    ON`, an aggregate that picks any value, or Postgres' one-argument `age(x)` (relative to
-    today).
+    window function that tells tied rows apart (or has a `ROWS` / `GROUPS` frame),
+    `DISTINCT ON`, an aggregate that picks any value, Oracle's `ROWNUM`, or Postgres'
+    one-argument `age(x)` (relative to today).
     """
-    if stmt.find(exp.Window, exp.AnyValue, exp.First, exp.Last) is not None:
+    if stmt.find(exp.AnyValue, exp.First, exp.Last) is not None:
+        return True
+    for window in stmt.find_all(exp.Window):
+        spec = window.args.get("spec")
+        kind = str(spec.args.get("kind") or "").lower() if spec is not None else ""
+        if kind in ("rows", "groups") or (
+            _function_name(window.this) in _ROW_ORDER_WINDOWS
+            or type(window.this).__name__.lower()
+            in (
+                "rownumber",
+                "ntile",
+                "firstvalue",
+                "lastvalue",
+                "nthvalue",
+                "lag",
+                "lead",
+            )
+        ):
+            return True
+    if dialect == "oracle" and any(
+        c.name.lower() == "rownum" and not c.table for c in stmt.find_all(exp.Column)
+    ):
         return True
     if any(d.args.get("on") is not None for d in stmt.find_all(exp.Distinct)):
         return True
@@ -670,6 +702,7 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
         "top_level_limit": False,
         "nested_queries": False,
         "side_effects": False,
+        "side_effects_outside_rows": False,
         "body": None,
     }
     try:
@@ -687,7 +720,8 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
     # go inside `(...)` (MySQL's `#` comment would comment out the parenthesis)
     while tokens and tokens[-1].token_type == sqlglot.TokenType.SEMICOLON:
         tokens.pop()
-    if tokens and len(statements) == 1:
+    if tokens and len(statements) == 1 and "/*!" not in sql[tokens[-1].end + 1 :]:
+        # (a MySQL executable comment after it is part of the query)
         body = sql[: tokens[-1].end + 1]
         with contextlib.suppress(sqlglot.errors.SqlglotError):
             # only what the tokens say is the same query
@@ -717,11 +751,23 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
     facts["repeatable"] = (
         stmt.find(exp.Limit, exp.Fetch, exp.Offset, exp.TableSample) is None
         and not volatile
-        and not _picks_arbitrary_rows(stmt)
+        and not _picks_arbitrary_rows(stmt, dialect)
     )
     # Running it may change something: a volatile function (`nextval`), or one sqlglot
     # doesn't know, which may be the user's own (a stored function that writes).
     facts["side_effects"] = volatile or stmt.find(exp.Anonymous) is not None
+    # Where MariaDB evaluates such a function under a `LIMIT 0`: a set operation's
+    # branches, a query without FROM, and conditions (`WHERE f() = 1` is constant)
+    calls = [
+        node
+        for node in stmt.find_all(exp.Func, exp.Dot, exp.Column, exp.Literal)
+        if isinstance(node, exp.Anonymous) or _is_volatile(node, dialect, relations)
+    ]
+    facts["side_effects_outside_rows"] = bool(calls) and (
+        isinstance(stmt, exp.SetOperation)
+        or stmt.args.get("from_", stmt.args.get("from")) is None
+        or any(c.find_ancestor(exp.Where, exp.Having, exp.Join) for c in calls)
+    )
     selects = stmt.selects
     if selects and not any(isinstance(s, exp.Star) or s.is_star for s in selects):
         facts["output_columns"] = [s.alias_or_name for s in selects]

@@ -95,17 +95,19 @@ def _module_of(obj: Any) -> str:
     return public if public != module and _has_module(public) else module
 
 
-def _pool_checkout(conn: Any) -> tuple[Any, Callable[[], None] | None]:
+def _pool_checkout(
+    conn: Any,
+) -> tuple[Any, Callable[[], None] | None, Callable[[], None] | None]:
     """
-    A SQLAlchemy pool's checkout (`engine.raw_connection()`): its DB-API connection, and
-    the call that returns it to the pool.
+    A SQLAlchemy pool's checkout (`engine.raw_connection()`): its DB-API connection, the
+    call that returns it to the pool, and the one that discards it.
     """
     if (
         type(conn).__name__ == "_ConnectionFairy"
         and (driver := getattr(conn, "driver_connection", None)) is not None
     ):
-        return driver, conn.close
-    return conn, None
+        return driver, conn.close, conn.invalidate
+    return conn, None, None
 
 
 # ADBC's vendor names, as dialect names
@@ -134,8 +136,9 @@ def connection_info(obj: Any, kind: str) -> tuple[str, str]:
         # Its autocommit is off: the scan's statements would leave a transaction open on
         # the user's connection, and a failed one abort it.
         msg = (
-            "a live ADBC connection can't be scanned (it is always in a transaction); "
-            "pass its URI (driver='adbc'), or a function that opens a connection"
+            "a live ADBC connection can't be scanned (the scan's statements and result "
+            "streams would share its transaction); pass its URI (driver='adbc'), or a "
+            "function that opens a connection"
         )
         raise TypeError(msg)
     return _connection_info(obj)
@@ -1215,10 +1218,12 @@ def _transaction_idle(conn: Any) -> bool | None:
         if callable(in_transaction):
             # A SQLAlchemy Connection, which begins one on its first statement, and
             # says so in AUTOCOMMIT too, where there is none
+            # (an ORM Session has neither)
             autocommit = getattr(conn, "_is_autocommit_isolation", None)
-            if (
-                autocommit() if callable(autocommit) else False
-            ) or conn.get_execution_options().get("isolation_level") == "AUTOCOMMIT":
+            options = getattr(conn, "get_execution_options", None)
+            if (callable(autocommit) and autocommit()) or (
+                callable(options) and options().get("isolation_level") == "AUTOCOMMIT"
+            ):
                 return True
             return not in_transaction()
         if isinstance(in_transaction, bool) and module in ("sqlite3", "mysql"):
@@ -1593,6 +1598,7 @@ class _Session:
         close: Callable[[], None] | None = None,
         params: Any = None,
         factory: bool = False,
+        invalidate: Callable[[], None] | None = None,
     ) -> None:
         self.conn = conn
         self.owned = owned
@@ -1601,6 +1607,8 @@ class _Session:
         self.execute_options = execute_options
         self.params = params
         self._close = close
+        # discards it from its pool instead (when its socket was shut down)
+        self._invalidate = invalidate
         self._state = _ConnectionState() if owned else _live_state(conn)
         # the session setup changed the connection's settings (see `close`)
         self._setup_ran = False
@@ -1911,7 +1919,10 @@ class _Session:
                 for sql in self._restore:
                     _run_statement(self.conn, sql)
                 self.conn.commit()
-        if self._close is not None:
+        if self._aborted and self._invalidate is not None:
+            with contextlib.suppress(Exception):
+                self._invalidate()
+        elif self._close is not None:
             self._close()
         elif self.owned and callable(getattr(self.conn, "close", None)):
             if self._aborted:
@@ -2235,8 +2246,15 @@ def connect(
     if target_kind == "live":
         return _Session(target, owned=False, **session)
     if target_kind == "factory":
-        conn, close = _pool_checkout(target())
-        return _Session(conn, owned=True, close=close, factory=True, **session)
+        conn, close, invalidate = _pool_checkout(target())
+        return _Session(
+            conn,
+            owned=True,
+            close=close,
+            invalidate=invalidate,
+            factory=True,
+            **session,
+        )
 
     creds = credentials(credential_provider) if credential_provider else None
     with _scrubbed(_secrets(target, creds, connect_opts)):
