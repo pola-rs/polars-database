@@ -507,28 +507,102 @@ _TIME_FUNCTIONS = _SQLITE_TIME_FUNCTIONS | {
 
 
 def _function_name(node: Any) -> str:
-    if isinstance(node, exp.Anonymous):
+    if isinstance(node, (exp.Anonymous, exp.AnonymousAggFunc)):
         return str(node.name).lower()
     if isinstance(node, exp.Func):
         return str(node.sql_name()).lower()
     return ""
 
 
+# Where `'now'` is only text: concatenated, a `LIKE` pattern, an output column of its own
+_TEXT_CONTEXTS = (exp.DPipe, exp.Concat, exp.ConcatWs, exp.Like, exp.ILike, exp.Alias)
+# String functions, by sqlglot's name or the function's own
+_TEXT_FUNCTIONS = frozenset(
+    {
+        "instr",
+        "replace",
+        "str_position",
+        "strpos",
+        "position",
+        "locate",
+        "substring",
+        "substr",
+        "left",
+        "right",
+        "lower",
+        "upper",
+        "trim",
+        "ltrim",
+        "rtrim",
+        "length",
+        "char_length",
+        "split_part",
+        "starts_with",
+        "ends_with",
+        "contains",
+        "lpad",
+        "rpad",
+        "repeat",
+        "reverse",
+        "format",
+        "regexp_like",
+        "regexp_replace",
+    }
+)
+
+
 def _is_current_time_literal(node: Any) -> bool:
     """
-    A text literal that the database reads as the current time: `'now'::timestamp`,
-    SQLite's `datetime('now')`. Elsewhere such text is only text (`concat(s, 'now')`).
-    Compared with a column it may be a time too (Postgres casts `created < 'now'` to the
-    column's type), which the query alone doesn't tell: taken as one.
+    A text literal that the database may read as the current time: `'now'::timestamp`,
+    SQLite's `datetime('now')`, and wherever its type comes from what it meets (Postgres
+    reads `ts - 'now'`, `created < 'now'` and `greatest(ts, 'now')` as times). Only where
+    it is clearly text (`s || 'now'`, a cast to text) is it not one.
     """
     if node.name.strip().lower() not in _CURRENT_TIME_TEXT:
         return False
     parent = node.parent
     if isinstance(parent, (exp.Cast, exp.TryCast)):
         return bool(parent.to.is_type(*exp.DataType.TEMPORAL_TYPES))
-    if isinstance(parent, exp.Predicate):
+    return not isinstance(parent, (*_TEXT_CONTEXTS, exp.Select)) and (
+        _function_name(parent) not in _TEXT_FUNCTIONS
+    )
+
+
+# Aggregates that return any one of their values; ClickHouse's numbering of the rows (and
+# blocks) in the order they happen to be read
+_ARBITRARY_FUNCTIONS = frozenset(
+    {
+        "any",
+        "anylast",
+        "any_value",
+        "arbitrary",
+        "first",
+        "last",
+        "rownumberinallblocks",
+        "rownumberinblock",
+        "blocknumber",
+    }
+)
+
+
+def _picks_arbitrary_rows(stmt: Any) -> bool:
+    """
+    Whether the query may give other rows, or number them otherwise, each time it runs: a
+    window function (`row_number() OVER ()`; its order is taken as not unique), `DISTINCT
+    ON`, an aggregate that picks any value, or Postgres' one-argument `age(x)` (relative to
+    today).
+    """
+    if stmt.find(exp.Window, exp.AnyValue, exp.First, exp.Last) is not None:
         return True
-    return _function_name(parent) in _TIME_FUNCTIONS
+    if any(d.args.get("on") is not None for d in stmt.find_all(exp.Distinct)):
+        return True
+    for node in stmt.find_all(exp.Func):
+        name = _function_name(node)
+        if name in _ARBITRARY_FUNCTIONS:
+            return True
+        if name == "age" and len(node.expressions) == 1:
+            return True
+    return False
 
 
 def _top_level_order_by_without_limit(stmt: Any) -> bool:
@@ -643,6 +717,7 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
     facts["repeatable"] = (
         stmt.find(exp.Limit, exp.Fetch, exp.Offset, exp.TableSample) is None
         and not volatile
+        and not _picks_arbitrary_rows(stmt)
     )
     # Running it may change something: a volatile function (`nextval`), or one sqlglot
     # doesn't know, which may be the user's own (a stored function that writes).

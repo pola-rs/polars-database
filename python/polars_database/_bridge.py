@@ -95,17 +95,59 @@ def _module_of(obj: Any) -> str:
     return public if public != module and _has_module(public) else module
 
 
+def _pool_checkout(conn: Any) -> tuple[Any, Callable[[], None] | None]:
+    """
+    A SQLAlchemy pool's checkout (`engine.raw_connection()`): its DB-API connection, and
+    the call that returns it to the pool.
+    """
+    if (
+        type(conn).__name__ == "_ConnectionFairy"
+        and (driver := getattr(conn, "driver_connection", None)) is not None
+    ):
+        return driver, conn.close
+    return conn, None
+
+
+# ADBC's vendor names, as dialect names
+_ADBC_VENDORS = {
+    "postgresql": "postgresql",
+    "sqlite": "sqlite",
+    "duckdb": "duckdb",
+    "mysql": "mysql",
+    "mariadb": "mysql",
+    "snowflake": "snowflake",
+    "microsoft sql server": "mssql",
+    "clickhouse": "clickhouse",
+}
+
+
 def connection_info(obj: Any, kind: str) -> tuple[str, str]:
     """`(dialect, module)` of a connection factory or live connection object."""
     if kind == "factory":
         conn = obj()
         try:
-            return connection_info(conn, "live")
+            return _connection_info(_pool_checkout(conn)[0])
         finally:
             with contextlib.suppress(Exception):
                 conn.close()
+    if _module_of(obj) == "adbc_driver_manager":
+        # Its autocommit is off: the scan's statements would leave a transaction open on
+        # the user's connection, and a failed one abort it.
+        msg = (
+            "a live ADBC connection can't be scanned (it is always in a transaction); "
+            "pass its URI (driver='adbc'), or a function that opens a connection"
+        )
+        raise TypeError(msg)
+    return _connection_info(obj)
 
+
+def _connection_info(obj: Any) -> tuple[str, str]:
     module = _module_of(obj)
+    if module == "adbc_driver_manager":
+        # its driver says which database it is
+        with contextlib.suppress(Exception):
+            vendor = str(obj.adbc_get_info().get("vendor_name", "")).lower()
+            return _ADBC_VENDORS.get(vendor, ""), module
     if module == "sqlalchemy":
         engine = getattr(obj, "engine", None) or getattr(obj, "bind", None)
         dialect = getattr(getattr(engine, "dialect", None), "name", "") or ""
@@ -1171,12 +1213,27 @@ def _transaction_idle(conn: Any) -> bool | None:
             return not conn.server_status & in_trans
         in_transaction = getattr(conn, "in_transaction", None)
         if callable(in_transaction):
-            # a SQLAlchemy Connection, which begins one on its first statement
+            # A SQLAlchemy Connection, which begins one on its first statement, and
+            # says so in AUTOCOMMIT too, where there is none
+            autocommit = getattr(conn, "_is_autocommit_isolation", None)
+            if (
+                autocommit() if callable(autocommit) else False
+            ) or conn.get_execution_options().get("isolation_level") == "AUTOCOMMIT":
+                return True
             return not in_transaction()
         if isinstance(in_transaction, bool) and module in ("sqlite3", "mysql"):
             # sqlite3, and mysql.connector (the status of its last result)
             return not in_transaction
     return None
+
+
+def _cancel_target(conn: Any) -> Any:
+    """What cancels a connection's statement: an Engine connection's driver connection
+    (a SQLAlchemy Connection has no cancel)."""
+    if _module_of(conn) == "sqlalchemy":
+        with contextlib.suppress(Exception):
+            return conn.connection.driver_connection
+    return conn
 
 
 def _postgres_family(conn: Any) -> bool:
@@ -1248,21 +1305,46 @@ def _sql_str(value: Any, *, dialect: str) -> str:
     return f"E'{s}'" if dialect == "postgresql" else f"'{s}'"
 
 
+# DB-API driver modules, by the dialect whose settings `_session_settings` restores
+_DRIVER_DIALECTS = {
+    "psycopg": "postgresql",
+    "psycopg2": "postgresql",
+    "pg8000": "postgresql",
+    "pymysql": "mysql",
+    "mysql": "mysql",
+    "MySQLdb": "mysql",
+    "oracledb": "oracle",
+}
+
+
 def _session_settings(conn: Any) -> list[str] | None:
     """
-    Statements that restore what the session setup changes on a SQLAlchemy connection;
-    `None` if unknown.
+    Statements that restore what the session setup changes on a SQLAlchemy or DB-API
+    connection; `None` if unknown.
     """
 
-    def row(sql: str) -> Any:
-        options = {"no_parameters": True, "stream_results": False}
-        result = conn.exec_driver_sql(sql, execution_options=options)
+    def rows(sql: str) -> list[Any]:
+        if callable(getattr(conn, "exec_driver_sql", None)):
+            options = {"no_parameters": True, "stream_results": False}
+            result = conn.exec_driver_sql(sql, execution_options=options)
+            try:
+                return list(result.fetchall())
+            finally:
+                result.close()
+        cursor = conn.cursor()
         try:
-            return result.fetchone()
+            cursor.execute(sql)
+            return list(cursor.fetchall())
         finally:
-            result.close()
+            with contextlib.suppress(Exception):
+                cursor.close()
 
-    dialect = getattr(getattr(conn, "dialect", None), "name", "")
+    def row(sql: str) -> Any:
+        return rows(sql)[0]
+
+    dialect = getattr(getattr(conn, "dialect", None), "name", "") or (
+        _DRIVER_DIALECTS.get(_module_of(conn), "")
+    )
     try:
         if dialect == "postgresql":
             names = ("application_name", "TimeZone", "default_transaction_read_only")
@@ -1291,12 +1373,13 @@ def _session_settings(conn: Any) -> list[str] | None:
                 f"SESSION {var} = {int(read_only)}"
             ]
         if dialect == "oracle":
-            rows = conn.exec_driver_sql(
-                "SELECT parameter, value FROM nls_session_parameters "
-                "WHERE parameter IN ('NLS_COMP', 'NLS_SORT')",
-                execution_options={"stream_results": False},
-            ).fetchall()
-            values = {str(p): str(v) for p, v in rows}
+            values = {
+                str(p): str(v)
+                for p, v in rows(
+                    "SELECT parameter, value FROM nls_session_parameters "
+                    "WHERE parameter IN ('NLS_COMP', 'NLS_SORT')"
+                )
+            }
             if sorted(values) != ["NLS_COMP", "NLS_SORT"] or not all(
                 re.fullmatch(r"\w+", v) for v in values.values()
             ):
@@ -1509,9 +1592,12 @@ class _Session:
         execute_options: dict[str, Any],
         close: Callable[[], None] | None = None,
         params: Any = None,
+        factory: bool = False,
     ) -> None:
         self.conn = conn
         self.owned = owned
+        # from the user's function, whose `close` may return it to a pool of theirs
+        self.factory = factory
         self.execute_options = execute_options
         self.params = params
         self._close = close
@@ -1532,7 +1618,10 @@ class _Session:
         # transaction. Its scans' cursors are closed instead.
         self.can_cancel = owned and (
             self._abort_socket
-            or any(callable(getattr(conn, m, None)) for m in ("cancel", "interrupt"))
+            or any(
+                callable(getattr(_cancel_target(conn), m, None))
+                for m in ("cancel", "interrupt")
+            )
         )
         # SQLAlchemy's `text()` reads `:name` and `\:` inside the string literals
         # written into the SQL; without parameters, the SQL goes to the driver as is
@@ -1776,6 +1865,9 @@ class _Session:
             conn.exec_driver_sql(sql)
             conn.commit()
             return
+        if self.factory and not self._setup_ran:
+            # restored on `close`, in case it goes back to a pool
+            self._restore = _session_settings(conn)
         self._setup_ran = True
         cursor = conn.cursor() if hasattr(conn, "cursor") else conn
         try:
@@ -1798,14 +1890,27 @@ class _Session:
             self._aborted = True
             _shutdown_socket(self.conn)
             return
+        target = _cancel_target(self.conn)
         for m in ("cancel", "interrupt"):
-            if callable(f := getattr(self.conn, m, None)):
+            if callable(f := getattr(target, m, None)):
                 f()
                 return
 
     def close(self) -> None:
         if self._setup_ran and self._close is None:
             self._reset_pooled()
+        if (
+            self._setup_ran
+            and self.factory
+            and self._restore
+            and not self._aborted
+            and _module_of(self.conn) != "sqlalchemy"  # (`_reset_pooled`)
+        ):
+            with contextlib.suppress(Exception):
+                self.conn.rollback()
+                for sql in self._restore:
+                    _run_statement(self.conn, sql)
+                self.conn.commit()
         if self._close is not None:
             self._close()
         elif self.owned and callable(getattr(self.conn, "close", None)):
@@ -2130,7 +2235,8 @@ def connect(
     if target_kind == "live":
         return _Session(target, owned=False, **session)
     if target_kind == "factory":
-        return _Session(target(), owned=True, **session)
+        conn, close = _pool_checkout(target())
+        return _Session(conn, owned=True, close=close, factory=True, **session)
 
     creds = credentials(credential_provider) if credential_provider else None
     with _scrubbed(_secrets(target, creds, connect_opts)):

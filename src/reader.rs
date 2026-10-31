@@ -302,6 +302,16 @@ impl PartitionReader {
             .as_ref()
             .is_none_or(|c| c.repeatable);
         let mut session = self.shared.acquire(&self.cancelled)?;
+        {
+            // cancellable as the read is (see `PartitionStream::start`)
+            let mut cancel = self.cancel.lock().unwrap();
+            if self.cancelled.load(Ordering::Relaxed) {
+                drop(cancel);
+                self.shared.release(session);
+                polars_bail!(ComputeError: "the database read was cancelled");
+            }
+            *cancel = session.cancel_handle();
+        }
         let r = if repeatable {
             session
                 .query(&self.partition.count_sql)
@@ -316,8 +326,13 @@ impl PartitionReader {
         // Back to the pool: holding it until this partition is read would let readers that
         // are counted out of order (a negative slice counts from the end) take every
         // session while the partition that is read next waits. A failed session may be in
-        // any state: it is closed.
-        if r.is_ok() {
+        // any state: it is closed, as is one whose statement was cancelled.
+        let cancelled = {
+            let mut cancel = self.cancel.lock().unwrap();
+            *cancel = None;
+            self.cancelled.load(Ordering::Relaxed)
+        };
+        if r.is_ok() && !cancelled {
             self.shared.release(session);
         } else {
             run_detached(move || drop(session));

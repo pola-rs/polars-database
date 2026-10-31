@@ -25,6 +25,9 @@ pub struct CatalogInfo {
     /// Types that only decide how the database compares a column, not how it is read
     /// (SQLite and DuckDB declarations, a query's result types).
     pub compare_types: PlHashMap<PlSmallStr, String>,
+    /// The columns of `compare_types`, in the table's order where the lookup gives it
+    /// (DuckDB).
+    pub compare_order: Vec<PlSmallStr>,
     /// The table declares collations the catalog doesn't expose per column (SQLite, DuckDB),
     /// or the collations of a query's columns are unknown: string columns are treated as
     /// unknown.
@@ -273,6 +276,7 @@ pub fn table_info(
             if let Some(name) = cell_str(&df, 0, row) {
                 // SQLite: no declared type is no affinity
                 let t = cell_str(&df, 1, row).unwrap_or_default();
+                info.compare_order.push(name.as_str().into());
                 info.compare_types.insert(name.into(), t);
             }
         }
@@ -794,7 +798,8 @@ impl CatalogQueries {
                     collations: None,
                     types: None,
                     compare_types: Some(format!(
-                        "SELECT column_name, data_type FROM duckdb_columns() WHERE {duck_filter}"
+                        "SELECT column_name, data_type FROM duckdb_columns() WHERE {duck_filter} \
+                        ORDER BY column_index"
                     )),
                     // `duckdb_columns()` doesn't show collations; a session `default_collation`
                     // applies to every column.

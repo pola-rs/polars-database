@@ -315,6 +315,15 @@ impl DialectName {
             Self::Oracle if t == "rowid" || t == "urowid" => Some(format!("ROWIDTOCHAR({column})")),
             // `INTERVAL … TO …`: Arrow's month-day-nano intervals have no Polars dtype
             Self::Oracle if t.starts_with("interval") => Some(format!("TO_CHAR({column})")),
+            // Bit strings and arbitrary-precision integers reach Arrow as their internal
+            // bytes, intervals and unions as types Polars can't read: their text form
+            Self::Duckdb
+                if matches!(t, "bit" | "bitstring" | "varint" | "bignum")
+                    || t.starts_with("interval")
+                    || t.starts_with("union(") =>
+            {
+                Some(format!("CAST({column} AS VARCHAR)"))
+            },
             _ => None,
         }
     }
@@ -532,6 +541,16 @@ const MYSQL_GEOMETRY: &[&str] = &[
 fn wide_decimal(t: &str) -> bool {
     if t.starts_with("decimal256(") {
         return true;
+    }
+    // Oracle `NUMBER(p, -s)`: integers of up to p + s digits
+    if let Some((p, s)) = t
+        .strip_prefix("number(")
+        .and_then(|r| r.strip_suffix(')'))
+        .and_then(|args| args.split_once(','))
+        && let (Ok(p), Ok(s)) = (p.trim().parse::<i64>(), s.trim().parse::<i64>())
+        && s < 0
+    {
+        return p - s > 38;
     }
     ["numeric(", "decimal(", "number("]
         .iter()

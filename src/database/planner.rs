@@ -186,8 +186,6 @@ struct QueryDiscovery {
     mariadb_order_by: bool,
     /// It parses, and a `LIMIT` (or a lock clause) ends it (`QueryFacts::top_level_limit`).
     top_level_limit: bool,
-    /// It parses, and has a CTE or a subquery (`QueryFacts::nested_queries`).
-    nested_queries: bool,
     /// It parses, and running it may change something (`QueryFacts::side_effects`).
     side_effects: bool,
     /// Every session is read-only ([`read_only_session`]): the database refuses a write.
@@ -204,31 +202,29 @@ const MARIADB_ORDER_BY: &str = "MariaDB ignores the ORDER BY of a query inside a
 /// MySQL and MariaDB evaluate a derived table of one row (`SELECT NEXTVAL(s)`, an
 /// aggregate) when they plan a query, before a `WHERE 1 = 0` (or a `LIMIT 0`) around it
 /// applies: the usual probe would run the query, and the read then runs it again. The
-/// query's own `LIMIT 0` doesn't run it, unless such a derived table is inside it (a CTE,
-/// a subquery, a parenthesised query with a `LIMIT` on MariaDB), or MariaDB parenthesises
-/// a query that ends in a `LIMIT`. A query that may
-/// change something (`QueryDiscovery::side_effects`) must not run twice: it is refused
-/// then, unless every session is read-only.
-fn mysql_query_probe(
-    session: &mut dyn DatabaseSession,
-    sql: &str,
-    query: &QueryDiscovery,
-) -> PolarsResult<String> {
+/// query's own `LIMIT 0` avoids most of that, but not all: a derived table inside it (a
+/// CTE, a subquery), and on MariaDB a constant `WHERE`, a `HAVING` or a `UNION` branch,
+/// still run. A query that may change something (`QueryDiscovery::side_effects`) must not
+/// run twice: it is refused, unless every session is read-only.
+fn mysql_query_probe(sql: &str, query: &QueryDiscovery) -> PolarsResult<String> {
     let sql = wrappable(sql);
-    let (probe, may_run) = if query.parses && !query.top_level_limit {
-        (format!("{sql} LIMIT 0"), query.nested_queries)
+    let probe = if query.parses && !query.top_level_limit {
+        format!("{sql} LIMIT 0")
     } else {
         // `(SELECT … LIMIT 5) LIMIT 0`
-        let may_run = query.nested_queries || (query.side_effects && is_mariadb(session));
-        (format!("({sql}) LIMIT 0"), may_run)
+        format!("({sql}) LIMIT 0")
     };
+    // MariaDB evaluates a constant `WHERE`, a `HAVING` and `UNION` branches under a `LIMIT
+    // 0` too. A query sqlglot can't parse may call anything, and so may a MySQL executable
+    // comment (`/*! … */`), which sqlglot drops.
+    let may_change = !query.parses || query.side_effects || sql.contains("/*!");
     polars_ensure!(
-        !(may_run && query.side_effects && !query.read_only_session),
+        !(may_change && !query.read_only_session),
         InvalidOperation:
         "this query calls a function that may change something (a volatile one, or one \
-        that isn't known, e.g. a stored function), inside a CTE or a subquery: MySQL would \
-        run it to find the query's schema, and the read would run it again; pass schema=..., \
-        or connect with a URI and a driver whose sessions are read-only (e.g. driver=\"pymysql\")"
+        that isn't known, e.g. a stored function), or can't be inspected: MySQL may run it \
+        to find the query's schema, and the read would run it again; pass schema=..., or \
+        connect with a URI and a driver whose sessions are read-only (e.g. driver=\"pymysql\")"
     );
     Ok(probe)
 }
@@ -304,7 +300,7 @@ pub fn resolve_scan(
         // Each partition runs the query again: it must pick the same rows every time.
         if let Ok(facts) = &facts
             && facts.parses
-            && !facts.repeatable
+            && !repeatable(facts, read_only_session)
             && matches!(
                 options.partitioning,
                 PartitionSpec::Column { .. } | PartitionSpec::Predicates(_)
@@ -313,8 +309,11 @@ pub fn resolve_scan(
             polars_bail!(
                 InvalidOperation:
                 "this query can't be partitioned: each partition runs it again, and with \
-                LIMIT, OFFSET, TABLESAMPLE, a random function or the current time it may \
-                return other rows each time; pass partition_on=None, or partition a table"
+                LIMIT, OFFSET, TABLESAMPLE, a random function, the current time, or rows \
+                numbered or picked in no set order (a window function, DISTINCT ON, \
+                any_value) it may return other rows each time; a function that may change \
+                something (one sqlglot doesn't know) would run again too, unless the \
+                driver's sessions are read-only; pass partition_on=None, or partition a table"
             );
         }
         // `SELECT …; -- done`: the trailing `;` and comments can't go inside `(...)`.
@@ -336,14 +335,13 @@ pub fn resolve_scan(
             pure_read: read_only_session
                 || facts
                     .as_ref()
-                    .is_ok_and(|f| f.parses && f.read_only && f.repeatable),
+                    .is_ok_and(|f| f.parses && f.read_only && repeatable(f, false)),
             volatile: facts.as_ref().is_ok_and(|f| f.parses && !f.repeatable),
             mariadb_order_by: dialect == DialectName::Mysql
                 && facts
                     .as_ref()
                     .is_ok_and(|f| f.top_level_order_by_without_limit),
             top_level_limit: facts.as_ref().is_ok_and(|f| f.parses && f.top_level_limit),
-            nested_queries: facts.as_ref().is_ok_and(|f| f.parses && f.nested_queries),
             side_effects: facts.as_ref().is_ok_and(|f| f.parses && f.side_effects),
             read_only_session,
             probe: None,
@@ -406,7 +404,7 @@ pub fn resolve_scan(
         if let DatabaseRelation::Query { sql } = &options.relation
             && dialect == DialectName::Mysql
         {
-            query.probe = Some(mysql_query_probe(session.as_mut(), sql, &query)?);
+            query.probe = Some(mysql_query_probe(sql, &query)?);
         }
         // The catalog first: some declared types are read as text (`text_conversion`), and
         // discovery must select them the same way the scan will.
@@ -549,6 +547,12 @@ pub fn resolve_scan(
                 is_key: info.key_column.as_ref() == Some(name),
                 comparable: !info.incomplete
                     && info.compares_like_polars(dialect, name, dtype)
+                    // read as text, compared as its own type
+                    && !(dialect == DialectName::Duckdb
+                        && info
+                            .compare_types
+                            .get(name.as_str())
+                            .is_some_and(|t| dialect.text_conversion(t, name).is_some()))
                     && info.declared_type(name).is_none_or(|t| {
                         dialect.text_conversion(t, name).is_none()
                             && !(alias_shadows_column(dialect)
@@ -616,13 +620,19 @@ pub fn resolve_scan(
     if matches!(backend.kind, BackendKind::ConnectorX) && dialect == DialectName::Sqlite {
         for c in columns.iter_mut() {
             match c.dtype {
-                DataType::String => c.db_type = Some(CONNECTORX_SQLITE_TEXT.into()),
+                DataType::String => c.db_type = Some(SQLITE_TEXT.into()),
                 DataType::Float64 => c.db_type = Some(CONNECTORX_SQLITE_REAL.into()),
                 DataType::Int64 | DataType::Binary => {
                     c.db_type = Some(CONNECTORX_SQLITE_VALUE.into())
                 },
                 _ => {},
             }
+        }
+    }
+    // ADBC writes a real in a String column with 6 significant digits.
+    if matches!(backend.kind, BackendKind::Adbc { .. }) && dialect == DialectName::Sqlite {
+        for c in columns.iter_mut().filter(|c| c.dtype == DataType::String) {
+            c.db_type = Some(SQLITE_TEXT.into());
         }
     }
 
@@ -788,9 +798,9 @@ fn alias_shadows_column(dialect: DialectName) -> bool {
 
 /// The `db_type` of a query's decimal column read through ConnectorX: selected as text.
 const CONNECTORX_DECIMAL: &str = "<connectorx decimal>";
-/// The `db_type` of a SQLite String / Float64 column read through ConnectorX: its values
-/// converted to text / reals, as the other drivers read them.
-const CONNECTORX_SQLITE_TEXT: &str = "<connectorx sqlite text>";
+/// The `db_type` of a SQLite String / Float64 column read through ConnectorX (String: or
+/// ADBC): its values converted to text / reals, as the other drivers read them.
+const SQLITE_TEXT: &str = "<sqlite text>";
 const CONNECTORX_SQLITE_REAL: &str = "<connectorx sqlite real>";
 /// The `db_type` of a SQLite Int64 / Binary column read through ConnectorX: its values as
 /// they are, without the column's declared type.
@@ -808,8 +818,21 @@ fn column_conversion(
     if db_type == CONNECTORX_DECIMAL && dialect == DialectName::Oracle {
         return Some(oracle_number_text(column));
     }
-    if db_type == CONNECTORX_DECIMAL || db_type == CONNECTORX_SQLITE_TEXT {
+    if db_type == CONNECTORX_DECIMAL {
         return Some(dialect.cast_to_text(column));
+    }
+    if db_type == SQLITE_TEXT {
+        // SQLite writes a real as text with 15 significant digits: the fewest digits
+        // (15 to 17) that read back as the same real
+        let digits = |n: u32| format!("printf('%!.{n}g', {column})");
+        return Some(format!(
+            "CASE WHEN typeof({column}) <> 'real' THEN CAST({column} AS TEXT) \
+            WHEN CAST({p15} AS REAL) = {column} THEN {p15} \
+            WHEN CAST({p16} AS REAL) = {column} THEN {p16} ELSE {p17} END",
+            p15 = digits(15),
+            p16 = digits(16),
+            p17 = digits(17),
+        ));
     }
     if db_type == CONNECTORX_SQLITE_VALUE {
         // `+x` is `x`, of any class, but an expression
@@ -826,7 +849,8 @@ fn column_conversion(
     }
     // ClickHouse `DateTime` (seconds) reaches Arrow as a plain UInt32; `DateTime64` is a
     // timestamp, and compares like the column. clickhouse_connect and ConnectorX cut a
-    // `DateTime64(7..9)` to microseconds: its text, in UTC, keeps the nanoseconds.
+    // `DateTime64(7..9)` to microseconds: its nanoseconds since the epoch keep them (its
+    // text clamps instants before 1900).
     if dialect == DialectName::Clickhouse {
         let t = super::schema::clickhouse_value_type(db_type);
         if t == "datetime" || t.starts_with("datetime(") {
@@ -836,7 +860,7 @@ fn column_conversion(
             && declared_dtype(dialect, db_type)
                 .is_some_and(|d| matches!(d, DataType::Datetime(TimeUnit::Nanoseconds, _)))
         {
-            return Some(format!("toString({column}, 'UTC')"));
+            return Some(format!("toUnixTimestamp64Nano({column})"));
         }
         // in arrays (any deep), as their nanoseconds since the epoch
         if !matches!(backend, BackendKind::Adbc { .. }) && t.starts_with("array(") {
@@ -866,6 +890,17 @@ fn column_conversion(
     // `NLS_CALENDAR` (a live connection's may be another).
     if dialect == DialectName::Oracle {
         let t = db_type.trim().to_ascii_lowercase();
+        // `NUMBER(p, -s)`: drivers fail on a negative scale; its values are integers
+        if t.starts_with("number(")
+            && let Some(DataType::Int64 | DataType::Decimal(_, 0)) = declared_dtype(dialect, &t)
+            && t.contains('-')
+        {
+            let digits = match declared_dtype(dialect, &t) {
+                Some(DataType::Decimal(p, _)) => p,
+                _ => 18,
+            };
+            return Some(format!("CAST({column} AS NUMBER({digits}, 0))"));
+        }
         if t.starts_with("timestamp") {
             let precision = super::schema::oracle_timestamp_precision(&t);
             let utc = if t.contains("local time zone") {
@@ -887,28 +922,63 @@ fn column_conversion(
             }
         }
     }
-    // A Postgres `time` may be `24:00:00`, which isn't a time of day: Arrow drivers read it
-    // as NULL or `00:00:00`. It fails the read instead, naming the column (the text isn't
-    // a valid time; the `CASE` evaluates it only then). In a `time[]`, any element.
+    // Postgres values Polars can't hold fail the read, naming the column (the message
+    // isn't a valid value of the type; the `CASE` evaluates it only then):
+    // - a `time` may be `24:00:00`, which isn't a time of day: Arrow drivers read it as NULL
+    //   or `00:00:00`. In a `time[]`, any element (`ANY` looks at every dimension).
+    // - `±infinity` dates and timestamps: psycopg2 reads them as `date.max` / `date.min`
+    //   (ADBC checks them itself).
+    // - a multi-dimensional array: ADBC flattens it (other drivers fail).
     if matches!(dialect, DialectName::Postgresql | DialectName::Redshift) {
-        let msg = dialect.quote_str(&format!(
-            "column {column} holds 24:00:00, which is not a time of day"
-        ));
-        let fail = format!("CAST({msg} || LEFT(CAST({column} AS TEXT), 0) AS TIME)");
-        match declared_dtype(dialect, db_type) {
-            Some(DataType::Time) => {
-                return Some(format!(
-                    "CASE WHEN {column} = TIME '24:00:00' THEN {fail} ELSE {column} END"
-                ));
-            },
-            // `ANY` looks at every element, of every dimension
-            Some(DataType::List(inner)) if *inner == DataType::Time => {
-                return Some(format!(
-                    "CASE WHEN TIME '24:00:00' = ANY({column}) THEN ARRAY[{fail}] \
-                    ELSE {column} END"
-                ));
-            },
-            _ => {},
+        let fail = |what: &str| {
+            let msg = dialect.quote_str(&format!("column {column} holds {what}"));
+            format!("CAST({msg} || LEFT(CAST({column} AS TEXT), 0) AS {db_type})")
+        };
+        let declared = declared_dtype(dialect, db_type);
+        let element = match &declared {
+            Some(DataType::List(inner)) => Some(inner.as_ref()),
+            _ => None,
+        };
+        let mut checks = vec![];
+        if declared == Some(DataType::Time) {
+            checks.push((
+                format!("{column} = TIME '24:00:00'"),
+                fail("24:00:00, which is not a time of day"),
+            ));
+        }
+        if element == Some(&DataType::Time) {
+            checks.push((
+                format!("TIME '24:00:00' = ANY({column})"),
+                fail("24:00:00, which is not a time of day"),
+            ));
+        }
+        let postgres = dialect == DialectName::Postgresql;
+        if postgres && !matches!(backend, BackendKind::Adbc { .. }) {
+            let t = db_type.trim().to_ascii_lowercase();
+            let base = t.trim_end_matches("[]");
+            if base == "date" || base.starts_with("timestamp") {
+                let infinite = if t.ends_with("[]") {
+                    format!("EXISTS (SELECT FROM unnest({column}) pl_x WHERE NOT isfinite(pl_x))")
+                } else {
+                    format!("NOT isfinite({column})")
+                };
+                checks.push((infinite, fail("infinity, which Polars can't represent")));
+            }
+        }
+        if postgres && matches!(backend, BackendKind::Adbc { .. }) && db_type.trim().ends_with("[]")
+        {
+            checks.push((
+                format!("array_ndims({column}) > 1"),
+                fail("a multi-dimensional array; read it as text, or unnest it in a query"),
+            ));
+        }
+        if !checks.is_empty() {
+            let whens = checks
+                .iter()
+                .map(|(when, then)| format!("WHEN {when} THEN {then}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Some(format!("CASE {whens} ELSE {column} END"));
         }
     }
     if dialect == DialectName::Duckdb
@@ -1234,11 +1304,27 @@ fn converted_select_list(
     info: &CatalogInfo,
 ) -> Option<Vec<SqlSelectItem>> {
     let mut any = false;
-    let items = info
-        .types
+    // DuckDB tables have no declared types (they are typed by their values), but some
+    // columns are still selected through a conversion (`text_conversion`)
+    let types = if info.types.is_empty() && dialect == DialectName::Duckdb {
+        info.compare_order
+            .iter()
+            .filter_map(|n| Some((n.clone(), info.compare_types.get(n)?.clone())))
+            .collect()
+    } else {
+        info.types.clone()
+    };
+    let items = types
         .iter()
         .map(|(name, t)| {
-            match column_conversion(dialect, backend, setup_runs, t, &dialect.quote_ident(name)) {
+            let quoted = dialect.quote_ident(name);
+            let conversion = if info.types.is_empty() {
+                // only what changes the type: the value checks are the read's
+                dialect.text_conversion(t, &quoted)
+            } else {
+                column_conversion(dialect, backend, setup_runs, t, &quoted)
+            };
+            match conversion {
                 Some(sql) => {
                     any = true;
                     SqlSelectItem::Expr {
@@ -1807,6 +1893,13 @@ fn compile_unwrapped(
     })
 }
 
+/// Whether a query returns the same rows, and changes nothing, each time it runs: it may
+/// change something (a function sqlglot doesn't know, which may write) only where the
+/// session refuses a write.
+fn repeatable(facts: &QueryFacts, read_only_session: bool) -> bool {
+    facts.repeatable && (!facts.side_effects || read_only_session)
+}
+
 /// Whether the source returns the same rows each time it runs. A query that can't be
 /// inspected is taken to be repeatable, as when it is partitioned.
 fn query_repeatable(config: &DatabaseScanConfig) -> bool {
@@ -1814,7 +1907,17 @@ fn query_repeatable(config: &DatabaseScanConfig) -> bool {
         DatabaseRelation::Table { .. } => true,
         DatabaseRelation::Query { sql } => sql_renderer()
             .and_then(|r| r.inspect_query(sql, config.dialect))
-            .map_or(true, |f| !f.parses || f.repeatable),
+            .map_or(true, |f| {
+                !f.parses
+                    || repeatable(
+                        &f,
+                        read_only_session(
+                            config.dialect,
+                            &config.backend.kind,
+                            config.options.connection.is_live(),
+                        ),
+                    )
+            }),
     }
 }
 

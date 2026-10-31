@@ -931,6 +931,29 @@ def test_mysql_tls_check_rejects_a_plain_connection() -> None:
         ("sqlite", "SELECT datetime(), date()", False),
         ("sqlite", "SELECT julianday('now')", False),
         ("sqlite", "SELECT unixepoch(ts) FROM t", True),
+        # 'now' typed by what it meets is a time; one-argument age() is relative to today
+        ("postgres", "SELECT extract(epoch FROM ts - 'now') FROM t", False),
+        (
+            "postgres",
+            "SELECT date_trunc('day', 'now'), greatest(ts, 'now') FROM t",
+            False,
+        ),
+        ("postgres", "SELECT coalesce(ts, 'now') FROM t", False),
+        ("postgres", "SELECT age(ts) FROM t", False),
+        ("postgres", "SELECT age(a, b) FROM t", True),
+        (
+            "postgres",
+            "SELECT 'now' AS label, s || 'now' FROM t WHERE s LIKE 'now%'",
+            True,
+        ),
+        # rows numbered or picked in no set order
+        ("postgres", "SELECT row_number() OVER () AS rn, id FROM t", False),
+        ("postgres", "SELECT lag(x) OVER (ORDER BY ts) FROM t", False),
+        ("postgres", "SELECT DISTINCT ON (a) a, b FROM t", False),
+        ("postgres", "SELECT DISTINCT a FROM t", True),
+        ("duckdb", "SELECT any_value(a), first(b) FROM t GROUP BY c", False),
+        ("clickhouse", "SELECT any(a), anyLast(b) FROM t", False),
+        ("clickhouse", "SELECT rowNumberInAllBlocks(), id FROM t", False),
     ],
 )
 def test_volatile_functions_make_a_query_not_repeatable(

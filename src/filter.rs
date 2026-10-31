@@ -493,6 +493,16 @@ impl Translator<'_> {
         if strings.empty_is_null && pat.is_empty() {
             return None;
         }
+        // Postgres rejects `LIKE` on a nondeterministic collation, which an unknown one
+        // (a query's column) may be: compared byte-wise instead, as `COLLATE "C"`.
+        let column = if self.dialect() == DialectName::Postgresql && !strings.equality_exact {
+            SqlExpr::Raw(format!(
+                "{} COLLATE \"C\"",
+                self.dialect().quote_ident(name)
+            ))
+        } else {
+            SqlExpr::col(name.clone())
+        };
         let pattern = format!("{prefix}{}{suffix}", self.escape_like(pat));
         let class = if strings.equality_exact && !self.dialect().like_case_insensitive() {
             Class::Exact
@@ -501,7 +511,7 @@ impl Translator<'_> {
         };
         Some((
             SqlExpr::Like {
-                expr: Box::new(SqlExpr::col(name.clone())),
+                expr: Box::new(column),
                 pattern,
                 escape: '\\',
             },

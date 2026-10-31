@@ -338,7 +338,8 @@ def _close_live_connections() -> Iterator[None]:
 def _scan(name: str, driver: str, source: str = "edge", **kwargs: Any) -> pl.LazyFrame:
     server = SERVERS[name]
     uri = server.uri
-    assert uri is not None
+    if uri is None:
+        pytest.skip(f"no {name} URI")
     if name == "oracle" and source.isidentifier() and source.islower():
         # the shared tables are created quoted lower-case; a bare name means upper case
         source = f'"{source}"'
@@ -2917,10 +2918,12 @@ def test_mysql_query_with_side_effects_runs_once(name: str) -> None:
         _execute(name, [f"DROP TABLE IF EXISTS {table}"])
         if "SUPER" not in str(e):
             raise
-        # (without one: a query that takes a second runs once)
+        # (without one: a query that takes a second runs once, given its schema)
         for driver in ["connectorx", "live"]:
             start = time.monotonic()
-            _scan(name, driver, "SELECT SLEEP(1) AS x").collect()
+            _scan(
+                name, driver, "SELECT SLEEP(1) AS x", schema={"x": pl.Int64}
+            ).collect()
             assert time.monotonic() - start < 1.9, driver
         return
     server = SERVERS[name]
@@ -2936,41 +2939,38 @@ def test_mysql_query_with_side_effects_runs_once(name: str) -> None:
 
         expected = 0
         for source, kw in [(server.uri, {"driver": "connectorx"}), (live, {})]:
-            # MariaDB evaluates `(SELECT f() LIMIT 1)` under a LIMIT 0 too
-            limited = "SELECT rvf_once_bump() AS x LIMIT 1"
+            # MySQL may evaluate the function to find the schema: inside a CTE, and on
+            # MariaDB in a constant WHERE, a HAVING or a UNION branch, even under the
+            # query's own LIMIT 0. Refused without a schema where sessions can write.
             for query in [
                 "SELECT rvf_once_bump() AS x",
                 "SELECT rvf_once_bump() AS x UNION ALL SELECT 0",
-                *([limited] if name == "mysql" else []),
-            ]:
-                for pushdown in [True, False]:
-                    pl.scan_database(query, source, pushdown=pushdown, **kw).collect()
-                    expected += 1
-                    assert calls() == expected, (query, pushdown)
-            # inside a CTE, MySQL evaluates it even under the query's own LIMIT 0
-            for query in [
+                "SELECT 1 AS x FROM DUAL WHERE rvf_once_bump() > 0",
                 "WITH c AS (SELECT rvf_once_bump() AS x) SELECT x FROM c",
                 "SELECT * FROM (SELECT rvf_once_bump() AS x) d",
                 "(SELECT rvf_once_bump() AS x LIMIT 1)",
-                *([limited] if name == "mariadb" else []),
+                "SELECT rvf_once_bump() AS x LIMIT 1",
             ]:
                 with pytest.raises(
-                    pl.exceptions.InvalidOperationError,
-                    match="inside a CTE or a subquery",
+                    pl.exceptions.InvalidOperationError, match="schema="
                 ):
                     pl.scan_database(query, source, **kw).collect()
                 assert calls() == expected
-            cte = "WITH c AS (SELECT rvf_once_bump() AS x) SELECT x FROM c"
-            df = pl.scan_database(cte, source, schema={"x": pl.Int64}, **kw).collect()
-            assert df.height == 1
-            expected += 1
-            assert calls() == expected
+                for pushdown in [True, False]:
+                    pl.scan_database(
+                        query, source, schema={"x": pl.Int64}, pushdown=pushdown, **kw
+                    ).collect()
+                    expected += 1
+                    assert calls() == expected, (query, pushdown)
         if name == "mariadb":
             cur.execute("DROP SEQUENCE IF EXISTS rvf_once_seq")
             cur.execute("CREATE SEQUENCE rvf_once_seq START WITH 1 NOCACHE")
             for source, kw in [(server.uri, {"driver": "connectorx"}), (live, {})]:
                 v = pl.scan_database(
-                    "SELECT NEXTVAL(rvf_once_seq) AS v", source, **kw
+                    "SELECT NEXTVAL(rvf_once_seq) AS v",
+                    source,
+                    schema={"v": pl.Int64},
+                    **kw,
                 ).collect()
                 cur.execute("SELECT next_not_cached_value FROM rvf_once_seq")
                 assert cur.fetchone()[0] == v.item() + 1
@@ -3287,3 +3287,347 @@ def test_mysql_time_is_a_duration(name: str) -> None:
                 ), driver
     finally:
         _execute(name, [f"DROP TABLE IF EXISTS {table}"])
+
+
+@needs_postgres
+@pytest.mark.parametrize("driver", ["psycopg2", "psycopg", "pg8000", "connectorx"])
+def test_postgres_infinity_is_an_error(driver: str) -> None:
+    # psycopg2 read ±infinity as date.max / date.min (ADBC checks them itself)
+    table = f"rvc_pg_inf_{driver}"
+    arrays = driver != "connectorx"
+    _execute(
+        "postgres17",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id int, d date, ts timestamp, tz timestamptz"
+            + (", da date[])" if arrays else ")"),
+            f"INSERT INTO {table} (id, d, ts, tz) VALUES "
+            "(1, '9999-12-31', '2024-01-01', '2024-01-01 00:00:00+00'), (2, NULL, NULL, NULL)",
+        ],
+    )
+    try:
+        for source in [table, f"SELECT * FROM {table}"]:
+            assert _scan("postgres17", driver, source).collect().height == 2
+        columns = {"d": "'-infinity'", "ts": "'infinity'", "tz": "'-infinity'"}
+        if arrays:
+            columns["da"] = "'{2024-01-01,infinity}'"
+        for i, (column, value) in enumerate(columns.items(), start=3):
+            _execute(
+                "postgres17",
+                [f"INSERT INTO {table} (id, {column}) VALUES ({i}, {value})"],
+            )
+        for column in columns:
+            for source in [table, f"SELECT id, {column} FROM {table}"]:
+                with pytest.raises(
+                    pl.exceptions.PolarsError, match=f'column "{column}" holds infinity'
+                ):
+                    _scan("postgres17", driver, source).select(column).collect()
+    finally:
+        _execute("postgres17", [f"DROP TABLE IF EXISTS {table}"])
+
+
+@needs_postgres
+def test_postgres_multidimensional_array_is_an_error_on_adbc() -> None:
+    # ADBC flattened {{1,2},{3,4}} to [1, 2, 3, 4]
+    table = "rvc_pg_ndims"
+    _execute(
+        "postgres17",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id int, a int[])",
+            f"INSERT INTO {table} VALUES (1, '{{1,2}}'), (2, '[0:1]={{5,6}}'), (3, NULL)",
+        ],
+    )
+    try:
+        for source in [table, f"SELECT * FROM {table}"]:
+            df = _scan("postgres17", "adbc", source).collect().sort("id")
+            assert df["a"].to_list() == [[1, 2], [5, 6], None]
+        _execute(
+            "postgres17", [f"INSERT INTO {table} VALUES (4, '{{{{1,2}},{{3,4}}}}')"]
+        )
+        for source in [table, f"SELECT * FROM {table}"]:
+            with pytest.raises(
+                pl.exceptions.PolarsError, match='column "a" holds a multi-dimensional'
+            ):
+                _scan("postgres17", "adbc", source).collect()
+    finally:
+        _execute("postgres17", [f"DROP TABLE IF EXISTS {table}"])
+
+
+@needs_clickhouse
+def test_clickhouse_nanoseconds_before_1900() -> None:
+    # read through their text, they were clamped to 1900-01-01, or a second late
+    table = "rvc_ch_ns_1900"
+    stored = [-2208988800123456789, -3000000000250000000, 1]
+    _execute(
+        "clickhouse",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id Int32, t DateTime64(9, 'UTC')) "
+            "ENGINE = MergeTree ORDER BY id",
+            f"INSERT INTO {table} SELECT number, fromUnixTimestamp64Nano(toInt64(v), 'UTC') "
+            f"FROM (SELECT arrayJoin(arrayEnumerate({stored})) - 1 AS number, "
+            f"{stored}[number + 1] AS v)",
+        ],
+    )
+    try:
+        for driver in ["adbc", "clickhouse_connect", "connectorx"]:
+            for source in [table, f"SELECT * FROM {table}"]:
+                df = _scan("clickhouse", driver, source).collect().sort("id")
+                assert df["t"].dt.epoch("ns").to_list() == stored, (driver, source)
+    finally:
+        _execute("clickhouse", [f"DROP TABLE IF EXISTS {table}"])
+
+
+@pytest.mark.skipif(SERVERS["oracle"].uri is None, reason="no Oracle URI")
+@ORACLE_GROUP
+def test_oracle_float_and_negative_scale_numbers() -> None:
+    # NUMBER(p, -s) failed; FLOAT (a decimal NUMBER) is read as the nearest Float64
+    _execute(
+        "oracle",
+        [
+            "BEGIN EXECUTE IMMEDIATE 'DROP TABLE rvc_or_num'; "
+            "EXCEPTION WHEN OTHERS THEN NULL; END;",
+            "CREATE TABLE rvc_or_num (id NUMBER(9), f FLOAT, neg NUMBER(10, -2), "
+            "wide NUMBER(30, -10))",
+            "INSERT INTO rvc_or_num VALUES (1, 9007199254740993, 123456789012, "
+            "1234567890123456789012345678900000000000)",
+            "INSERT INTO rvc_or_num VALUES (2, 0.5, NULL, NULL)",
+        ],
+    )
+    try:
+        # (a query's columns are probed as the driver reads them: NUMBER(p, -s) fails)
+        for source in ["RVC_OR_NUM", "SELECT ID, F FROM rvc_or_num"]:
+            lf = _scan("oracle", "oracledb", source)
+            assert lf.select("ID").collect().height == 2
+            df = lf.collect().sort("ID")
+            assert df["F"].to_list() == [9007199254740992.0, 0.5]
+            if source == "RVC_OR_NUM":
+                assert df["NEG"].to_list() == [123456789000, None]
+                assert df["WIDE"].to_list() == [
+                    "1234567890123456789012345678900000000000",
+                    None,
+                ]
+    finally:
+        _execute("oracle", ["DROP TABLE rvc_or_num"])
+
+
+@needs_postgres
+def test_postgres_query_with_a_writing_function_runs_once() -> None:
+    # a count (tail) and partition bounds ran it twice where sessions aren't read-only
+    pytest.importorskip("connectorx")
+    _execute(
+        "postgres17",
+        [
+            "DROP TABLE IF EXISTS rvc_pg_log",
+            "DROP TABLE IF EXISTS rvc_pg_src",
+            "CREATE TABLE rvc_pg_log (n int)",
+            "CREATE TABLE rvc_pg_src AS SELECT g AS id FROM generate_series(1, 5) g",
+            "CREATE OR REPLACE FUNCTION rvc_pg_logged(i int) RETURNS int LANGUAGE sql "
+            "VOLATILE AS $$ INSERT INTO rvc_pg_log VALUES (i); SELECT i $$",
+        ],
+    )
+    import psycopg
+
+    assert POSTGRES is not None
+    query = "SELECT id, rvc_pg_logged(id) AS f FROM rvc_pg_src"
+    try:
+        with psycopg.connect(POSTGRES, autocommit=True) as conn:
+
+            def logged() -> int:
+                n = conn.execute("SELECT count(*) FROM rvc_pg_log").fetchone()
+                conn.execute("DELETE FROM rvc_pg_log")
+                return int(n[0])  # type: ignore[index]
+
+            assert (
+                _scan("postgres17", "connectorx", query).tail(2).collect().height == 2
+            )
+            assert logged() == 5
+            with pytest.raises(
+                pl.exceptions.InvalidOperationError, match="partitioned"
+            ):
+                _scan(
+                    "postgres17",
+                    "connectorx",
+                    query,
+                    partition_on="id",
+                    partition_num=2,
+                ).collect()
+            assert logged() == 0
+    finally:
+        _execute(
+            "postgres17",
+            [
+                "DROP TABLE IF EXISTS rvc_pg_log",
+                "DROP TABLE IF EXISTS rvc_pg_src",
+                "DROP FUNCTION IF EXISTS rvc_pg_logged(int)",
+            ],
+        )
+
+
+@needs_postgres
+def test_postgres_like_on_a_nondeterministic_collation() -> None:
+    # Postgres rejects LIKE there: the whole scan failed
+    _execute(
+        "postgres17",
+        [
+            "DROP TABLE IF EXISTS rvc_pg_nd",
+            "DROP COLLATION IF EXISTS rvc_pg_ci",
+            "CREATE COLLATION rvc_pg_ci (provider = icu, locale = 'und-u-ks-level2', "
+            "deterministic = false)",
+            "CREATE TABLE rvc_pg_nd (id int, s text COLLATE rvc_pg_ci)",
+            "INSERT INTO rvc_pg_nd VALUES (1, 'abc'), (2, 'ABD'), (3, 'xa')",
+        ],
+    )
+    try:
+        lf = _scan("postgres17", "adbc", "rvc_pg_nd")
+        for p in [
+            pl.col("s").str.starts_with("a"),
+            pl.col("s").str.ends_with("a"),
+            pl.col("s").str.contains("b", literal=True),
+        ]:
+            assert lf.filter(p).collect().sort("id")["id"].to_list() == (
+                lf.collect().filter(p).sort("id")["id"].to_list()
+            )
+    finally:
+        _execute(
+            "postgres17",
+            ["DROP TABLE IF EXISTS rvc_pg_nd", "DROP COLLATION IF EXISTS rvc_pg_ci"],
+        )
+
+
+@pytest.mark.skipif(SERVERS["mariadb"].uri is None, reason="no MariaDB URI")
+def test_mariadb_query_with_a_function_is_not_probed_on_writable_sessions() -> None:
+    # MariaDB runs a constant WHERE, a HAVING or a UNION branch under LIMIT 0: the
+    # schema probe ran the function, and the read again
+    lf = _scan(
+        "mariadb", "live", "SELECT id FROM edge WHERE rvc_unknown_fn() = 1"
+    ).select("id")
+    with pytest.raises(pl.exceptions.InvalidOperationError, match="schema="):
+        lf.collect()
+
+
+@needs_postgres
+@pytest.mark.parametrize("driver", ["psycopg", "psycopg2"])
+def test_sqlalchemy_autocommit_connection_after_a_statement(driver: str) -> None:
+    # SQLAlchemy says it is in a transaction under AUTOCOMMIT: a SAVEPOINT failed
+    sa = pytest.importorskip("sqlalchemy")
+    pytest.importorskip(driver)
+    assert POSTGRES is not None
+    engine = sa.create_engine(
+        POSTGRES.replace("postgresql://", f"postgresql+{driver}://"),
+        isolation_level="AUTOCOMMIT",
+    )
+    try:
+        with engine.connect() as conn:
+            conn.exec_driver_sql("SELECT 1")
+            assert pl.scan_database("SELECT 1 AS x", conn).collect()["x"].item() == 1
+    finally:
+        engine.dispose()
+
+
+@needs_postgres
+def test_live_adbc_connection_is_refused() -> None:
+    # its autocommit is off: the scan left a transaction open, and a failed statement
+    # aborted the user's
+    dbapi = pytest.importorskip("adbc_driver_postgresql.dbapi")
+    assert POSTGRES is not None
+    with dbapi.connect(POSTGRES) as conn:
+        with pytest.raises(pl.exceptions.ComputeError, match="live ADBC connection"):
+            pl.scan_database("SELECT 1 AS x", conn).collect()
+        # a function opening ADBC connections plans the database's dialect
+        lf = pl.scan_database("edge", lambda: dbapi.connect(POSTGRES))
+        assert lf.collect_schema()["id"].is_integer()
+
+
+@pytest.mark.skipif(SERVERS["mysql"].uri is None, reason="no MySQL URI")
+def test_factory_connection_returns_to_its_pool_as_it_was() -> None:
+    # a pool that doesn't reset sessions got its connection back READ ONLY, in UTC
+    pooling = pytest.importorskip("mysql.connector.pooling")
+    uri = urlsplit(SERVERS["mysql"].uri)
+    pool = pooling.MySQLConnectionPool(
+        pool_name="rvc_pool",
+        pool_size=1,
+        pool_reset_session=False,
+        host=uri.hostname,
+        port=uri.port,
+        user=uri.username,
+        password=uri.password,
+        database=uri.path.lstrip("/"),
+    )
+    conn = pool.get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT @@SESSION.time_zone, @@SESSION.transaction_read_only")
+    before = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    assert pl.scan_database("edge", pool.get_connection).collect().height > 0
+    conn = pool.get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT @@SESSION.time_zone, @@SESSION.transaction_read_only")
+    assert cursor.fetchall() == before
+    cursor.close()
+    conn.close()
+
+
+@needs_postgres
+def test_engine_raw_connection_as_a_factory() -> None:
+    sa = pytest.importorskip("sqlalchemy")
+    pytest.importorskip("psycopg")
+    assert POSTGRES is not None
+    engine = sa.create_engine(
+        POSTGRES.replace("postgresql://", "postgresql+psycopg://")
+    )
+    try:
+        assert pl.scan_database("edge", engine.raw_connection).collect().height > 0
+        with engine.connect() as conn:
+            assert conn.exec_driver_sql("SHOW transaction_read_only").scalar() == "off"
+    finally:
+        engine.dispose()
+
+
+@needs_postgres
+def test_engine_partitions_are_cancelled_on_an_early_stop() -> None:
+    # an Engine's connections had no cancel: head() waited for the slowest partition
+    sa = pytest.importorskip("sqlalchemy")
+    pytest.importorskip("psycopg")
+    _execute(
+        "postgres17",
+        [
+            "DROP VIEW IF EXISTS rvc_pg_slow_v",
+            "DROP TABLE IF EXISTS rvc_pg_slow",
+            "CREATE OR REPLACE FUNCTION rvc_pg_slow_fn(i int) RETURNS int LANGUAGE plpgsql "
+            "IMMUTABLE AS $$ BEGIN IF i > 300 THEN PERFORM pg_sleep(0.05); END IF; "
+            "RETURN i; END $$",
+            "CREATE TABLE rvc_pg_slow (id int PRIMARY KEY)",
+            "INSERT INTO rvc_pg_slow SELECT generate_series(1, 400)",
+            "CREATE VIEW rvc_pg_slow_v AS SELECT id, rvc_pg_slow_fn(id) AS v "
+            "FROM rvc_pg_slow",
+        ],
+    )
+    assert POSTGRES is not None
+    engine = sa.create_engine(
+        POSTGRES.replace("postgresql://", "postgresql+psycopg://"), pool_size=4
+    )
+    try:
+        lf = pl.scan_database(
+            "rvc_pg_slow_v",
+            engine,
+            partition_on="id",
+            partition_range=(1, 400),
+            partition_num=4,
+        )
+        start = time.perf_counter()
+        assert lf.filter(pl.col("id") <= 100).head(1).collect().height == 1
+        # the last partition alone takes 5 s
+        assert time.perf_counter() - start < 3
+    finally:
+        engine.dispose()
+        _execute(
+            "postgres17",
+            [
+                "DROP VIEW IF EXISTS rvc_pg_slow_v",
+                "DROP TABLE IF EXISTS rvc_pg_slow",
+                "DROP FUNCTION IF EXISTS rvc_pg_slow_fn(int)",
+            ],
+        )

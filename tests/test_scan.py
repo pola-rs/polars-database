@@ -1154,6 +1154,55 @@ def test_scan_duckdb_values_arrow_cant_carry(tmp_path: Path, driver: str) -> Non
         assert lf.select("id").collect().height == 7
 
 
+@pytest.mark.parametrize("driver", ["duckdb", "adbc"])
+def test_scan_duckdb_types_read_as_text(tmp_path: Path, driver: str) -> None:
+    # BIT and VARINT read as their internal bytes; an INTERVAL or UNION column failed
+    # every scan of its table, even unprojected
+    duckdb = pytest.importorskip("duckdb")
+    if driver == "adbc":
+        _skip_without_duckdb_adbc()
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE t (id INTEGER, b BIT, v VARINT, iv INTERVAL, "
+            "u UNION(n INTEGER, s VARCHAR))"
+        )
+        conn.execute(
+            "INSERT INTO t VALUES (1, '0101', "
+            "123456789012345678901234567890123456789012, INTERVAL 3 DAY, 1), "
+            "(2, '1', -1, NULL, 'x')"
+        )
+    # (a query's columns are probed as the driver reads them: an INTERVAL fails there)
+    for source in ["t"]:
+        lf = pl.scan_database(source, f"duckdb:///{path}", driver=driver)
+        assert lf.select("id").collect().height == 2
+        df = lf.collect().sort("id")
+        assert df["b"].to_list() == ["0101", "1"]
+        assert df["v"].to_list() == ["123456789012345678901234567890123456789012", "-1"]
+        assert df["iv"].to_list() == ["3 days", None]
+        assert df["u"].to_list() == ["1", "x"]
+
+
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
+def test_scan_sqlite_reals_in_a_string_column_keep_every_digit(
+    tmp_path: Path, driver: str
+) -> None:
+    # SQLite's text of a real has 15 digits (ConnectorX), ADBC's 6
+    _importorskip_sqlite_driver(driver)
+    path = tmp_path / "t.db"
+    values = ["label", 1234.5678901234567, 0.1, 2.0 / 3, 1e300, None]
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, x)")
+        conn.executemany("INSERT INTO t VALUES (?, ?)", list(enumerate(values)))
+        conn.commit()
+    for source in ["t", "SELECT * FROM t"]:
+        lf = pl.scan_database(source, f"sqlite:///{path}", driver=driver)
+        read = lf.collect().sort("id")["x"].to_list()
+        assert read[0] == "label"
+        assert read[-1] is None
+        assert [float(v) for v in read[1:-1]] == values[1:-1]
+
+
 def test_scan_duckdb_timestamptz_is_planned_in_utc(tmp_path: Path) -> None:
     # DuckDB returns TIMESTAMPTZ in the session time zone, the machine's by default
     from datetime import datetime, timezone

@@ -130,10 +130,18 @@ pub fn declared_dtype(dialect: DialectName, db_type: &str) -> Option<DataType> {
         }
         if let Some(args) = t.strip_prefix("number(").and_then(|r| r.strip_suffix(')'))
             && let Some((p, s)) = args.split_once(',')
-            && s.trim() == "0"
-            && p.trim().parse::<usize>().is_ok_and(|p| p <= 18)
+            && let (Ok(p), Ok(s)) = (p.trim().parse::<usize>(), s.trim().parse::<i64>())
+            && s <= 0
+            // `NUMBER(p, -s)` rounds to 10^s: integers of up to p + s digits (more than 38
+            // are read as text, see `text_conversion`)
+            && let digits = p + s.unsigned_abs() as usize
+            && digits <= 38
         {
-            return Some(DataType::Int64);
+            return Some(if digits <= 18 {
+                DataType::Int64
+            } else {
+                DataType::Decimal(digits, 0)
+            });
         }
     }
     // MySQL `decimal(30,15) unsigned zerofill`: the attributes don't change the values.
