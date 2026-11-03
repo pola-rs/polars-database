@@ -482,6 +482,11 @@ impl Translator<'_> {
         if !dtype.is_string() || self.binds_params() || self.mysql_without_setup() {
             return None;
         }
+        // SQLite's `LIKE` reads a value only up to its first NUL: `'a' || char(0) || 'b'
+        // LIKE '%b'` is false, which no superset class recovers.
+        if self.dialect() == DialectName::Sqlite {
+            return None;
+        }
         let pat = lit.value().extract_str()?;
         if !self.writable(&SqlLiteral::String(pat.into())) {
             return None;
@@ -645,6 +650,20 @@ impl Translator<'_> {
         }
     }
 
+    /// Whether a `Time` column may be a `TIME WITH TIME ZONE` in the database.
+    fn maybe_time_with_zone(&self, name: &str) -> bool {
+        match self.config.column(name).and_then(|c| c.db_type.as_deref()) {
+            Some(t) => {
+                let t = t.trim().to_ascii_lowercase();
+                t.starts_with("timetz") || t.contains("with time zone")
+            },
+            None => matches!(
+                self.dialect(),
+                DialectName::Postgresql | DialectName::Redshift | DialectName::Duckdb
+            ),
+        }
+    }
+
     /// The class of `column <op> literal`, from the column's type and semantics.
     fn leaf_class(&self, name: &str, dtype: &DataType, op: CmpOp) -> Option<Class> {
         match dtype {
@@ -677,6 +696,11 @@ impl Translator<'_> {
                 .dialect()
                 .temporal_comparisons_exact()
                 .then_some(Class::Exact),
+            // A `TIME WITH TIME ZONE` column is read as its local time, but the database
+            // compares it with a `TIME` literal in UTC (Postgres), or not at all (DuckDB's
+            // ordering comparisons): where the column's type is unknown on a dialect that
+            // has the type, it may be one.
+            DataType::Time if self.maybe_time_with_zone(name) => None,
             DataType::Time => self.dialect().supports_time().then_some(Class::Exact),
             // An unconstrained `numeric` / `NUMBER` is read rounded to this scale, so the
             // database compares digits Polars doesn't see.

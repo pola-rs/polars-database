@@ -108,9 +108,10 @@ def test_scan_table_drivers(
         (pl.col("amount").is_not_null() & (pl.col("amount") < 30), True),
         ((pl.col("id") < 10) | (pl.col("id") > 990), True),
         (~(pl.col("id") < 990), True),
-        (pl.col("customer").str.starts_with("c1"), True),
-        (pl.col("customer").str.ends_with("3"), True),
-        (pl.col("customer").str.contains("_", literal=True), True),
+        # not pushed on SQLite: its LIKE stops at a NUL
+        (pl.col("customer").str.starts_with("c1"), False),
+        (pl.col("customer").str.ends_with("3"), False),
+        (pl.col("customer").str.contains("_", literal=True), False),
         (pl.col("amount").ne_missing(3.0), True),
         (pl.col("amount").eq_missing(None), True),
         # not pushed: arithmetic is not in tier 1

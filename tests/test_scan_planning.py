@@ -16,7 +16,7 @@ import sqlite3
 import subprocess
 import sys
 from contextlib import closing
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -1100,3 +1100,46 @@ def test_url_parts_errors_dont_echo_the_uri() -> None:
     assert "kq7" not in str(exc.value)
     with pytest.raises(ValueError, match="several"):
         _url_parts("postgresql://u@h1:5432,h2:5433/db")
+
+
+@pytest.mark.parametrize("driver", ["sqlite3", "adbc"])
+def test_sqlite_string_filters_with_nul(tmp_path: Path, driver: str) -> None:
+    # SQLite's LIKE stops at a NUL: `'a\0b' LIKE '%b'` is false, which Polars can't
+    # filter back in
+    if driver == "adbc":
+        pytest.importorskip("adbc_driver_sqlite")
+    db = tmp_path / "nul.db"
+    with closing(sqlite3.connect(db)) as conn, conn:
+        conn.execute("CREATE TABLE t (id INTEGER, s TEXT)")
+        conn.executemany("INSERT INTO t VALUES (?, ?)", [(1, "a\0b"), (2, "ab"), (3, "c")])
+    lf = pl.scan_database("t", f"sqlite:///{db}", driver=driver)
+    df = lf.collect()
+    for predicate in (
+        pl.col("s").str.ends_with("b"),
+        pl.col("s").str.starts_with("a"),
+        pl.col("s").str.contains("b", literal=True),
+    ):
+        got = lf.filter(predicate).collect().sort("id")
+        assert got["id"].to_list() == df.filter(predicate).sort("id")["id"].to_list()
+
+
+def test_duckdb_time_with_time_zone_filters(tmp_path: Path) -> None:
+    # TIMETZ reads as its local time; DuckDB compares it with a TIME literal in UTC (and
+    # can't order it against one): such filters stay in Polars
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "tz.duckdb"
+    with duckdb.connect(str(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, t TIMETZ)")
+        conn.execute(
+            "INSERT INTO t VALUES (1, TIMETZ '12:00:00+02'), (2, TIMETZ '09:00:00+00')"
+        )
+    lf = pl.scan_database("t", f"duckdb:///{path}")
+    df = lf.collect()
+    for predicate in (
+        pl.col("t") == time(12),
+        pl.col("t") < time(11),
+        pl.col("t") >= time(10),
+    ):
+        got = lf.filter(predicate).collect().sort("id")
+        assert got["id"].to_list() == df.filter(predicate).sort("id")["id"].to_list()
+        assert "filters 0/1" in lf.filter(predicate).explain()
