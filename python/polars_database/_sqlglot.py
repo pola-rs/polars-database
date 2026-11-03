@@ -15,10 +15,13 @@ from typing import Any
 
 from polars._dependencies import import_optional
 
+# The lowest version the tests pass with (also in pyproject.toml): before 28.6, Oracle's
+# SYSTIMESTAMP isn't parsed as a volatile function, so a query on it was read as repeatable.
 sqlglot = import_optional(
     "sqlglot",
     err_prefix="scan_database needs",
-    install_message="Install it with: pip install sqlglot",
+    min_version="28.6",
+    install_message="Install it with: pip install -U sqlglot",
 )
 exp = sqlglot.exp
 
@@ -48,6 +51,22 @@ def version() -> str:
 
 def _ident(name: str) -> Any:
     return exp.to_identifier(name, quoted=True)
+
+
+# ClickHouse reads `\` as an escape in a quoted identifier too. sqlglot escapes it there
+# only from 30.22: before, a column `x\` was written `"x\"`, which reads as an escaped quote.
+_CLICKHOUSE_ESCAPES_BACKSLASH = (
+    exp.to_identifier("\\", quoted=True).sql("clickhouse") == '"\\\\"'
+)
+
+
+def _escaped_identifiers(node: Any, dialect: str | None) -> Any:
+    """`node`, its ClickHouse identifiers' backslashes escaped where sqlglot doesn't."""
+    if dialect == "clickhouse" and not _CLICKHOUSE_ESCAPES_BACKSLASH:
+        for ident in node.find_all(exp.Identifier):
+            if ident.quoted and "\\" in ident.this:
+                ident.set("this", ident.this.replace("\\", "\\\\"))
+    return node
 
 
 def _column(name: str) -> Any:
@@ -295,7 +314,7 @@ def _ordered(o: Any, d: str | None, qualify: Any = lambda e: e) -> list[Any]:
     # Written even where it is the default, which sqlglot leaves out: a session setting
     # may change the default (DuckDB's `default_null_order`, Snowflake's
     # `DEFAULT_NULL_ORDERING`)
-    sql = ordered.sql(dialect=d)
+    sql = _escaped_identifiers(ordered, d).sql(dialect=d)
     if not sql.endswith(("NULLS FIRST", "NULLS LAST")):
         sql += " NULLS FIRST" if nulls_first else " NULLS LAST"
     return [_raw(sql)]
@@ -330,7 +349,7 @@ def build(query: dict[str, Any], dialect: str | None = None) -> Any:
 def render(query_json: str, dialect: str | None) -> str:
     """Render a `SqlQuery` (as JSON) for a dialect (`None` is sqlglot's default)."""
     query = json.loads(query_json)
-    sql = str(build(query, dialect).sql(dialect=dialect))
+    sql = str(_escaped_identifiers(build(query, dialect), dialect).sql(dialect=dialect))
     from_ = query["from"]
     if "Subquery" in from_:
         sub = from_["Subquery"]

@@ -3,6 +3,9 @@ from __future__ import annotations
 import io
 import os
 import sqlite3
+import subprocess
+import sys
+import textwrap
 from contextlib import closing
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -1778,3 +1781,71 @@ def test_scan_query_that_isnt_repeatable_counts_batches_of_other_dtypes(
         "SELECT * FROM t", f"sqlite:///{path}", driver=driver, batch_size=50
     )
     assert lf.collect()["x"].dtype == pl.Float64
+
+
+@pytest.mark.parametrize("stop", ["head", "collect_batches", "held_iterator"])
+def test_scan_duckdb_stopped_early_exits_cleanly(tmp_path: Path, stop: str) -> None:
+    # The cleanup of a stopped read ran on a thread of its own and outlived `collect()`;
+    # a query of a dropped `collect_batches()` iterator runs on until it notices. Their
+    # driver calls then ran while Python finalized, which aborts the process (psycopg2,
+    # MySQL over ADBC). DuckDB's module reported the connections leaked, also after a
+    # complete read: the scan's last session was released only at pyo3's next use of the
+    # GIL. A `collect_batches()` iterator held until exit stops its query only once Python
+    # finalizes: its driver calls are skipped then (its connection is left unclosed).
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE TABLE t AS SELECT range AS id FROM range(2000000)")
+    read = {
+        "head": "assert lf.head(3).collect().height == 3",
+        "collect_batches": "for df in lf.collect_batches():\n    break",
+        "held_iterator": "it = lf.collect_batches()\nnext(it)",
+    }[stop]
+    code = (
+        textwrap.dedent(
+            f"""
+        import polars as pl
+        lf = pl.scan_database("t", {f"duckdb:///{path}"!r}, batch_size=1000)
+        assert lf.collect().height == 2000000
+        """
+        )
+        + read
+    )
+    for _ in range(3):
+        out = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+        )
+        assert out.returncode == 0, out.stderr
+        if stop != "held_iterator":
+            assert "leaked" not in out.stderr
+
+
+def test_scan_sqlalchemy_older_than_2_is_refused(
+    shop_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # On SQLAlchemy 1.4 the session setup failed (`Connection` has no `commit`), and so
+    # did bound parameters and SQLite connections used across threads
+    sa = pytest.importorskip("sqlalchemy")
+    engine = sa.create_engine(f"sqlite:///{shop_db}")
+    monkeypatch.setattr(sa, "__version__", "1.4.54")
+    try:
+        for connection, driver in (
+            (f"sqlite:///{shop_db}", "sqlalchemy"),
+            (engine, None),
+        ):
+            with pytest.raises(Exception, match=r"sqlalchemy.* 2\.0"):
+                pl.scan_database("orders", connection, driver=driver).collect()
+    finally:
+        engine.dispose()
+
+
+def test_scan_connectorx_older_than_the_minimum_is_refused(
+    shop_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ConnectorX 0.3 read decimals wider than a float's digits rounded, silently
+    cx = pytest.importorskip("connectorx")
+    from polars_database import _bridge
+
+    monkeypatch.setattr(cx, "__version__", "0.3.3")
+    with pytest.raises(Exception, match=rf"connectorx {_bridge._MIN_CONNECTORX}"):
+        pl.scan_database("orders", shop_uri, driver="connectorx").collect()

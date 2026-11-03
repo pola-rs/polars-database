@@ -374,6 +374,17 @@ fn find_adbc_driver(py: Python<'_>, name: &str) -> PyResult<Option<(String, Opti
 }
 
 /// The module name must match `module-name` of the wheel (see `pyproject.toml`).
+/// Registered with `atexit` on import: waits a moment for queries still running (a
+/// `collect_batches()` iterator dropped just before exit stops its query only when the query
+/// notices), so their sessions are closed while Python still runs; then stops every driver
+/// call of a query that runs on. Python ends a thread that takes the GIL while it finalizes,
+/// which aborts the process inside Rust frames.
+#[pyfunction]
+fn _at_exit(py: Python<'_>) {
+    py.detach(|| crate::reader::wait_for_scans(std::time::Duration::from_secs(2)));
+    bridge::EXITING.store(true, std::sync::atomic::Ordering::Release);
+}
+
 #[pymodule]
 fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Plans may be deserialized and run in a process that never called `scan_resolver`.
@@ -388,5 +399,6 @@ fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(driver_statuses, m)?)?;
     m.add_function(wrap_pyfunction!(dialect_from_scheme, m)?)?;
     m.add_function(wrap_pyfunction!(find_adbc_driver, m)?)?;
+    m.add_function(wrap_pyfunction!(_at_exit, m)?)?;
     Ok(())
 }

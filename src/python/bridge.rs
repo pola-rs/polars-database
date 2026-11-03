@@ -11,6 +11,7 @@
 
 use std::ffi::CString;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use polars_arrow::ffi::ArrowArrayStream;
 use polars_core::frame::DataFrame;
@@ -57,6 +58,52 @@ pub(crate) fn take_stream(capsule: &Bound<'_, PyAny>) -> PyResult<Box<ArrowArray
             ArrowArrayStream::empty(),
         ))
     })
+}
+
+/// Set at interpreter exit (`_at_exit`), after the scans still running had time to end: the
+/// driver calls of a query that runs on (a dropped `collect_batches()` iterator held until
+/// exit) are skipped from then on. Python ends a thread that takes the GIL while it finalizes,
+/// which aborts the process inside Rust frames.
+pub(crate) static EXITING: AtomicBool = AtomicBool::new(false);
+
+fn exiting() -> bool {
+    EXITING.load(Ordering::Acquire)
+}
+
+fn exiting_err() -> polars_error::PolarsError {
+    polars_err!(ComputeError: "the database read was stopped: Python is exiting")
+}
+
+/// A Python object released with the GIL. A `Py` dropped without it is only queued for pyo3's
+/// next use of the GIL, which may not come: a scan's last session (a closed connection, the
+/// user's live one) stayed referenced until the next scan, or to the end of the process,
+/// where DuckDB's module reported it leaked.
+struct Released(Option<Py<PyAny>>);
+
+impl Released {
+    fn new(obj: Py<PyAny>) -> Self {
+        Self(Some(obj))
+    }
+}
+
+impl std::ops::Deref for Released {
+    type Target = Py<PyAny>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap()
+    }
+}
+
+impl Drop for Released {
+    fn drop(&mut self) {
+        if let Some(obj) = self.0.take() {
+            if exiting() {
+                std::mem::forget(obj);
+            } else {
+                Python::attach(|py| drop(obj.into_bound(py)));
+            }
+        }
+    }
 }
 
 struct NoOwner;
@@ -194,7 +241,7 @@ impl PythonDriverBridge for PyDriverBridge {
             )?;
             let can_cancel: bool = session.getattr("can_cancel")?.extract()?;
             PyResult::Ok(Box::new(PySession {
-                session: Arc::new(session.unbind()),
+                session: Arc::new(Released::new(session.unbind())),
                 can_cancel,
                 batch_size,
                 secrets: secrets.clone(),
@@ -229,7 +276,7 @@ impl PythonDriverBridge for PyDriverBridge {
                 ),
             )?;
             PyResult::Ok(Box::new(PyAdbcSession {
-                session: Arc::new(session.unbind()),
+                session: Arc::new(Released::new(session.unbind())),
                 dialect,
             }) as Box<dyn DatabaseSession>)
         })
@@ -254,7 +301,7 @@ impl PythonDriverBridge for PyDriverBridge {
 
 /// A session of a Python backend.
 struct PySession {
-    session: Arc<Py<PyAny>>,
+    session: Arc<Released>,
     can_cancel: bool,
     batch_size: Option<usize>,
     /// Scrubbed from driver errors.
@@ -263,18 +310,24 @@ struct PySession {
 
 impl DatabaseSession for PySession {
     fn execute(&mut self, sql: &str, batch_size: Option<usize>) -> PolarsResult<BatchIter> {
+        if exiting() {
+            return Err(exiting_err());
+        }
         let iter = Python::attach(|py| {
             self.session
                 .call_method1(py, "execute", (sql, batch_size.or(self.batch_size)))
         })
         .map_err(|e| scrubbed_err(e, &self.secrets))?;
         Ok(Box::new(PyBatches {
-            iter: Some(iter),
+            iter: Some(Released::new(iter)),
             secrets: self.secrets.clone(),
         }))
     }
 
     fn execute_update(&mut self, sql: &str) -> PolarsResult<()> {
+        if exiting() {
+            return Err(exiting_err());
+        }
         Python::attach(|py| self.session.call_method1(py, "execute_update", (sql,)))
             .map_err(|e| scrubbed_err(e, &self.secrets))?;
         Ok(())
@@ -286,6 +339,9 @@ impl DatabaseSession for PySession {
         }
         let session = self.session.clone();
         Some(Arc::new(move || {
+            if exiting() {
+                return Ok(());
+            }
             Python::attach(|py| session.call_method0(py, "cancel"))
                 .map_err(err)
                 .map(|_| ())
@@ -295,6 +351,9 @@ impl DatabaseSession for PySession {
 
 impl Drop for PySession {
     fn drop(&mut self) {
+        if exiting() {
+            return;
+        }
         Python::attach(|py| {
             if let Err(e) = self.session.call_method0(py, "close") {
                 if polars_core::config::verbose() {
@@ -307,7 +366,7 @@ impl Drop for PySession {
 
 /// Batches from a Python iterator of DataFrames.
 struct PyBatches {
-    iter: Option<Py<PyAny>>,
+    iter: Option<Released>,
     secrets: Arc<[String]>,
 }
 
@@ -316,6 +375,10 @@ impl Iterator for PyBatches {
 
     fn next(&mut self) -> Option<Self::Item> {
         let iter = self.iter.as_ref()?;
+        if exiting() {
+            self.iter = None;
+            return Some(Err(exiting_err()));
+        }
         let out = Python::attach(|py| {
             let builtins = py.import("builtins")?;
             let sentinel = py.None();
@@ -339,17 +402,9 @@ impl Iterator for PyBatches {
     }
 }
 
-impl Drop for PyBatches {
-    fn drop(&mut self) {
-        if let Some(iter) = self.iter.take() {
-            Python::attach(|py| drop(iter.into_bound(py)));
-        }
-    }
-}
-
 /// An ADBC connection opened through Python's `adbc_driver_manager`.
 struct PyAdbcSession {
-    session: Arc<Py<PyAny>>,
+    session: Arc<Released>,
     dialect: DialectName,
 }
 
@@ -358,6 +413,9 @@ impl DatabaseSession for PyAdbcSession {
         let hint = batch_size
             .and_then(|n| adbc::batch_size_option(self.dialect, n))
             .map(|(k, v)| (k.to_string_lossy().into_owned(), v));
+        if exiting() {
+            return Err(exiting_err());
+        }
         let (stream, stmt) = Python::attach(|py| {
             let out = self.session.call_method1(py, "execute", (sql, hint))?;
             let (capsule, stmt): (Bound<'_, PyAny>, Py<PyAny>) = out.extract(py)?;
@@ -375,6 +433,9 @@ impl DatabaseSession for PyAdbcSession {
     }
 
     fn execute_update(&mut self, sql: &str) -> PolarsResult<()> {
+        if exiting() {
+            return Err(exiting_err());
+        }
         Python::attach(|py| self.session.call_method1(py, "execute_update", (sql,)))
             .map_err(err)?;
         Ok(())
@@ -383,6 +444,9 @@ impl DatabaseSession for PyAdbcSession {
     fn cancel_handle(&self) -> Option<CancelHandle> {
         let session = self.session.clone();
         Some(Arc::new(move || {
+            if exiting() {
+                return Ok(());
+            }
             Python::attach(|py| session.call_method0(py, "cancel"))
                 .map_err(err)
                 .map(|_| ())
@@ -392,6 +456,9 @@ impl DatabaseSession for PyAdbcSession {
 
 impl Drop for PyAdbcSession {
     fn drop(&mut self) {
+        if exiting() {
+            return;
+        }
         Python::attach(|py| {
             if let Err(e) = self.session.call_method0(py, "close") {
                 if polars_core::config::verbose() {
@@ -404,7 +471,7 @@ impl Drop for PyAdbcSession {
 
 /// The statement of a result stream; closed after the stream is released.
 struct PyAdbcStatement {
-    session: Arc<Py<PyAny>>,
+    session: Arc<Released>,
     stmt: Option<Py<PyAny>>,
 }
 
@@ -415,6 +482,10 @@ impl Drop for PyAdbcStatement {
         let Some(stmt) = self.stmt.take() else {
             return;
         };
+        if exiting() {
+            std::mem::forget(stmt);
+            return;
+        }
         Python::attach(|py| {
             if let Err(e) = self.session.call_method1(py, "release", (stmt,)) {
                 if polars_core::config::verbose() {

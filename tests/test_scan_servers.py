@@ -26,6 +26,8 @@ import contextlib
 import functools
 import importlib.util
 import os
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, date
@@ -3603,6 +3605,58 @@ def test_engine_raw_connection_as_a_factory() -> None:
         engine.dispose()
 
 
+_EARLY_STOP_SOURCES = {
+    "postgres17": "SELECT g AS id FROM generate_series(1, 5000000) g",
+    "mysql": "SELECT a.id + b.id * 1000 AS id FROM edge a CROSS JOIN edge b CROSS JOIN edge c",
+}
+
+
+@pytest.mark.parametrize(
+    ("server", "driver"),
+    [
+        ("postgres17", "psycopg2"),
+        ("postgres17", "sqlalchemy"),
+        ("mysql", "adbc"),
+        ("mysql", "pymysql"),
+    ],
+)
+@pytest.mark.parametrize("stop", ["head", "collect_batches"])
+def test_stopped_early_exits_cleanly(server: str, driver: str, stop: str) -> None:
+    # The cleanup of a stopped read ran on a thread of its own after `collect()`
+    # returned, and a dropped `collect_batches()` iterator's query runs on until it
+    # notices: their driver calls during Python's finalization aborted the process on
+    # Python <= 3.13 (psycopg2 4 runs in 5, SQLAlchemy over psycopg2 and MySQL over ADBC
+    # 5 in 5).
+    uri = SERVERS[server].uri
+    if uri is None:
+        pytest.skip(f"no {server} URI")
+    if driver == "adbc":
+        import polars_database
+
+        if polars_database.find_adbc_driver(server) is None:
+            pytest.skip(f"no ADBC driver for {server}")
+    elif driver == "sqlalchemy":
+        pytest.importorskip("sqlalchemy")
+        pytest.importorskip("psycopg2")
+        uri = uri.replace("postgresql://", "postgresql+psycopg2://")
+    else:
+        pytest.importorskip(driver)
+    read = {
+        "head": "assert lf.head(3).collect().height == 3",
+        "collect_batches": "for df in lf.collect_batches():\n    break",
+    }[stop]
+    code = (
+        "import polars as pl\n"
+        f"lf = pl.scan_database({_EARLY_STOP_SOURCES[server]!r}, {uri!r}, "
+        f"driver={driver!r}, batch_size=1000)\n"
+    ) + read
+    for _ in range(3):
+        out = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+        )
+        assert out.returncode == 0, out.stderr
+
+
 @needs_postgres
 def test_engine_partitions_are_cancelled_on_an_early_stop() -> None:
     # an Engine's connections had no cancel: head() waited for the slowest partition
@@ -3638,13 +3692,9 @@ def test_engine_partitions_are_cancelled_on_an_early_stop() -> None:
         assert lf.filter(pl.col("id") <= 100).head(1).collect().height == 1
         # the last partition alone takes 5 s
         assert time.perf_counter() - start < 3
-        # The cancelled partitions give their connections back after `collect()`
-        # returned, from the threads that drop them. Disposed before that, the Engine
-        # lets them go unclosed: their ResourceWarnings then failed a later test of the
-        # same worker.
-        deadline = time.perf_counter() + 10
-        while engine.pool.checkedout() and time.perf_counter() < deadline:
-            time.sleep(0.05)
+        # The cancelled partitions gave their connections back after `collect()`
+        # returned, from threads of their own: an Engine disposed then let them go
+        # unclosed. They are back before it returns.
         assert engine.pool.checkedout() == 0
     finally:
         engine.dispose()

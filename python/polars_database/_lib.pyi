@@ -5,6 +5,7 @@ __version__: str
 _polars_io_plugin_ids: tuple[str, ...]
 
 def _capsule(id: str) -> Any: ...
+def _at_exit() -> None: ...
 def scan_resolver(
     source: str,
     source_type: str | None,

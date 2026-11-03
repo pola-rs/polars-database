@@ -36,10 +36,20 @@ use crate::ffi::{
 /// Prefix of serialized builders, so that a change of the format fails clearly.
 const SERDE_MAGIC: &[u8] = b"PLDBRB1";
 
-/// Runs a driver call that may block (a cancel, closing a session) on its own thread, without
-/// waiting for it.
-fn run_detached(f: impl FnOnce() + Send + 'static) {
-    std::thread::spawn(f);
+/// The scan executions whose state ([`Shared`]) is alive in this process: their sessions may
+/// still be read, stopped or closed.
+static LIVE_SCANS: Mutex<usize> = Mutex::new(0);
+static LIVE_SCANS_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Waits up to `timeout` for every scan execution to end, its sessions closed; whether they
+/// did. A query can outlive the call that started it: `collect_batches()` runs on until it
+/// notices that its iterator was dropped, and its readers then stop their statements.
+pub fn wait_for_scans(timeout: std::time::Duration) -> bool {
+    let live = LIVE_SCANS.lock().unwrap();
+    let (live, _) = LIVE_SCANS_CHANGED
+        .wait_timeout_while(live, timeout, |n| *n > 0)
+        .unwrap();
+    *live == 0
 }
 
 /// The plan of a resolved scan: its config, with the SQL of every partition.
@@ -176,6 +186,17 @@ pub struct Shared {
 }
 
 impl Shared {
+    fn new(config: Arc<DatabaseScanConfig>) -> Self {
+        *LIVE_SCANS.lock().unwrap() += 1;
+        Self {
+            config,
+            backend: OnceLock::new(),
+            pool: Mutex::new(Pool::default()),
+            pool_changed: std::sync::Condvar::new(),
+            aborted: AtomicBool::new(false),
+        }
+    }
+
     fn open_new(&self) -> PolarsResult<Box<dyn DatabaseSession>> {
         let backend = self.backend()?;
         open_session_with_retries(
@@ -247,6 +268,16 @@ impl Shared {
             self.pool.lock().unwrap().idle.push(s);
             self.pool_changed.notify_all();
         }
+    }
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // Closed before the scan counts as ended (`wait_for_scans`).
+        drop(std::mem::take(&mut self.pool.get_mut().unwrap().idle));
+        drop(self.backend.take());
+        *LIVE_SCANS.lock().unwrap() -= 1;
+        LIVE_SCANS_CHANGED.notify_all();
     }
 }
 
@@ -326,7 +357,8 @@ impl PartitionReader {
         // Back to the pool: holding it until this partition is read would let readers that
         // are counted out of order (a negative slice counts from the end) take every
         // session while the partition that is read next waits. A failed session may be in
-        // any state: it is closed, as is one whose statement was cancelled.
+        // any state: it is closed, as is one whose statement was cancelled. Closed here,
+        // before the count returns (see `PartitionStream::drop`).
         let cancelled = {
             let mut cancel = self.cancel.lock().unwrap();
             *cancel = None;
@@ -335,7 +367,7 @@ impl PartitionReader {
         if r.is_ok() && !cancelled {
             self.shared.release(session);
         } else {
-            run_detached(move || drop(session));
+            drop(session);
         }
         let n = r.map_err(|e| out_of_range_date_hint(e).context(self.context().into()))?;
         *self.n_rows.lock().unwrap() = Some(n);
@@ -665,23 +697,24 @@ impl Drop for PartitionStream {
         } else {
             // Released before the end: stop the statement, so the database doesn't keep
             // working for nobody. A cancelled or failed session may be in any state: it is
-            // closed, not reused. Cancelling and closing may block.
-            let running = batches.is_some();
-            let stop = move || {
-                if running && let Some(cancel) = cancel {
-                    let _ = cancel();
-                }
-                drop(batches);
-                drop(session);
-            };
-            if self.shared.config.options.connection.is_live() {
-                // The user's connection: its cursor is closed and the scan's transaction
-                // rolled back before the read returns, or they would race the user's
-                // next statements on it.
-                stop();
-            } else {
-                run_detached(stop);
+            // closed, not reused.
+            //
+            // Both are done here, before the stream's release returns, even though they may
+            // block: the host releases the stream on the blocking thread that read it, and
+            // its query waits for that thread. Left to a thread of its own, the cleanup
+            // outlived `collect()`: a pooled connection went back to the user's pool late,
+            // and driver calls made while Python finalized aborted the process (psycopg2,
+            // MySQL over ADBC). The statement is cancelled first, so that closing it doesn't
+            // wait for the rest of its result.
+            if batches.is_some()
+                && let Some(cancel) = cancel
+                && let Err(e) = cancel()
+                && polars_core::config::verbose()
+            {
+                eprintln!("[scan_database]: cancelling a statement failed: {e}");
             }
+            drop(batches);
+            drop(session);
         }
     }
 }
@@ -754,13 +787,7 @@ unsafe extern "C" fn scan_new(h: BuilderHandle) -> FfiResult<ScanHandle> {
         polars_ensure_compiled(&config)?;
         Ok(ScanHandle(into_handle(Arc::new(Scan {
             schema: b.schema.clone(),
-            shared: Arc::new(Shared {
-                config,
-                backend: OnceLock::new(),
-                pool: Mutex::new(Pool::default()),
-                pool_changed: std::sync::Condvar::new(),
-                aborted: AtomicBool::new(false),
-            }),
+            shared: Arc::new(Shared::new(config)),
         }))))
     })
 }

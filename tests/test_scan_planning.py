@@ -1242,6 +1242,42 @@ def test_user_schema_floats_and_decimals_are_not_compared(dtype: Any) -> None:
     assert "filters 1/1" in lf.filter(pl.col("id") > 1).explain()
 
 
+def test_clickhouse_identifiers_escape_backslashes() -> None:
+    # sqlglot escapes `\` in ClickHouse's quoted identifiers only from 30.22: a column
+    # `x\` was written `"x\"`, which ClickHouse reads as an escaped quote
+    from polars_database import _sqlglot
+
+    column = {"Column": "x\\"}
+    query = {
+        "columns": [column],
+        "from": {"Table": ["t\\"]},
+        "filter": [{"Binary": [column, "Eq", {"Literal": {"Int": 1}}]}],
+        "order_by": [{"expr": column, "descending": False}],
+        "limit": None,
+        "qualified": [],
+    }
+    sql = _sqlglot.render(json.dumps(query), "clickhouse")
+    assert sql.count('"x\\\\"') == 3, sql
+    assert '"t\\\\"' in sql, sql
+    assert '"x\\"' not in sql.replace('"x\\\\"', ""), sql
+
+
+def test_sqlglot_older_than_the_minimum_is_refused() -> None:
+    # pyproject.toml asks for sqlglot >= 28.6; an older one (installed without its
+    # dependencies' resolution) read Oracle's SYSTIMESTAMP as repeatable
+    code = (
+        "import sqlglot\n"
+        "sqlglot.__version__ = '28.5.0'\n"
+        "import polars_database._sqlglot\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=False
+    )
+    assert out.returncode != 0
+    assert "ModuleUpgradeRequiredError" in out.stderr, out.stderr
+    assert "28.6" in out.stderr, out.stderr
+
+
 @pytest.mark.parametrize(
     ("value", "sql"),
     [

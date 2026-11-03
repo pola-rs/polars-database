@@ -9,6 +9,7 @@ for Python drivers and streams results back as DataFrames. Query execution reuse
 from __future__ import annotations
 
 import contextlib
+import functools
 import importlib.util
 import itertools
 import os
@@ -145,6 +146,17 @@ def connection_info(obj: Any, kind: str) -> tuple[str, str]:
     return _connection_info(obj)
 
 
+def _require_sqlalchemy() -> None:
+    """
+    SQLAlchemy 2.0 or later: sessions use its 2.0 `Connection` API (`commit()`,
+    `exec_driver_sql` options). On 1.4 the session setup failed (no `commit`), and bound
+    parameters and SQLite connections across threads didn't work.
+    """
+    from polars._dependencies import import_optional
+
+    import_optional("sqlalchemy", err_prefix="scan_database needs", min_version="2.0")
+
+
 def _connection_info(obj: Any) -> tuple[str, str]:
     module = _module_of(obj)
     if module == "adbc_driver_manager":
@@ -153,6 +165,7 @@ def _connection_info(obj: Any) -> tuple[str, str]:
             vendor = str(obj.adbc_get_info().get("vendor_name", "")).lower()
             return _ADBC_VENDORS.get(vendor, ""), module
     if module == "sqlalchemy":
+        _require_sqlalchemy()
         engine = getattr(obj, "engine", None) or getattr(obj, "bind", None)
         dialect = getattr(getattr(engine, "dialect", None), "name", "") or ""
         return dialect, "sqlalchemy"
@@ -381,6 +394,17 @@ def _sqlite_connect_args(uri: str) -> tuple[str, dict[str, Any]]:
     return path, kw
 
 
+@functools.cache
+def _sqlalchemy_decodes_sqlite_paths() -> bool:
+    """
+    Whether SQLAlchemy percent-decodes a SQLite URI's path: 2.1 does, 2.0 takes it as
+    written (`sqlite:///a%20b.db` opened, and created, a file `a%20b.db`).
+    """
+    from sqlalchemy.engine import make_url
+
+    return make_url("sqlite:///a%20b.db").database == "a b.db"
+
+
 def _sqlalchemy_sqlite_uri(uri: str) -> str:
     """
     A `sqlite:` URI in SQLAlchemy's form, for the file the other backends open.
@@ -401,8 +425,8 @@ def _sqlalchemy_sqlite_uri(uri: str) -> str:
         path, _, file_query = path.partition("?")
         query = {**dict(parse_qsl(file_query, keep_blank_values=True)), **query}
         query["uri"] = "true"
-    # SQLAlchemy decodes the path
-    path = quote(path, safe="/:\\")
+    if _sqlalchemy_decodes_sqlite_paths():
+        path = quote(path, safe="/:\\")
     return f"{scheme}:///{path}" + (f"?{urlencode(query)}" if query else "")
 
 
@@ -2012,6 +2036,9 @@ def _close_for_real(conn: Any) -> None:
         (inner if inner is not None else conn).close()
 
 
+# the oldest ConnectorX the tests pass with (also in Polars' `database` extra)
+_MIN_CONNECTORX = "0.4.6"
+
 # (URI, protocol) pairs ConnectorX has connected to in this process
 _CONNECTORX_CHECKED: set[tuple[str, str | None]] = set()
 _CONNECTORX_CHECKED_LOCK = threading.Lock()
@@ -2023,6 +2050,14 @@ class _ConnectorXSession:
     can_cancel = False
 
     def __init__(self, uri: str, dialect: str, protocol: str | None = None) -> None:
+        from polars._dependencies import import_optional
+
+        # ConnectorX 0.3 read decimals wider than a float's digits rounded, silently
+        import_optional(
+            "connectorx",
+            err_prefix="scan_database needs",
+            min_version=_MIN_CONNECTORX,
+        )
         self.uri = uri
         self.dialect = dialect
         self.protocol = protocol
@@ -2379,6 +2414,7 @@ def _open(
             protocol=connect_opts.get("protocol"),
         )
     if head == "sqlalchemy":
+        _require_sqlalchemy()
         from sqlalchemy import create_engine
 
         if dialect == "sqlite":
