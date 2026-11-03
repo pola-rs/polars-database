@@ -68,6 +68,9 @@ pub struct ConnectionSpec {
     /// driver keyword arguments aren't always strings.
     #[cfg(feature = "python")]
     pub python_options: Option<Arc<PythonObject>>,
+    /// A stable identity of `python_options` (as `query_params_key`): their string forms in
+    /// `connect_options` / `execute_options` don't tell `1` from `"1"`.
+    pub python_options_key: Option<PlSmallStr>,
 }
 
 impl ConnectionSpec {
@@ -83,6 +86,7 @@ impl ConnectionSpec {
             query_params_key: None,
             #[cfg(feature = "python")]
             python_options: None,
+            python_options_key: None,
         }
     }
 
@@ -181,6 +185,7 @@ impl ConnectionSpec {
             .map(|p| Arc::as_ptr(p) as usize)
             .hash(state);
         self.query_params_key.hash(state);
+        self.python_options_key.hash(state);
     }
 
     /// The secrets in the connection as given: the URI's password and the values of

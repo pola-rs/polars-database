@@ -215,6 +215,13 @@ fn scan_resolver<'py>(
         },
         None => (None, None),
     };
+    let (python_options_key, python_options) = match python_options {
+        Some(p) => {
+            let (key, p) = params_key(p.into_bound(py))?;
+            (Some(key), Some(Arc::new(PythonObject(p.unbind()))))
+        },
+        None => (None, None),
+    };
     let target = match connection_kind {
         "uri" => ConnectionTarget::Uri(connection.extract::<String>(py)?.into()),
         "odbc" => ConnectionTarget::Odbc(connection.extract::<String>(py)?.into()),
@@ -235,7 +242,8 @@ fn scan_resolver<'py>(
         credential_provider: credential_provider.map(|p| Arc::new(PythonObject(p))),
         query_params_key,
         query_params,
-        python_options: python_options.map(|p| Arc::new(PythonObject(p))),
+        python_options,
+        python_options_key,
     };
 
     let source_type = source_type.filter(|s| *s != "auto");

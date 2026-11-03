@@ -362,8 +362,10 @@ impl Translator<'_> {
         // string literals too
         let placeholder =
             self.binds_params() && (s.contains('%') || (self.sqlalchemy() && s.contains(':')));
-        // the renderer writes `\\` and NUL (`\0`) as backslash escapes
-        let escape = self.mysql_without_setup() && (s.contains('\\') || s.contains('\0'));
+        // the renderer (sqlglot) writes `\\` and control characters (NUL, `\n`, `\t`, `\r`, `\b`,
+        // `\x1a`, and more in older versions) as backslash escapes
+        let escape =
+            self.mysql_without_setup() && s.chars().any(|c| c == '\\' || c.is_ascii_control());
         let nul = s.contains('\0')
             && !matches!(
                 self.dialect(),

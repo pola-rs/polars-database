@@ -640,6 +640,21 @@ def test_params_change_the_scan(numbers_db: str) -> None:
     assert out.item() == 12
 
 
+def test_typed_driver_options_change_the_scan(numbers_db: str) -> None:
+    # the string forms of `False` and `"False"` (truthy) are the same: the scans differ by
+    # the values the driver gets
+    def scan(value: Any) -> pl.LazyFrame:
+        return pl.scan_database(
+            "n",
+            numbers_db,
+            driver="sqlite3",
+            connect_options={"check_same_thread": value},
+        )
+
+    assert "CACHE" in scan(False).join(scan(False), on="id").explain()
+    assert "CACHE" not in scan(False).join(scan("False"), on="id").explain()
+
+
 def test_snapshot_consistency_with_partitions(numbers_db: str) -> None:
     pytest.importorskip("adbc_driver_sqlite")
     lf = pl.scan_database(

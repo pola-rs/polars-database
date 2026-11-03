@@ -2157,13 +2157,15 @@ def test_postgres_uuid_from_row_drivers(driver: str) -> None:
 
 @pytest.mark.skipif(SERVERS["mysql"].uri is None, reason="no MySQL URI")
 def test_mysql_nul_literal_without_backslash_escapes() -> None:
-    # NUL is written as `\0`, which NO_BACKSLASH_ESCAPES reads as backslash, zero
+    # NUL is written as `\0`, which NO_BACKSLASH_ESCAPES reads as backslash, zero; so are
+    # the other control characters sqlglot escapes (`\n`, `\t`, `\r`, `\b`, `\Z`)
     _execute(
         "mysql",
         [
             "DROP TABLE IF EXISTS review_nul",
             "CREATE TABLE review_nul (id int, s varchar(10) COLLATE utf8mb4_bin)",
-            "INSERT INTO review_nul VALUES (1, 'a\\0b'), (2, 'a'), (3, 'a\\\\0b')",
+            "INSERT INTO review_nul VALUES (1, 'a\\0b'), (2, 'a'), (3, 'a\\\\0b'), "
+            "(4, 'a\\nb'), (5, 'a\\tb'), (6, 'a\\Zb'), (7, 'a\\\\nb')",
         ],
     )
     assert SERVERS["mysql"].uri is not None
@@ -2180,6 +2182,10 @@ def test_mysql_nul_literal_without_backslash_escapes() -> None:
                 pl.col("s") == "a\0b",
                 pl.col("s").is_in(["a\0b"]),
                 pl.col("s") == "a\\0b",
+                pl.col("s") == "a\nb",
+                pl.col("s") != "a\nb",
+                pl.col("s").is_in(["a\tb", "a\x1ab"]),
+                pl.col("s") == "a\\nb",
             ],
         )
     finally:

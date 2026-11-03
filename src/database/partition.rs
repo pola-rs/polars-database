@@ -38,10 +38,17 @@ pub fn nulls_sort_first(dialect: DialectName) -> bool {
     }
 }
 
+/// Whether an ascending `ORDER BY` puts NaN before every number (right after NULLs, where
+/// those come first): BigQuery. Elsewhere NaN is the greatest value, or can't be stored.
+pub fn nans_sort_first(dialect: DialectName) -> bool {
+    dialect == DialectName::Bigquery
+}
+
 /// Equal-width half-open ranges over `[lo, hi]`. The first and last partitions are open-ended,
 /// so rows outside the bounds are never lost. NULLs go to the first partition if `nulls_first`
 /// (where an ascending `ORDER BY` puts them first, so partitions read in order stay sorted),
-/// to the last one otherwise.
+/// to the last one otherwise. NaNs that fail every comparison go to the first partition if
+/// `nans_first`, to the last one otherwise.
 pub fn range_partitions(
     column: &PlSmallStr,
     lo: f64,
@@ -49,6 +56,7 @@ pub fn range_partitions(
     n: usize,
     kind: RangeKind,
     nulls_first: bool,
+    nans_first: bool,
 ) -> Vec<Partition> {
     let n = n.max(1);
     // Infinite bounds (a float column holding ±inf) give no usable cuts.
@@ -100,10 +108,11 @@ pub fn range_partitions(
         if i == if nulls_first { 0 } else { cuts.len() } {
             pred = SqlExpr::binary(pred, SqlBinOp::Or, SqlExpr::IsNull(Box::new(col()), false));
         }
-        if i == cuts.len() && matches!(kind, RangeKind::Float) {
+        if i == if nans_first { 0 } else { cuts.len() } && matches!(kind, RangeKind::Float) {
             // NaN fails every comparison where it follows IEEE (ClickHouse, BigQuery,
-            // Trino): `x <> x` keeps it. Where NaN is the greatest value, `>=` already
-            // keeps it in this last partition and `x <> x` is false.
+            // Trino): `x <> x` keeps it, in the partition its sort order puts it in. Where
+            // NaN is the greatest value, `>=` already keeps it in the last partition and
+            // `x <> x` is false.
             pred = SqlExpr::binary(
                 pred,
                 SqlBinOp::Or,
@@ -207,7 +216,7 @@ mod tests {
 
     #[test]
     fn ranges_cover_everything() {
-        let p = range_partitions(&"id".into(), 0.0, 100.0, 4, RangeKind::Int, false);
+        let p = range_partitions(&"id".into(), 0.0, 100.0, 4, RangeKind::Int, false, false);
         assert_eq!(p.len(), 4);
         // First is open below, last is open above and takes NULLs.
         assert!(matches!(
@@ -219,12 +228,12 @@ mod tests {
             Some(SqlExpr::Binary(_, SqlBinOp::Or, _))
         ));
         assert_eq!(
-            range_partitions(&"id".into(), 5.0, 5.0, 4, RangeKind::Int, false).len(),
+            range_partitions(&"id".into(), 5.0, 5.0, 4, RangeKind::Int, false, false).len(),
             1
         );
         // Fewer distinct integer cuts than requested partitions.
         assert_eq!(
-            range_partitions(&"id".into(), 0.0, 2.0, 8, RangeKind::Int, false).len(),
+            range_partitions(&"id".into(), 0.0, 2.0, 8, RangeKind::Int, false, false).len(),
             3
         );
     }
@@ -242,18 +251,42 @@ mod tests {
 
     #[test]
     fn nulls_follow_the_sort_order() {
-        let last = range_partitions(&"id".into(), 0.0, 100.0, 4, RangeKind::Int, false);
+        let last = range_partitions(&"id".into(), 0.0, 100.0, 4, RangeKind::Int, false, false);
         assert_eq!(
             last.iter().map(takes_nulls).collect::<Vec<_>>(),
             [false, false, false, true]
         );
-        let first = range_partitions(&"id".into(), 0.0, 100.0, 4, RangeKind::Int, true);
+        let first = range_partitions(&"id".into(), 0.0, 100.0, 4, RangeKind::Int, true, false);
         assert_eq!(
             first.iter().map(takes_nulls).collect::<Vec<_>>(),
             [true, false, false, false]
         );
         assert!(nulls_sort_first(DialectName::Mysql));
         assert!(!nulls_sort_first(DialectName::Postgresql));
+    }
+
+    #[test]
+    fn nans_follow_the_sort_order() {
+        fn takes_nans(p: &Partition) -> bool {
+            fn walk(e: &SqlExpr) -> bool {
+                match e {
+                    SqlExpr::Binary(l, SqlBinOp::NotEq, r) => l == r,
+                    SqlExpr::Binary(l, SqlBinOp::Or, r) => walk(l) || walk(r),
+                    _ => false,
+                }
+            }
+            p.predicate.as_ref().is_some_and(walk)
+        }
+        let f = |nans_first| {
+            range_partitions(&"f".into(), 0.0, 1.0, 3, RangeKind::Float, true, nans_first)
+                .iter()
+                .map(takes_nans)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(f(false), [false, false, true]);
+        assert_eq!(f(true), [true, false, false]);
+        assert!(nans_sort_first(DialectName::Bigquery));
+        assert!(!nans_sort_first(DialectName::Clickhouse));
     }
 
     #[test]
@@ -269,7 +302,7 @@ mod tests {
             }
         }
         let mut cuts = vec![];
-        let parts = range_partitions(&"y".into(), 0.0, 2155.0, 40, RangeKind::Year, true);
+        let parts = range_partitions(&"y".into(), 0.0, 2155.0, 40, RangeKind::Year, true, false);
         for p in &parts {
             ints_in(p.predicate.as_ref().unwrap(), &mut cuts);
         }
@@ -299,7 +332,7 @@ mod tests {
         }
         let cut_texts = |lo: f64, hi: f64| -> Vec<String> {
             let mut out = vec![];
-            for p in range_partitions(&"d".into(), lo, hi, 4, RangeKind::Date, false) {
+            for p in range_partitions(&"d".into(), lo, hi, 4, RangeKind::Date, false, false) {
                 dates_in(p.predicate.as_ref().unwrap(), &mut out);
             }
             out
