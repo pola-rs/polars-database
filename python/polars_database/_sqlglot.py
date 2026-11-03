@@ -81,6 +81,12 @@ def _string(text: str, dialect: str | None) -> Any:
     return exp.Literal.string(text)
 
 
+def _number(text: str) -> Any:
+    # the text as written: `exp.Literal.number` makes a negative number a `Neg` node,
+    # which sqlglot writes through a 28-digit `Decimal` (rounding wider ones)
+    return exp.Literal(this=text, is_string=False)
+
+
 def _literal(v: Any, dialect: str | None) -> Any:
     if v == "Null":
         return exp.Null()
@@ -88,15 +94,21 @@ def _literal(v: Any, dialect: str | None) -> Any:
     if kind == "Bool":
         return exp.Boolean(this=x)
     if kind == "Int":
-        return exp.Literal.number(int(x))
+        return _number(str(int(x)))
     if kind == "Float":
-        return exp.Literal.number(repr(float(x)))
+        return _number(repr(float(x)))
     if kind == "Decimal":
         if dialect == "clickhouse":
             # a bare literal is parsed as a float, which overflows for wide decimals
             scale = len(x.partition(".")[2])
             return _cast(x, f"Decimal(38, {scale})")
-        return exp.Literal.number(x)
+        if dialect == "bigquery":
+            # a bare `1.5` is a FLOAT64, which a NUMERIC column would be compared as;
+            # NUMERIC holds 29 integer and 9 fractional digits, BIGNUMERIC 38 of each
+            whole, _, frac = x.lstrip("-").partition(".")
+            fits = len(frac) <= 9 and len(whole.lstrip("0")) <= 29
+            return _raw(f"{'NUMERIC' if fits else 'BIGNUMERIC'} '{x}'")
+        return _number(x)
     if kind == "String":
         return _string(x, dialect)
     if kind == "Date":

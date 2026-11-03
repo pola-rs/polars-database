@@ -135,9 +135,10 @@ def test_sql_snapshot_details() -> None:
     assert "'it''s'" in plans["postgresql"]["str_quote"]["sql"]
     assert "'a\\\\b'" in plans["mysql"]["str_backslash"]["sql"]
     assert "DATE '2026-01-01'" in plans["oracle"]["date_cmp"]["sql"]
-    assert "[[]x]" in plans["mssql"]["like_contains"]["sql"] or (
-        "\\[x]" in plans["mssql"]["like_contains"]["sql"]
-    )
+    # LIKE under an unknown collation: a superset only where it matches per character
+    # (MySQL) or compares `COLLATE "C"` (Postgres)
+    assert "filters 0/1" in plans["mssql"]["like_contains"]["pushed"]
+    assert "filters 1/1 (0 exact)" in plans["mysql"]["like_contains"]["pushed"]
     # SQL Server lists are kept short: a long IN becomes a BETWEEN superset
     assert "BETWEEN 0 AND 4999" in plans["mssql"]["is_in_long"]["sql"]
     assert "(0 exact)" in plans["mssql"]["is_in_long"]["pushed"]
@@ -153,9 +154,11 @@ def test_sql_snapshot_details() -> None:
     assert "filters 0/1" in plans["mysql"]["int_cmp"]["pushed"]
     assert "filters 1/1" in plans["mysql"]["not_exact"]["pushed"]
     assert "filters 0/1" in plans["sqlite"]["str_eq"]["pushed"]
-    # floats: pushed only where comparisons agree with Polars (total order NaN)
+    # floats and decimals: with `schema=` their columns may be of another numeric type
+    # (`real`, `numeric`), which the database compares as the values it holds
     assert "filters 0/1" in plans["bigquery"]["float_cmp"]["pushed"]
-    assert "filters 1/1 (1 exact)" in plans["postgresql"]["float_cmp"]["pushed"]
+    assert "filters 0/1" in plans["postgresql"]["float_cmp"]["pushed"]
+    assert "filters 0/1" in plans["postgresql"]["decimal_cmp"]["pushed"]
     # Oracle: '' is NULL, so an empty-string literal isn't pushed
     assert "filters 0/1" in plans["oracle"]["str_empty"]["pushed"]
     # arithmetic is not tier 1
@@ -170,6 +173,13 @@ def test_sql_snapshot_details() -> None:
         ("mssql", "WITH a AS (SELECT 1 AS x) SELECT x FROM a", "CTE"),
         ("mssql", "SELECT x FROM t ORDER BY x", "ORDER BY"),
         ("postgresql", "SELECT x, x FROM t", "duplicate"),
+        # Trino drops the ORDER BY of a derived table without LIMIT, and the others
+        # aren't known to keep it
+        ("trino", "SELECT x FROM t ORDER BY x DESC", "ORDER BY"),
+        ("snowflake", "SELECT x FROM t ORDER BY x", "ORDER BY"),
+        ("bigquery", "SELECT x FROM t ORDER BY x", "ORDER BY"),
+        ("databricks", "SELECT x FROM t ORDER BY x", "ORDER BY"),
+        ("redshift", "SELECT x FROM t ORDER BY x", "ORDER BY"),
     ],
 )
 def test_query_wrapping_falls_back(dialect: str, query: str, reason: str) -> None:
@@ -180,6 +190,26 @@ def test_query_wrapping_falls_back(dialect: str, query: str, reason: str) -> Non
     assert "pushdown: off" in plan
     assert reason in plan
     assert f"sql[0]: {query}" in plan
+
+
+@pytest.mark.parametrize(
+    ("dialect", "query"),
+    [
+        # kept inside a derived table (checked on the servers)
+        ("postgresql", "SELECT x FROM t ORDER BY x"),
+        ("oracle", "SELECT x FROM t ORDER BY x"),
+        ("clickhouse", "SELECT x FROM t ORDER BY x"),
+        # with a LIMIT, every database keeps it
+        ("trino", "SELECT x FROM t ORDER BY x LIMIT 5"),
+    ],
+)
+def test_query_order_by_is_wrapped_where_kept(dialect: str, query: str) -> None:
+    lf = pl.scan_database(
+        query, DIALECT_URIS[dialect], schema={"x": pl.Int64}, driver="sqlalchemy"
+    )
+    plan = lf.filter(pl.col("x") > 1).explain()
+    assert "pushdown: off" not in plan
+    assert "filters 1/1" in plan
 
 
 def test_query_wrapping() -> None:
@@ -1115,7 +1145,9 @@ def test_sqlite_string_filters_with_nul(tmp_path: Path, driver: str) -> None:
     db = tmp_path / "nul.db"
     with closing(sqlite3.connect(db)) as conn, conn:
         conn.execute("CREATE TABLE t (id INTEGER, s TEXT)")
-        conn.executemany("INSERT INTO t VALUES (?, ?)", [(1, "a\0b"), (2, "ab"), (3, "c")])
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?)", [(1, "a\0b"), (2, "ab"), (3, "c")]
+        )
     lf = pl.scan_database("t", f"sqlite:///{db}", driver=driver)
     df = lf.collect()
     for predicate in (
@@ -1147,3 +1179,87 @@ def test_duckdb_time_with_time_zone_filters(tmp_path: Path) -> None:
         got = lf.filter(predicate).collect().sort("id")
         assert got["id"].to_list() == df.filter(predicate).sort("id")["id"].to_list()
         assert "filters 0/1" in lf.filter(predicate).explain()
+
+
+def test_clickhouse_negated_in_is_not_pushed() -> None:
+    # `NULL IN (…)` is 0 under ClickHouse's `transform_null_in`: NOT would keep NULLs
+    for dialect, pushed in [
+        ("clickhouse", "filters 0/1"),
+        ("postgresql", "filters 1/1"),
+    ]:
+        lf = pl.scan_database(
+            "s.t",
+            DIALECT_URIS[dialect],
+            schema=EDGE_SCHEMA,
+            driver="sqlalchemy",
+            partition_on=None,
+        )
+        for p in [
+            ~pl.col("i64").is_in([1, 2]),
+            ~(pl.col("i64").is_in([1, 2]) & (pl.col("i16") == 1)),
+        ]:
+            assert pushed in lf.filter(p).explain(), (dialect, p)
+        # positively, 0 drops the NULL rows as NULL does
+        assert "filters 1/1 (1 exact)" in lf.filter(pl.col("i64").is_in([1])).explain()
+
+
+@pytest.mark.parametrize(
+    ("dialect", "pushed"),
+    [
+        # per character (MySQL), or compared `COLLATE "C"` (Postgres)
+        ("mysql", "filters 1/1 (0 exact)"),
+        ("postgresql", "filters 1/1 (0 exact)"),
+        # a collation may match by its collation elements (Czech `ch`)
+        ("oracle", "filters 0/1"),
+        ("mssql", "filters 0/1"),
+        ("snowflake", "filters 0/1"),
+    ],
+)
+def test_like_under_an_unknown_collation(dialect: str, pushed: str) -> None:
+    lf = pl.scan_database(
+        "s.t",
+        DIALECT_URIS[dialect],
+        schema=EDGE_SCHEMA,
+        driver="sqlalchemy",
+        partition_on=None,
+    )
+    assert pushed in lf.filter(pl.col("s").str.starts_with("c")).explain()
+
+
+@pytest.mark.parametrize("dtype", [pl.Float64, pl.Float32, pl.Decimal(20, 4)])
+def test_user_schema_floats_and_decimals_are_not_compared(dtype: Any) -> None:
+    # `schema=` doesn't say the column's type: a Float64 over `real` or `numeric` is
+    # compared by the database as the value it holds, not the one Polars reads
+    lf = pl.scan_database(
+        "t",
+        DIALECT_URIS["postgresql"],
+        schema={"id": pl.Int64, "x": dtype},
+        driver="sqlalchemy",
+        partition_on=None,
+    )
+    plan = lf.filter(pl.col("x") > 1).explain()
+    assert "filters 0/1" in plan
+    assert "filters 1/1" in lf.filter(pl.col("id") > 1).explain()
+
+
+@pytest.mark.parametrize(
+    ("value", "sql"),
+    [
+        ("1.50", "NUMERIC '1.50'"),
+        (
+            "-12345678901234567890123456789.123456789",
+            "NUMERIC '-12345678901234567890123456789.123456789'",
+        ),
+        ("0.1234567890", "BIGNUMERIC '0.1234567890'"),
+        (
+            "123456789012345678901234567890",
+            "BIGNUMERIC '123456789012345678901234567890'",
+        ),
+    ],
+)
+def test_bigquery_decimal_literals_are_typed(value: str, sql: str) -> None:
+    # a bare `1.50` is a FLOAT64 on BigQuery
+    from polars_database import _sqlglot
+
+    assert _sqlglot._literal({"Decimal": value}, "bigquery").sql("bigquery") == sql
+    assert _sqlglot._literal({"Decimal": value}, "postgres").sql("postgres") == value

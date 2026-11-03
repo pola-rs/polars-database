@@ -352,10 +352,36 @@ impl DialectName {
         matches!(self, Self::Sqlite)
     }
 
+    /// Whether the database keeps the `ORDER BY` (without `LIMIT`) of a query inside a
+    /// derived table, so that a wrapped query returns its rows in its order: checked on
+    /// Postgres, Oracle, ClickHouse, DuckDB and SQLite. `None` for MySQL, whose MariaDB
+    /// servers drop it. Trino documents that it drops it; SQL Server refuses it; the others
+    /// aren't known to keep it.
+    pub fn keeps_derived_table_order(self) -> Option<bool> {
+        match self {
+            Self::Postgresql | Self::Oracle | Self::Clickhouse | Self::Duckdb | Self::Sqlite => {
+                Some(true)
+            },
+            Self::Mysql => None,
+            _ => Some(false),
+        }
+    }
+
+    /// Whether `LIKE` under a collation that isn't byte-wise (case- or accent-insensitive)
+    /// still matches every value that matches byte-wise: MySQL and MariaDB match it per
+    /// character, each compared by the collation (so a contraction like Czech `ch` doesn't
+    /// count as one letter); Postgres compares such columns `COLLATE "C"` (see the
+    /// filter). Elsewhere a collation with contractions may match fewer values.
+    pub fn like_matches_per_character(self) -> bool {
+        matches!(self, Self::Mysql | Self::Singlestore | Self::Postgresql)
+    }
+
     /// Whether decimal comparisons agree with Polars. SQLite has no decimal type: values
-    /// declared as decimals are stored as text or floats.
+    /// declared as decimals are stored as text or floats. A bare decimal literal's type is
+    /// the database's to choose (BigQuery reads `1.5` as `FLOAT64`; the renderer writes
+    /// typed literals there): unknown for Generic and FlightSQL.
     pub fn decimal_comparisons_exact(self) -> bool {
-        !matches!(self, Self::Sqlite)
+        !matches!(self, Self::Sqlite | Self::Generic | Self::Flightsql)
     }
 
     /// Whether a `TIME` type (and literal) exists.
@@ -408,7 +434,7 @@ impl DialectName {
         match self {
             // Deterministic default collations; ordering depends on the collation (only "C"
             // matches byte order), which schema discovery refines per column.
-            Self::Postgresql | Self::Redshift => StringSemantics {
+            Self::Postgresql => StringSemantics {
                 equality_exact: true,
                 ordering_exact: false,
                 empty_is_null: false,
@@ -434,9 +460,12 @@ impl DialectName {
             return self.default_string_semantics();
         };
         match self {
+            // Redshift's `CASE_INSENSITIVE` collations (of a column, or a database's
+            // default) don't show in `pg_collation`: unknown.
+            Self::Redshift => StringSemantics::UNKNOWN,
             // Empty: a non-deterministic collation (see the catalog query).
-            Self::Postgresql | Self::Redshift if c.is_empty() => StringSemantics::UNKNOWN,
-            Self::Postgresql | Self::Redshift => StringSemantics {
+            Self::Postgresql if c.is_empty() => StringSemantics::UNKNOWN,
+            Self::Postgresql => StringSemantics {
                 equality_exact: true,
                 ordering_exact: matches!(c.as_str(), "c" | "posix" | "ucs_basic"),
                 empty_is_null: false,
@@ -504,9 +533,17 @@ impl DialectName {
     /// Quotes a string literal for the fixed metadata queries.
     pub fn quote_str(self, s: &str) -> String {
         let mut out = s.replace('\'', "''");
+        // backslash escapes in string literals: ClickHouse, Snowflake and Databricks
+        // always, MySQL unless `NO_BACKSLASH_ESCAPES` (removed by the session setup)
         if matches!(
             self,
-            Self::Mysql | Self::Singlestore | Self::Bigquery | Self::Redshift
+            Self::Mysql
+                | Self::Singlestore
+                | Self::Bigquery
+                | Self::Redshift
+                | Self::Clickhouse
+                | Self::Snowflake
+                | Self::Databricks
         ) {
             out = out.replace('\\', "\\\\");
         }
@@ -524,6 +561,8 @@ impl DialectName {
                 format!("`{}`", s.replace('`', "``"))
             },
             Self::Mssql => format!("[{}]", s.replace(']', "]]")),
+            // ClickHouse reads backslash escapes in quoted identifiers too
+            Self::Clickhouse => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\"\"")),
             _ => format!("\"{}\"", s.replace('"', "\"\"")),
         }
     }
@@ -682,5 +721,10 @@ mod tests {
         assert_eq!(DialectName::Postgresql.quote_str("a'b\\c"), "E'a''b\\\\c'");
         assert_eq!(DialectName::Postgresql.quote_ident("a\"b"), "\"a\"\"b\"");
         assert_eq!(DialectName::Mssql.quote_ident("a]b"), "[a]]b]");
+        assert_eq!(DialectName::Clickhouse.quote_str("a'b\\c"), "'a''b\\\\c'");
+        assert_eq!(
+            DialectName::Clickhouse.quote_ident("x\\\"y"),
+            "\"x\\\\\"\"y\""
+        );
     }
 }

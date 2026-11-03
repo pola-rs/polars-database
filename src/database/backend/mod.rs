@@ -308,9 +308,13 @@ pub fn open_session(
     Ok(session)
 }
 
-/// Casts columns that are `Null` on one side to the other side's dtype, so the frames stack.
+/// Casts columns that are `Null` on one side to the other side's dtype, and numeric columns
+/// typed apart to their supertype, so the frames stack.
 fn align_null_columns(mut a: DataFrame, mut b: DataFrame) -> PolarsResult<(DataFrame, DataFrame)> {
     use polars_core::prelude::DataType;
+    use polars_core::utils::try_get_supertype;
+
+    let numeric = |d: &DataType| d.is_primitive_numeric() || d.is_decimal();
 
     if a.width() != b.width() {
         return Ok((a, b));
@@ -328,6 +332,17 @@ fn align_null_columns(mut a: DataFrame, mut b: DataFrame) -> PolarsResult<(DataF
             a.replace_column(i, c)?;
         } else if db == DataType::Null {
             let c = b.columns()[i].cast(&da)?;
+            b.replace_column(i, c)?;
+        } else if let Some(st) = numeric(&da)
+            .then(|| numeric(&db).then(|| try_get_supertype(&da, &db).ok()))
+            .flatten()
+            .flatten()
+        {
+            // Numbers typed per batch (a SQLite column of integers, then floats; a
+            // decimal's scale): both widened, as one result would be typed.
+            let c = a.columns()[i].cast(&st)?;
+            a.replace_column(i, c)?;
+            let c = b.columns()[i].cast(&st)?;
             b.replace_column(i, c)?;
         }
     }

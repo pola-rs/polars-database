@@ -18,8 +18,11 @@ use super::dialect::{DialectName, StringSemantics};
 pub struct CatalogInfo {
     /// The single-column primary (or clustered) key, if there is one.
     pub key_column: Option<PlSmallStr>,
-    /// Per-column collation names. A column that is absent uses the dialect default.
+    /// Per-column collation names. A column that is absent uses the dialect default, or,
+    /// where the lookup listed the columns (`collations_listed`), is unknown.
     pub collations: PlHashMap<PlSmallStr, Option<String>>,
+    /// The collation lookup ran and listed the table's columns.
+    pub collations_listed: bool,
     /// Declared types, e.g. `numeric(12,2)`, in column order.
     pub types: Vec<(PlSmallStr, String)>,
     /// Types that only decide how the database compares a column, not how it is read
@@ -95,6 +98,8 @@ impl CatalogInfo {
             // the dialect default; the catalog reports them as no collation.
             Some(Some(_)) if dialect == DialectName::Oracle => unknown_string_semantics(dialect),
             Some(c) => dialect.string_semantics_for_collation(c.as_deref()),
+            // a column the lookup didn't list (by another name than the one read)
+            None if self.collations_listed => unknown_string_semantics(dialect),
             None => dialect.default_string_semantics(),
         }
     }
@@ -251,6 +256,7 @@ pub fn table_info(
     if let Some(sql) = &queries.collations
         && let Some(df) = run("collations", sql)
     {
+        info.collations_listed = true;
         for row in 0..df.height() {
             if let Some(name) = cell_str(&df, 0, row) {
                 info.collations.insert(name.into(), cell_str(&df, 1, row));
@@ -489,7 +495,16 @@ pub fn query_info(
             })
             .collect::<Vec<_>>();
         if !text.is_empty() {
-            let sql = pg_select(&|c| format!("pg_collation_for({c})"), &text);
+            // (byte order is code point order only in UTF-8, see the table's lookup)
+            let sql = pg_select(
+                &|c| {
+                    format!(
+                        "CASE WHEN current_setting('server_encoding') = 'UTF8' \
+                        THEN pg_collation_for({c}) ELSE 'default' END"
+                    )
+                },
+                &text,
+            );
             match run(session, "collations", &sql) {
                 Some(df) => {
                     for (i, c) in text.into_iter().enumerate() {
@@ -602,10 +617,13 @@ impl CatalogQueries {
                     )),
                     // A non-deterministic (e.g. case-insensitive ICU) collation has no name
                     // we can classify: it is reported as empty, which reads as `UNKNOWN`.
+                    // A byte-wise collation orders by code point only in UTF-8: in another
+                    // server encoding it reads as the (deterministic) default.
                     collations: Some(if dialect == DialectName::Postgresql {
                         format!(
-                            "SELECT a.attname, CASE WHEN co.collisdeterministic THEN co.collname \
-                            ELSE '' END FROM pg_attribute a \
+                            "SELECT a.attname, CASE WHEN NOT co.collisdeterministic THEN '' \
+                            WHEN current_setting('server_encoding') <> 'UTF8' THEN 'default' \
+                            ELSE co.collname END FROM pg_attribute a \
                             JOIN pg_collation co ON co.oid = a.attcollation \
                             WHERE a.attrelid = {oid} AND a.attnum > 0 AND NOT a.attisdropped"
                         )
@@ -700,9 +718,14 @@ impl CatalogQueries {
                         s(name)
                     )),
                     // Column collations (12.2+): `BINARY` and `USING_NLS_COMP` (the session's
-                    // comparison) are the default, reported as none.
+                    // comparison) are the default, reported as none. A database character
+                    // set other than Unicode turns the characters of a literal it lacks into
+                    // `?` (the client sends UTF-8): its columns read as an unknown collation.
                     collations: Some(format!(
-                        "SELECT column_name, CASE WHEN collation IN ('BINARY', 'USING_NLS_COMP') \
+                        "SELECT column_name, CASE WHEN NVL((SELECT MAX(value) \
+                        FROM nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET'), \
+                        '-') NOT IN ('AL32UTF8', 'UTF8') THEN 'NON_UNICODE_CHARACTER_SET' \
+                        WHEN collation IN ('BINARY', 'USING_NLS_COMP') \
                         THEN NULL ELSE collation END \
                         FROM all_tab_columns WHERE owner = {owner} AND table_name = {}",
                         s(name)
@@ -745,8 +768,12 @@ impl CatalogQueries {
                         s(name),
                         s(schema)
                     )),
+                    // `BINARY` compares the bytes of the database's encoding: code point
+                    // order only in UTF-8, so a UTF-16 database reads as collated.
                     declared_sql: Some(format!(
-                        "SELECT sql FROM {}.sqlite_master WHERE type = 'table' AND name = {}",
+                        "SELECT sql || CASE WHEN (SELECT encoding FROM pragma_encoding) \
+                        <> 'UTF-8' THEN ' COLLATE' ELSE '' END \
+                        FROM {}.sqlite_master WHERE type = 'table' AND name = {}",
                         dialect.quote_ident(schema),
                         s(name)
                     )),

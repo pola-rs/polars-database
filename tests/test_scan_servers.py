@@ -3676,3 +3676,402 @@ def test_sqlalchemy_orm_session_left_outside_a_transaction() -> None:
             assert not session.in_transaction()
     finally:
         engine.dispose()
+
+
+# Round 7 review findings.
+
+
+def _connect(name: str) -> Any:
+    server = SERVERS[name]
+    if server.uri is None:
+        pytest.skip(f"no {name} URI")
+    assert server.factory is not None
+    return server.factory(server.uri)()
+
+
+@needs_clickhouse
+def test_clickhouse_negated_filters_on_nullable_columns() -> None:
+    # `NULL IN (…)` is 0 on ClickHouse, not NULL: `NOT (x IN …)` kept the NULL rows
+    pytest.importorskip("clickhouse_connect")
+    table = "r7_ch_not_in"
+    _execute(
+        "clickhouse",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id Int32, x Nullable(Int32), "
+            "s Nullable(String), b Nullable(Bool)) ENGINE = MergeTree ORDER BY id",
+            f"INSERT INTO {table} VALUES (1, 1, 'ab', true), (2, 2, 'cd', false), "
+            "(3, NULL, NULL, NULL)",
+        ],
+    )
+    try:
+        lf = _scan("clickhouse", "clickhouse_connect", table)
+        _check_filters(
+            lf,
+            [
+                ~pl.col("x").is_in([1]),
+                ~pl.col("x").is_in([1, None]),
+                ~pl.col("x").is_in([1], nulls_equal=True),
+                ~(pl.col("x").is_in([1]) | (pl.col("id") == 3)),
+                ~(pl.col("x").is_in([1]) & (pl.col("id") == 3)),
+                ~pl.col("s").is_in(["ab"]),
+                ~pl.col("s").str.starts_with("a"),
+                ~pl.col("s").str.contains("b", literal=True),
+                ~(pl.col("x") == 1),
+                ~(pl.col("x") > 1),
+                ~pl.col("x").is_between(0, 1),
+                ~pl.col("b"),
+                ~(pl.col("x").eq_missing(1)),
+                ~(pl.col("s") == "ab"),
+            ],
+        )
+    finally:
+        _execute("clickhouse", [f"DROP TABLE IF EXISTS {table}"])
+
+
+@needs_clickhouse
+def test_clickhouse_backslashes_in_names() -> None:
+    # the catalog and UTF-8 check queries didn't escape `\` in string literals, nor
+    # the fixed select lists in quoted identifiers
+    pytest.importorskip("clickhouse_connect")
+    table = "r7_ch_bs"
+    _execute(
+        "clickhouse",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id Int32, `x\\\\` Int32, `s\\\\` String, "
+            "`t\\\\` DateTime64(3, 'UTC')) ENGINE = MergeTree ORDER BY id",
+            f"INSERT INTO {table} VALUES (1, 10, 'a', 0), (2, 20, 'b', 1000)",
+        ],
+    )
+    try:
+        for source in [table, f"SELECT * FROM {table}"]:
+            lf = _scan("clickhouse", "clickhouse_connect", source)
+            assert lf.collect_schema().names() == ["id", "x\\", "s\\", "t\\"]
+            df = lf.collect().sort("id")
+            assert df["x\\"].to_list() == [10, 20]
+            assert df["s\\"].to_list() == ["a", "b"]
+            _check_filters(lf, [pl.col("x\\") > 10, pl.col("s\\") == "a"])
+    finally:
+        _execute("clickhouse", [f"DROP TABLE IF EXISTS {table}"])
+
+
+_FLOAT_DRIVERS = {"postgres17": "psycopg", "mysql": "pymysql", "mariadb": "pymysql"}
+
+
+@pytest.mark.parametrize("name", list(_FLOAT_DRIVERS))
+def test_float_literals_compare_exactly(name: str) -> None:
+    # a float literal the database reads as a decimal must compare as the double itself
+    import random
+
+    rng = random.Random(145)
+    values = [rng.random() for _ in range(200)]
+    values += [rng.uniform(-1, 1) * 10.0 ** rng.randint(-40, 40) for _ in range(200)]
+    table = "r7_floats"
+    float_type = "double precision" if name == "postgres17" else "DOUBLE"
+    conn = _connect(name)
+    try:
+        cur = conn.cursor()
+        cur.execute(f"DROP TABLE IF EXISTS {table}")
+        cur.execute(f"CREATE TABLE {table} (id int, f {float_type})")
+        cur.executemany(f"INSERT INTO {table} VALUES (%s, %s)", list(enumerate(values)))
+        conn.commit()
+    finally:
+        conn.close()
+    lf = _scan(name, _FLOAT_DRIVERS[name], table)
+    assert_frame_equal(
+        lf.collect().sort("id"),
+        pl.DataFrame({"id": range(len(values)), "f": values}),
+        check_dtypes=False,
+    )
+    got = lf.filter(pl.col("f").is_in(values)).collect()
+    assert sorted(got["id"].to_list()) == list(range(len(values)))
+    for i, v in list(enumerate(values))[::25]:
+        assert lf.filter(pl.col("f") == v).collect()["id"].to_list() == [i], v
+
+
+@needs_postgres
+@pytest.mark.parametrize("driver", ["psycopg", "adbc"])
+def test_postgres_user_float_schema_over_real_and_numeric(driver: str) -> None:
+    # `schema=` Float64 over `real` / `numeric`: the database compares values Polars
+    # doesn't read
+    table = "r7_pg_schema_float"
+    _execute(
+        "postgres17",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id int, r real, n numeric, d numeric(40, 30))",
+            f"INSERT INTO {table} VALUES (1, 0.1, 0.10000000000000001, "
+            "0.100000000000000000000000000001), (2, 0.5, 0.5, 0.5), (3, NULL, NULL, NULL)",
+        ],
+    )
+    schema = {"id": pl.Int32, "r": pl.Float64, "n": pl.Float64, "d": pl.Float64}
+    lf = _scan("postgres17", driver, table, schema=schema)
+    _check_filters(
+        lf,
+        [
+            pl.col("r") == 0.1,
+            pl.col("r") != 0.1,
+            pl.col("r") > 0.1,
+            pl.col("r") <= 0.1,
+            pl.col("n") == 0.1,
+            pl.col("n") <= 0.1,
+            pl.col("d") == 0.1,
+            pl.col("d") > 0.1,
+        ],
+    )
+
+
+_WIDE_DECIMAL = "123456789012345678901234.1234567891"
+
+
+@pytest.mark.parametrize("name", ["postgres17", "mysql"])
+def test_connectorx_wide_decimals_are_exact_or_an_error(name: str) -> None:
+    # ConnectorX reads decimals through rust_decimal (28-29 digits): a wider value must
+    # be read exactly or fail, never be rounded
+    pytest.importorskip("connectorx")
+    table = "r7_cx_wide"
+    _execute(
+        name,
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id int, d numeric(38, 10))",
+            f"INSERT INTO {table} VALUES (1, {_WIDE_DECIMAL}), (2, -{_WIDE_DECIMAL}), "
+            "(3, 1.5)",
+        ],
+    )
+    expected = [Decimal(_WIDE_DECIMAL), Decimal("-" + _WIDE_DECIMAL), Decimal("1.5")]
+    for source in [table, f"SELECT id, d FROM {table}"]:
+        lf = _scan(name, "connectorx", source)
+        try:
+            got = lf.collect().sort("id")["d"].to_list()
+        except pl.exceptions.PolarsError:
+            # refused rather than rounded: ConnectorX's rounding lowers the scale,
+            # which its Arrow writer rejects ("decimal scale is not equal"), and the
+            # plugin's cast of a query's decimals fails where it would round
+            continue
+        assert got == expected, (source, got)
+
+
+@pytest.mark.skipif(SERVERS["oracle"].uri is None, reason="no Oracle URI")
+@ORACLE_GROUP
+def test_oracle_like_under_a_collation_with_contractions() -> None:
+    # Czech `ch` is one letter: `'chata' LIKE 'c%'` is false under XCZECH, so LIKE isn't
+    # a superset of the byte-wise match there
+    _execute(
+        "oracle",
+        [
+            "BEGIN EXECUTE IMMEDIATE 'DROP TABLE r7_czech'; "
+            "EXCEPTION WHEN OTHERS THEN NULL; END;",
+            'CREATE TABLE r7_czech ("id" NUMBER(9), s VARCHAR2(10))',
+            "INSERT INTO r7_czech VALUES (1, 'chata')",
+            "INSERT INTO r7_czech VALUES (2, 'cesta')",
+            "INSERT INTO r7_czech VALUES (3, 'hrad')",
+            "INSERT INTO r7_czech VALUES (4, 'CHATA')",
+        ],
+    )
+    assert SERVERS["oracle"].uri is not None
+    conn = _oracle_factory(SERVERS["oracle"].uri)()
+    try:
+        conn.cursor().execute(
+            "ALTER SESSION SET NLS_COMP = LINGUISTIC NLS_SORT = XCZECH"
+        )
+        lf = pl.scan_database("R7_CZECH", conn)
+        _check_filters(
+            lf,
+            [
+                pl.col("S").str.starts_with("c"),
+                pl.col("S").str.ends_with("h"),
+                pl.col("S").str.contains("c", literal=True),
+                pl.col("S").str.starts_with("h"),
+                pl.col("S") == "chata",
+                pl.col("S").is_in(["cesta"]),
+            ],
+        )
+    finally:
+        conn.close()
+
+
+@needs_clickhouse
+def test_clickhouse_naive_datetimes_read_alike_by_every_driver() -> None:
+    # a naive DateTime is stored as an instant and shown in the server's time zone;
+    # every driver must read the same values (checked by hand on a server in Asia/Tokyo)
+    pytest.importorskip("clickhouse_connect")
+    table = "r7_ch_naive"
+    _execute(
+        "clickhouse",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id Int32, dt DateTime, dt64 DateTime64(3)) "
+            "ENGINE = MergeTree ORDER BY id",
+            f"INSERT INTO {table} VALUES (1, '2024-01-02 03:04:05', "
+            "'2024-01-02 03:04:05.123')",
+        ],
+    )
+    try:
+        frames = []
+        for driver in ["clickhouse_connect", "connectorx", "adbc"]:
+            module = DRIVER_MODULES.get(driver, driver)
+            if module is not None and not _installed(module):
+                continue
+            for source in [table, f"SELECT * FROM {table}"]:
+                lf = _scan("clickhouse", driver, source)
+                frames.append((lf.collect_schema(), lf.collect()))
+        (first_schema, first), *rest = frames
+        assert first_schema["dt"] == pl.Datetime("ms")
+        for schema, df in rest:
+            assert schema == first_schema
+            assert_frame_equal(df, first)
+    finally:
+        _execute("clickhouse", [f"DROP TABLE IF EXISTS {table}"])
+
+
+class _PooledConnection:
+    """A DB-API connection of a user's pool: `close()` hands it back to the pool."""
+
+    def __init__(self, cnx: Any, pool: list[Any]) -> None:
+        self._cnx = cnx
+        self._pool = pool
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cnx, name)
+
+    def close(self) -> None:
+        self._pool.append(self)
+
+
+def _session_state(conn: Any) -> Any:
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT @@SESSION.time_zone, @@SESSION.transaction_read_only, "
+        "@@SESSION.sql_mode"
+    )
+    rows = cursor.fetchall()
+    cursor.close()
+    return rows
+
+
+@pytest.mark.skipif(SERVERS["mariadb"].uri is None, reason="no MariaDB URI")
+@pytest.mark.parametrize("restore", ["works", "fails"])
+def test_factory_connection_of_the_mariadb_module_is_restored_or_discarded(
+    restore: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The session setup ran on a `mariadb` (or `cx_Oracle`) connection, but nothing
+    # restored it: it went back to the user's pool READ ONLY, in UTC. A restore that
+    # fails discards the connection instead.
+    import importlib.machinery
+    import sys
+    import types
+
+    import pymysql
+
+    from polars_database import _bridge
+
+    mod = types.ModuleType("mariadb")
+    mod.__spec__ = importlib.machinery.ModuleSpec("mariadb", None)
+    monkeypatch.setitem(sys.modules, "mariadb", mod)
+    # a connection type of the `mariadb` module, around a PyMySQL connection
+    wrapper = type(
+        "Connection", (_PooledConnection,), {"__module__": "mariadb.connections"}
+    )
+    if restore == "fails":
+        monkeypatch.setattr(
+            _bridge, "_session_settings", lambda conn: ["SELECT no_such_function()"]
+        )
+    pool: list[Any] = []
+    opened: list[Any] = []
+
+    def get() -> Any:
+        conn = pool.pop() if pool else None
+        if conn is None or not conn._cnx.open:
+            # a pool reconnects a connection that was closed
+            opened.append(pymysql.connect(**_parts(SERVERS["mariadb"].uri)))
+            conn = wrapper(opened[-1], pool)
+        return conn
+
+    probe = pymysql.connect(**_parts(SERVERS["mariadb"].uri))
+    before = _session_state(probe)
+    probe.close()
+    lf = pl.scan_database("edge", get, partition_on=None)
+    assert lf.collect().height > 0
+    assert opened
+    for cnx in opened:
+        if restore == "works":
+            assert _session_state(cnx) == before
+            cnx.close()
+        else:
+            # closed for real, not handed back as the setup left it
+            assert not cnx.open
+
+
+@needs_postgres
+def test_postgres_c_collation_in_another_server_encoding() -> None:
+    # `COLLATE "C"` orders by the bytes of the server encoding: code point order only in
+    # UTF-8. In WIN1251, '№' (0xB9, U+2116) sorts before 'А' (0xC0, U+0410).
+    import psycopg
+
+    assert POSTGRES is not None
+    with psycopg.connect(POSTGRES, autocommit=True) as conn:
+        conn.execute("DROP DATABASE IF EXISTS r7_win1251")
+        conn.execute(
+            "CREATE DATABASE r7_win1251 ENCODING 'WIN1251' LC_COLLATE 'C' "
+            "LC_CTYPE 'C' TEMPLATE template0"
+        )
+    uri = POSTGRES.rsplit("/", 1)[0] + "/r7_win1251"
+    try:
+        with psycopg.connect(uri) as conn:
+            conn.execute('CREATE TABLE t (id int, s text COLLATE "C")')
+            conn.execute(
+                "INSERT INTO t VALUES (1, 'А'), (2, '№'), (3, 'Я'), (4, 'a'), (5, NULL)"
+            )
+        for source in ["t", "SELECT id, s FROM t"]:
+            lf = pl.scan_database(source, uri, driver="psycopg")
+            _check_filters(
+                lf,
+                [
+                    pl.col("s") > "А",
+                    pl.col("s") < "Я",
+                    pl.col("s") == "№",
+                    pl.col("s").str.starts_with("№"),
+                ],
+            )
+    finally:
+        with psycopg.connect(POSTGRES, autocommit=True) as conn:
+            conn.execute("DROP DATABASE IF EXISTS r7_win1251 WITH (FORCE)")
+
+
+@pytest.mark.skipif(SERVERS["oracle"].uri is None, reason="no Oracle URI")
+@ORACLE_GROUP
+@pytest.mark.parametrize("connection", ["oracledb", "sqlalchemy", "factory", "live"])
+def test_oracle_numbers_without_arrow_are_exact(
+    connection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # oracledb < 3.4 has no Arrow fetch: NUMBER(p, s) came as floats, 1234567890123456
+    # 789012345678.12 read as ...778777195970.56
+    from polars.io.database._cursor_proxies import OracleCursorProxy
+
+    monkeypatch.setattr(
+        OracleCursorProxy, "supports_arrow", classmethod(lambda cls, conn: False)
+    )
+    _execute(
+        "oracle",
+        [
+            "BEGIN EXECUTE IMMEDIATE 'DROP TABLE r7_ora_num'; "
+            "EXCEPTION WHEN OTHERS THEN NULL; END;",
+            'CREATE TABLE r7_ora_num ("id" NUMBER(9), n NUMBER(30, 2), '
+            "m NUMBER(12, 4), i NUMBER(20), f BINARY_DOUBLE)",
+            "INSERT INTO r7_ora_num VALUES "
+            "(1, 1234567890123456789012345678.12, 12345678.1234, "
+            "12345678901234567890, 0.5)",
+            "INSERT INTO r7_ora_num VALUES (2, -0.07, 0.0001, -1, NULL)",
+        ],
+    )
+    lf = _scan("oracle", connection, "R7_ORA_NUM")
+    df = lf.collect().sort("id")
+    assert df["N"].to_list() == [
+        Decimal("1234567890123456789012345678.12"),
+        Decimal("-0.07"),
+    ]
+    assert df["M"].to_list() == [Decimal("12345678.1234"), Decimal("0.0001")]
+    assert df["I"].cast(pl.String).to_list() == ["12345678901234567890", "-1"]
+    assert df["F"].to_list() == [0.5, None]

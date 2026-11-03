@@ -1633,3 +1633,148 @@ def test_scan_duckdb_nested_values_arrow_cant_carry(tmp_path: Path) -> None:
             ):
                 lf.select(column).collect()
         assert lf.select("id").collect().height == 1 + len(values)
+
+
+def _check_ids(lf: pl.LazyFrame, predicates: list[pl.Expr]) -> None:
+    """Each pushed filter keeps the rows Polars keeps on the whole table."""
+    table = lf.collect()
+    for p in predicates:
+        got = sorted(lf.filter(p).collect()["id"].to_list())
+        assert got == sorted(table.filter(p)["id"].to_list()), str(p)
+
+
+def test_scan_duckdb_nanosecond_timestamps_compare_at_nanoseconds(
+    tmp_path: Path,
+) -> None:
+    # a microsecond literal compared with a TIMESTAMP_NS column at microseconds
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE t AS SELECT * FROM (VALUES "
+            "(1, '2020-01-01 00:00:00.000000500'::TIMESTAMP_NS), "
+            "(2, '2020-01-01 00:00:00'::TIMESTAMP_NS), "
+            "(3, '2020-01-01 00:00:00.000001'::TIMESTAMP_NS), "
+            "(4, NULL::TIMESTAMP_NS)) v(id, ts)"
+        )
+    lf = pl.scan_database("t", f"duckdb:///{path}")
+    assert lf.collect_schema()["ts"] == pl.Datetime("ns")
+    t0 = datetime(2020, 1, 1)
+    t1 = datetime(2020, 1, 1, 0, 0, 0, 1)
+    _check_ids(
+        lf,
+        [
+            pl.col("ts") == t0,
+            pl.col("ts") != t0,
+            pl.col("ts") > t0,
+            pl.col("ts") <= t0,
+            pl.col("ts") < t1,
+            pl.col("ts").is_in([t0, t1]),
+            pl.col("ts").is_between(t0, t1, closed="none"),
+        ],
+    )
+
+
+def test_scan_duckdb_float_literals_compare_exactly(tmp_path: Path) -> None:
+    # `repr(float)` is a DECIMAL literal to DuckDB, cast to DOUBLE inexactly
+    import random
+
+    duckdb = pytest.importorskip("duckdb")
+    rng = random.Random(140)
+    values = [rng.random() for _ in range(300)]
+    values += [rng.uniform(-1, 1) * 10.0 ** rng.randint(-40, 40) for _ in range(300)]
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, f DOUBLE)")
+        conn.executemany("INSERT INTO t VALUES (?, ?)", list(enumerate(values)))
+    lf = pl.scan_database("t", f"duckdb:///{path}")
+    got = lf.filter(pl.col("f").is_in(values)).collect()
+    assert sorted(got["id"].to_list()) == list(range(len(values)))
+    for i, v in list(enumerate(values))[::20]:
+        assert lf.filter(pl.col("f") == v).collect()["id"].to_list() == [i], v
+        n_le = sum(x <= v for x in values)
+        assert lf.filter(pl.col("f") <= v).collect().height == n_le, v
+
+
+def test_scan_sqlite_utf16_text_is_not_ordered_in_the_database(
+    tmp_path: Path,
+) -> None:
+    # BINARY compares UTF-16 bytes (memcmp) in a UTF-16 database: not code point order
+    path = tmp_path / "utf16.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("PRAGMA encoding = 'UTF-16le'")
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?)",
+            [(1, "a"), (2, "Ā"), (3, "b"), (4, "\U0001f600"), (5, "Ａ")],
+        )
+        conn.commit()
+        assert conn.execute("PRAGMA encoding").fetchone()[0] == "UTF-16le"
+    lf = pl.scan_database("t", f"sqlite:///{path}")
+    _check_ids(
+        lf,
+        [
+            pl.col("s") > "a",
+            pl.col("s") < "b",
+            pl.col("s") >= "Ａ",
+            pl.col("s") == "Ā",
+        ],
+    )
+
+
+def test_scan_duckdb_negative_wide_decimal_literals(tmp_path: Path) -> None:
+    # sqlglot wrote a negative literal through a 28-digit Decimal: rounded
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    v = "0.1234567890123456789012345678901234"
+    with duckdb.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE t AS SELECT * FROM (VALUES "
+            f"(1, -{v}::DECIMAL(38, 34)), (2, {v}::DECIMAL(38, 34)), "
+            "(3, -0.1234567890123456789012345679::DECIMAL(38, 34))) v(id, d)"
+        )
+    lf = pl.scan_database("t", f"duckdb:///{path}")
+    neg = Decimal("-" + v)
+    _check_ids(
+        lf,
+        [
+            pl.col("d") == neg,
+            pl.col("d") < neg,
+            pl.col("d") > neg,
+            pl.col("d").is_in([neg, -neg]),
+        ],
+    )
+    assert "(1 exact)" in lf.filter(pl.col("d") == neg).explain()
+
+
+@pytest.mark.parametrize("driver", ["sqlite3"])
+def test_scan_query_that_isnt_repeatable_counts_batches_of_other_dtypes(
+    tmp_path: Path, driver: str
+) -> None:
+    # the rows a count reads (and the query's schema sample) were stacked as the driver
+    # typed each batch: an integer batch and a float batch didn't stack. (ADBC refuses
+    # the column's change of type itself.)
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x NUMERIC)")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?)",
+            [(i, i if i < 100 else i + 0.5) for i in range(250)],
+        )
+        conn.commit()
+    lf = pl.scan_database(
+        "SELECT * FROM t WHERE abs(random()) % 1 = 0",
+        f"sqlite:///{path}",
+        driver=driver,
+        batch_size=50,
+        schema_overrides={"x": pl.Float64},
+    )
+    assert lf.collect_schema()["x"] == pl.Float64
+    tail = lf.tail(3).collect()
+    assert tail["x"].to_list() == [247.5, 248.5, 249.5]
+    assert lf.select(pl.len()).collect().item() == 250
+    # a repeatable query is sampled the same way
+    lf = pl.scan_database(
+        "SELECT * FROM t", f"sqlite:///{path}", driver=driver, batch_size=50
+    )
+    assert lf.collect()["x"].dtype == pl.Float64

@@ -13,6 +13,7 @@ import importlib.util
 import itertools
 import os
 import re
+import sys
 import threading
 import weakref
 from importlib.metadata import PackageNotFoundError
@@ -1174,6 +1175,54 @@ def _object_columns_as_text(frames: Iterator[DataFrame]) -> Iterator[DataFrame]:
         yield df
 
 
+def _oracle_row_cursor(cx: Any) -> Any:
+    """
+    A cursor of the Oracle driver (oracledb without its Arrow fetch, cx_Oracle) that
+    the executor reads rows from, or `None`: its own, or one on the DB-API connection
+    of a SQLAlchemy connection (the same session, as the Arrow proxy uses).
+    """
+    cursor = cx.cursor
+    if _module_of(cursor) in ("oracledb", "cx_Oracle"):
+        return cursor
+    if cx.driver_name == "sqlalchemy" and not cx._is_alchemy_session(cursor):
+        with contextlib.suppress(Exception):
+            driver = cursor.connection.driver_connection
+            if _module_of(driver) in ("oracledb", "cx_Oracle"):
+                return driver.cursor()
+    return None
+
+
+def _oracle_decimal_handler(cursor: Any) -> Callable[..., Any]:
+    """An `outputtypehandler` that fetches NUMBER with a scale as `Decimal`."""
+    from decimal import Decimal
+
+    module = sys.modules[_module_of(cursor)]
+    number = module.DB_TYPE_NUMBER
+
+    def scaled(type_code: Any, precision: Any, scale: Any) -> bool:
+        # integers (`NUMBER(p)`, `NUMBER(p, s)` with s <= 0) are exact as Python ints,
+        # and `FLOAT(b)` (scale -127) is a float
+        return type_code is number and not ((precision or 0) > 0 and (scale or 0) <= 0)
+
+    if _module_of(cursor) == "oracledb":
+
+        def handler(cursor: Any, metadata: Any) -> Any:
+            if scaled(metadata.type_code, metadata.precision, metadata.scale):
+                return cursor.var(Decimal, arraysize=cursor.arraysize)
+            return None
+
+        return handler
+
+    def legacy_handler(
+        cursor: Any, name: Any, default_type: Any, size: Any, precision: Any, scale: Any
+    ) -> Any:
+        if scaled(default_type, precision, scale):
+            return cursor.var(Decimal, arraysize=cursor.arraysize)
+        return None
+
+    return legacy_handler
+
+
 def _params_keyword(cx: Any) -> str:
     """The keyword of a cursor's `execute()` that takes the bound parameters."""
     from inspect import Parameter, signature
@@ -1318,7 +1367,9 @@ _DRIVER_DIALECTS = {
     "pymysql": "mysql",
     "mysql": "mysql",
     "MySQLdb": "mysql",
+    "mariadb": "mysql",
     "oracledb": "oracle",
+    "cx_Oracle": "oracle",
 }
 
 
@@ -1683,6 +1734,14 @@ class _Session:
                 if oracle_arrow:
                     # NUMBER(p, s) as decimals, not floats, like the other drivers
                     options.setdefault("fetch_decimals", True)
+                elif (raw := _oracle_row_cursor(cx)) is not None:
+                    # Without Arrow (oracledb < 3.4, cx_Oracle) NUMBER(p, s) is
+                    # fetched as a float, which rounds past 15 digits: as decimals
+                    # instead, on a cursor of the driver's own
+                    if raw is not cx.cursor:
+                        cx = ConnectionExecutor(raw)
+                        cx_cursor = raw
+                    raw.outputtypehandler = _oracle_decimal_handler(raw)
                 if (
                     _module_of(self.conn) == "clickhouse_connect"
                     and "parameters" not in options
@@ -1907,29 +1966,50 @@ class _Session:
     def close(self) -> None:
         if self._setup_ran and self._close is None:
             self._reset_pooled()
+        # A factory's connection may go back to a pool of the user's: the settings the
+        # setup changed are restored, or, when that is unknown or fails, it is discarded
+        # (invalidated, or its own connection closed) rather than handed back changed.
+        discard = self._aborted
         if (
             self._setup_ran
             and self.factory
-            and self._restore
             and not self._aborted
             and _module_of(self.conn) != "sqlalchemy"  # (`_reset_pooled`)
         ):
-            with contextlib.suppress(Exception):
-                self.conn.rollback()
-                for sql in self._restore:
-                    _run_statement(self.conn, sql)
-                self.conn.commit()
-        if self._aborted and self._invalidate is not None:
+            discard = True
+            if self._restore:
+                try:
+                    self.conn.rollback()
+                    for sql in self._restore:
+                        _run_statement(self.conn, sql)
+                    self.conn.commit()
+                except Exception:
+                    pass
+                else:
+                    discard = False
+        if discard and not self._aborted:
+            _close_for_real(self.conn)
+        if discard and self._invalidate is not None:
             with contextlib.suppress(Exception):
                 self._invalidate()
         elif self._close is not None:
             self._close()
         elif self.owned and callable(getattr(self.conn, "close", None)):
-            if self._aborted:
+            if discard:
                 with contextlib.suppress(Exception):
                     self.conn.close()
             else:
                 self.conn.close()
+
+
+def _close_for_real(conn: Any) -> None:
+    """
+    Closes the connection itself, also where `close()` would return it to a pool:
+    mysql.connector's pooled connections hold it as `_cnx`.
+    """
+    inner = getattr(conn, "_cnx", None)
+    with contextlib.suppress(Exception):
+        (inner if inner is not None else conn).close()
 
 
 # (URI, protocol) pairs ConnectorX has connected to in this process

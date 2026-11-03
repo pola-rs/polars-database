@@ -182,8 +182,10 @@ struct QueryDiscovery {
     /// It parses, and has volatile functions (`nextval`, `random()`): it may return other
     /// rows, or change something, each time it runs.
     volatile: bool,
-    /// A MySQL-dialect query with a top-level `ORDER BY` and no `LIMIT`.
-    mariadb_order_by: bool,
+    /// A query with a top-level `ORDER BY` and no `LIMIT`, on a dialect that may drop it
+    /// inside a derived table (MariaDB among the MySQL dialect's servers; see
+    /// [`DialectName::keeps_derived_table_order`]).
+    derived_order_by: bool,
     /// It parses, and a `LIMIT` (or a lock clause) ends it (`QueryFacts::top_level_limit`).
     top_level_limit: bool,
     /// It parses, and has a CTE or a subquery (`QueryFacts::nested_queries`).
@@ -200,6 +202,15 @@ struct QueryDiscovery {
 }
 
 const MARIADB_ORDER_BY: &str = "MariaDB ignores the ORDER BY of a query inside a derived table";
+
+/// Why a query whose `ORDER BY` the dialect may drop in a derived table isn't wrapped.
+fn derived_order_by_reason(dialect: DialectName) -> PlSmallStr {
+    format!(
+        "{dialect:?} may ignore the ORDER BY of a query inside a derived table (without a \
+        LIMIT); the query is read as it is"
+    )
+    .into()
+}
 
 /// The schema probe of a MySQL query: the query with a `LIMIT 0` of its own.
 ///
@@ -351,7 +362,7 @@ pub fn resolve_scan(
                     .as_ref()
                     .is_ok_and(|f| f.parses && f.read_only && repeatable(f, dialect, false)),
             volatile: facts.as_ref().is_ok_and(|f| f.parses && !f.repeatable),
-            mariadb_order_by: dialect == DialectName::Mysql
+            derived_order_by: dialect.keeps_derived_table_order() != Some(true)
                 && facts
                     .as_ref()
                     .is_ok_and(|f| f.top_level_order_by_without_limit),
@@ -369,9 +380,18 @@ pub fn resolve_scan(
         {
             pushdown_disabled = Some(reason);
         }
-        if query.mariadb_order_by && user_schema.is_some() && pushdown_disabled.is_none() {
-            // Without I/O, the server may be a MariaDB (see below).
-            pushdown_disabled = Some(MARIADB_ORDER_BY.into());
+        if query.derived_order_by && pushdown_disabled.is_none() {
+            if dialect.keeps_derived_table_order().is_none() {
+                // Without I/O, the server may be a MariaDB (see below).
+                if user_schema.is_some() {
+                    pushdown_disabled = Some(MARIADB_ORDER_BY.into());
+                }
+            } else {
+                // Trino drops it (as its documentation says), and the others aren't
+                // known to keep it: the wrapped query would return its rows in another
+                // order (and `head` other rows).
+                pushdown_disabled = Some(derived_order_by_reason(dialect));
+            }
         }
         if verbose()
             && let Some(reason) = &pushdown_disabled
@@ -401,6 +421,11 @@ pub fn resolve_scan(
                 comparable: match dtype {
                     DataType::String => dialect != DialectName::Sqlite,
                     DataType::Datetime(_, _) => dialect != DialectName::Mssql,
+                    // A float or decimal dtype over a column of another numeric type
+                    // (`real` read as Float64, `numeric` read as a float or at another
+                    // scale): the database compares the values it holds, not the ones
+                    // Polars reads.
+                    dt if dt.is_float() || dt.is_decimal() => false,
                     _ => true,
                 },
             })
@@ -413,7 +438,7 @@ pub fn resolve_scan(
         // MariaDB drops the `ORDER BY` of a derived table without `LIMIT`: the wrapped
         // query would return its rows in another order (and `head` other rows).
         // (Its schema is still found wrapped: the order doesn't matter there.)
-        if query.mariadb_order_by && pushdown_disabled.is_none() && is_mariadb(session.as_mut()) {
+        if query.derived_order_by && pushdown_disabled.is_none() && is_mariadb(session.as_mut()) {
             if verbose() {
                 eprintln!("[scan_database]: pushdown disabled: {MARIADB_ORDER_BY}");
             }
@@ -771,7 +796,7 @@ fn read_wrapped(
         DatabaseRelation::Table { .. } => true,
         DatabaseRelation::Query { .. } => {
             pushdown_disabled.is_none()
-                || (!options.pushdown && query.wrappable && !query.mariadb_order_by)
+                || (!options.pushdown && query.wrappable && !query.derived_order_by)
         },
     }
 }

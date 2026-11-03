@@ -21,12 +21,12 @@
       "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE (\"i64\" >= 0) AND (\"i64\" <= 10)"
     },
     "float_cmp": {
-      "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"f64\" > 1.5"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "decimal_cmp": {
-      "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"dec\" >= 12.5000"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "str_eq": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -139,8 +139,8 @@
       "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t`"
     },
     "decimal_cmp": {
-      "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t` WHERE `dec` >= 12.5000"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t`"
     },
     "str_eq": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -249,12 +249,12 @@
       "sql": "SELECT [id], [i16], [i32], [i64], [f64], [dec], [s], [sb], [d], [ts], [b] FROM [s].[t] WHERE ([i64] >= 0) AND ([i64] <= 10)"
     },
     "float_cmp": {
-      "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT [id], [i16], [i32], [i64], [f64], [dec], [s], [sb], [d], [ts], [b] FROM [s].[t] WHERE [f64] > 1.5"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT [id], [i16], [i32], [i64], [f64], [dec], [s], [sb], [d], [ts], [b] FROM [s].[t]"
     },
     "decimal_cmp": {
-      "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT [id], [i16], [i32], [i64], [f64], [dec], [s], [sb], [d], [ts], [b] FROM [s].[t] WHERE [dec] >= 12.5000"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT [id], [i16], [i32], [i64], [f64], [dec], [s], [sb], [d], [ts], [b] FROM [s].[t]"
     },
     "str_eq": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -285,12 +285,12 @@
       "sql": "SELECT [id], [i16], [i32], [i64], [f64], [dec], [s], [sb], [d], [ts], [b] FROM [s].[t] WHERE [s] = N''"
     },
     "like_prefix": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT [id], [i16], [i32], [i64], [f64], [dec], [s], [sb], [d], [ts], [b] FROM [s].[t] WHERE [s] LIKE N'a\\%\\_%' ESCAPE '\\'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT [id], [i16], [i32], [i64], [f64], [dec], [s], [sb], [d], [ts], [b] FROM [s].[t]"
     },
     "like_contains": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT [id], [i16], [i32], [i64], [f64], [dec], [s], [sb], [d], [ts], [b] FROM [s].[t] WHERE [s] LIKE N'%\\[x]%' ESCAPE '\\'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT [id], [i16], [i32], [i64], [f64], [dec], [s], [sb], [d], [ts], [b] FROM [s].[t]"
     },
     "is_in": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -367,8 +367,8 @@
       "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "decimal_cmp": {
-      "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"dec\" >= 12.5000"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "str_eq": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -399,12 +399,12 @@
       "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "like_prefix": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"s\" LIKE 'a\\%\\_%' ESCAPE '\\'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "like_contains": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"s\" LIKE '%[x]%' ESCAPE '\\'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "is_in": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -477,8 +477,8 @@
       "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE (\"i64\" >= 0) AND (\"i64\" <= 10)"
     },
     "float_cmp": {
-      "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"f64\" > 1.5"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "decimal_cmp": {
       "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
@@ -591,12 +591,12 @@
       "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE (\"i64\" >= 0) AND (\"i64\" <= 10)"
     },
     "float_cmp": {
-      "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"f64\" > 1.5"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "decimal_cmp": {
-      "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"dec\" >= 12.5000"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "str_eq": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -627,12 +627,12 @@
       "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"s\" = ''"
     },
     "like_prefix": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"s\" LIKE 'a\\%\\_%' ESCAPE '\\'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "like_contains": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"s\" LIKE '%[x]%' ESCAPE '\\'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "is_in": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -709,8 +709,8 @@
       "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "decimal_cmp": {
-      "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"dec\" >= 12.5000"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "str_eq": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -741,12 +741,12 @@
       "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"s\" = ''"
     },
     "like_prefix": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"s\" LIKE 'a\\\\%\\\\_%' ESCAPE '\\\\'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "like_contains": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"s\" LIKE '%[x]%' ESCAPE '\\\\'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "is_in": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -823,8 +823,8 @@
       "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t`"
     },
     "decimal_cmp": {
-      "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t` WHERE `dec` >= 12.5000"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t`"
     },
     "str_eq": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -855,12 +855,12 @@
       "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t` WHERE `s` = ''"
     },
     "like_prefix": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t` WHERE `s` LIKE 'a\\\\%\\\\_%' ESCAPE '\\\\'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t`"
     },
     "like_contains": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t` WHERE `s` LIKE '%[x]%' ESCAPE '\\\\'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t`"
     },
     "is_in": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -937,8 +937,8 @@
       "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t`"
     },
     "decimal_cmp": {
-      "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t` WHERE `dec` >= 12.5000"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t`"
     },
     "str_eq": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -969,12 +969,12 @@
       "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t` WHERE `s` = ''"
     },
     "like_prefix": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t` WHERE `s` LIKE 'a\\\\%\\\\_%' ESCAPE '\\\\'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t`"
     },
     "like_contains": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t` WHERE `s` LIKE '%[x]%' ESCAPE '\\\\'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT `id`, `i16`, `i32`, `i64`, `f64`, `dec`, `s`, `sb`, `d`, `ts`, `b` FROM `s`.`t`"
     },
     "is_in": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -1051,8 +1051,8 @@
       "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\", throwIf(NOT ifNull(isValidUTF8(CAST(\"s\" AS Nullable(String))), 1), 'column ''s'' holds text that is not valid UTF-8; read it as hex(s) in a query') AS \"__pl_utf8_0\", throwIf(NOT ifNull(isValidUTF8(CAST(\"sb\" AS Nullable(String))), 1), 'column ''sb'' holds text that is not valid UTF-8; read it as hex(sb) in a query') AS \"__pl_utf8_1\" FROM \"s\".\"t\""
     },
     "decimal_cmp": {
-      "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\", throwIf(NOT ifNull(isValidUTF8(CAST(\"s\" AS Nullable(String))), 1), 'column ''s'' holds text that is not valid UTF-8; read it as hex(s) in a query') AS \"__pl_utf8_0\", throwIf(NOT ifNull(isValidUTF8(CAST(\"sb\" AS Nullable(String))), 1), 'column ''sb'' holds text that is not valid UTF-8; read it as hex(sb) in a query') AS \"__pl_utf8_1\" FROM \"s\".\"t\" WHERE \"dec\" >= CAST('12.5000' AS Nullable(Decimal(38, 4)))"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\", throwIf(NOT ifNull(isValidUTF8(CAST(\"s\" AS Nullable(String))), 1), 'column ''s'' holds text that is not valid UTF-8; read it as hex(s) in a query') AS \"__pl_utf8_0\", throwIf(NOT ifNull(isValidUTF8(CAST(\"sb\" AS Nullable(String))), 1), 'column ''sb'' holds text that is not valid UTF-8; read it as hex(sb) in a query') AS \"__pl_utf8_1\" FROM \"s\".\"t\""
     },
     "str_eq": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -1083,12 +1083,12 @@
       "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\", throwIf(NOT ifNull(isValidUTF8(CAST(\"s\" AS Nullable(String))), 1), 'column ''s'' holds text that is not valid UTF-8; read it as hex(s) in a query') AS \"__pl_utf8_0\", throwIf(NOT ifNull(isValidUTF8(CAST(\"sb\" AS Nullable(String))), 1), 'column ''sb'' holds text that is not valid UTF-8; read it as hex(sb) in a query') AS \"__pl_utf8_1\" FROM \"s\".\"t\" WHERE \"s\" = ''"
     },
     "like_prefix": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\", throwIf(NOT ifNull(isValidUTF8(CAST(\"s\" AS Nullable(String))), 1), 'column ''s'' holds text that is not valid UTF-8; read it as hex(s) in a query') AS \"__pl_utf8_0\", throwIf(NOT ifNull(isValidUTF8(CAST(\"sb\" AS Nullable(String))), 1), 'column ''sb'' holds text that is not valid UTF-8; read it as hex(sb) in a query') AS \"__pl_utf8_1\" FROM \"s\".\"t\" WHERE \"s\" LIKE 'a\\\\%\\\\_%'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\", throwIf(NOT ifNull(isValidUTF8(CAST(\"s\" AS Nullable(String))), 1), 'column ''s'' holds text that is not valid UTF-8; read it as hex(s) in a query') AS \"__pl_utf8_0\", throwIf(NOT ifNull(isValidUTF8(CAST(\"sb\" AS Nullable(String))), 1), 'column ''sb'' holds text that is not valid UTF-8; read it as hex(sb) in a query') AS \"__pl_utf8_1\" FROM \"s\".\"t\""
     },
     "like_contains": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\", throwIf(NOT ifNull(isValidUTF8(CAST(\"s\" AS Nullable(String))), 1), 'column ''s'' holds text that is not valid UTF-8; read it as hex(s) in a query') AS \"__pl_utf8_0\", throwIf(NOT ifNull(isValidUTF8(CAST(\"sb\" AS Nullable(String))), 1), 'column ''sb'' holds text that is not valid UTF-8; read it as hex(sb) in a query') AS \"__pl_utf8_1\" FROM \"s\".\"t\" WHERE \"s\" LIKE '%[x]%'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\", throwIf(NOT ifNull(isValidUTF8(CAST(\"s\" AS Nullable(String))), 1), 'column ''s'' holds text that is not valid UTF-8; read it as hex(s) in a query') AS \"__pl_utf8_0\", throwIf(NOT ifNull(isValidUTF8(CAST(\"sb\" AS Nullable(String))), 1), 'column ''sb'' holds text that is not valid UTF-8; read it as hex(sb) in a query') AS \"__pl_utf8_1\" FROM \"s\".\"t\""
     },
     "is_in": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -1165,8 +1165,8 @@
       "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "decimal_cmp": {
-      "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"dec\" >= 12.5000"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "str_eq": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -1197,12 +1197,12 @@
       "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"s\" = ''"
     },
     "like_prefix": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"s\" LIKE 'a\\%\\_%' ESCAPE '\\'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "like_contains": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"s\" LIKE '%[x]%' ESCAPE '\\'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "is_in": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -1275,12 +1275,12 @@
       "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE (\"i64\" >= 0) AND (\"i64\" <= 10)"
     },
     "float_cmp": {
-      "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"f64\" > 1.5"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "decimal_cmp": {
-      "pushed": "projection 11/11, filters 1/1 (1 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"dec\" >= 12.5000"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "str_eq": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
@@ -1311,12 +1311,12 @@
       "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"s\" = ''"
     },
     "like_prefix": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"s\" LIKE 'a\\\\%\\\\_%' ESCAPE '\\\\'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "like_contains": {
-      "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",
-      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\" WHERE \"s\" LIKE '%[x]%' ESCAPE '\\\\'"
+      "pushed": "projection 11/11, filters 0/1 (0 exact), limit: no",
+      "sql": "SELECT \"id\", \"i16\", \"i32\", \"i64\", \"f64\", \"dec\", \"s\", \"sb\", \"d\", \"ts\", \"b\" FROM \"s\".\"t\""
     },
     "is_in": {
       "pushed": "projection 11/11, filters 1/1 (0 exact), limit: no",

@@ -317,7 +317,7 @@ impl PartitionReader {
                 .query(&self.partition.count_sql)
                 .and_then(|df| catalog::scalar_u64(&df))
         } else {
-            session.query(&self.partition.sql).map(|df| {
+            self.read_counted(&mut session).map(|df| {
                 let n = df.height() as u64;
                 *self.counted_rows.lock().unwrap() = Some(df);
                 n
@@ -340,6 +340,34 @@ impl PartitionReader {
         let n = r.map_err(|e| out_of_range_date_hint(e).context(self.context().into()))?;
         *self.n_rows.lock().unwrap() = Some(n);
         Ok(n)
+    }
+
+    /// The partition's rows, each batch cast to the planned schema as the read casts
+    /// it: drivers type each batch on its own (a decimal's scale, a time zone), and
+    /// batches of other dtypes can't be stacked.
+    fn read_counted(&self, session: &mut Session) -> PolarsResult<DataFrame> {
+        let config = &self.shared.config;
+        let overrides = config.options.schema_overrides.as_deref();
+        let mut out: Option<DataFrame> = None;
+        for batch in session.execute(&self.partition.sql, config.options.fetch.batch_size)? {
+            let batch = batch?;
+            let names = batch
+                .get_column_names()
+                .into_iter()
+                .filter(|n| config.schema.contains(n))
+                .cloned()
+                .collect::<Vec<_>>();
+            let batch = cast_to_schema(&batch, &config.schema.try_project(&names)?, overrides)?;
+            match &mut out {
+                None => out = Some(batch),
+                Some(acc) => {
+                    acc.vstack_mut_owned(batch)?;
+                },
+            }
+        }
+        out.ok_or_else(|| {
+            polars_err!(ComputeError: "database query returned no result: {}", self.partition.sql)
+        })
     }
 
     fn cancel(&self) {

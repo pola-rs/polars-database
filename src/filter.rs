@@ -282,6 +282,16 @@ fn decimal_fits(v: i128, precision: usize) -> bool {
         .is_none_or(|digits| (digits as usize) < precision)
 }
 
+/// Whether an expression holds an `IN (…)` list.
+fn contains_in_list(e: &SqlExpr) -> bool {
+    match e {
+        SqlExpr::InList(..) => true,
+        SqlExpr::Binary(l, _, r) => contains_in_list(l) || contains_in_list(r),
+        SqlExpr::Not(e) => contains_in_list(e),
+        _ => false,
+    }
+}
+
 /// How a translated expression relates to the Polars predicate `P`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Class {
@@ -442,6 +452,12 @@ impl Translator<'_> {
             Node::Not(inner) => {
                 // The negation of a superset is a subset: only exact expressions negate.
                 let (inner, class) = self.translate(inner)?;
+                // ClickHouse's `x IN (…)` is 0, not NULL, for a NULL `x` under
+                // `transform_null_in = 1` (a user or profile setting): `NOT` would keep the
+                // NULL rows Polars drops. Positively, 0 drops them as NULL does.
+                if self.dialect() == DialectName::Clickhouse && contains_in_list(&inner) {
+                    return None;
+                }
                 (class == Class::Exact).then(|| (SqlExpr::Not(Box::new(inner)), Class::Exact))
             },
             Node::IsNull(e, negated) => {
@@ -513,8 +529,13 @@ impl Translator<'_> {
         let pattern = format!("{prefix}{}{suffix}", self.escape_like(pat));
         let class = if strings.equality_exact && !self.dialect().like_case_insensitive() {
             Class::Exact
-        } else {
+        } else if self.dialect().like_matches_per_character() {
             Class::Superset
+        } else {
+            // A collation may match `LIKE` by its collation elements: under Czech `ch`
+            // is one letter, so `'chata' LIKE 'c%'` is false (Oracle linguistic sorts,
+            // SQL Server), and the match is no superset of Polars'.
+            return None;
         };
         Some((
             SqlExpr::Like {
