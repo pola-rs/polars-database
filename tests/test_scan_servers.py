@@ -1213,12 +1213,14 @@ def test_mysql_year_literals(name: str) -> None:
 @needs_postgres
 @pytest.mark.parametrize("driver", ["adbc", "psycopg", "connectorx", "live"])
 def test_postgres_literals_without_standard_conforming_strings(driver: str) -> None:
+    # a table per driver: the parametrizations run on parallel workers
+    table = f"review_scs_{driver}"
     _execute(
         "postgres17",
         [
-            "DROP TABLE IF EXISTS review_scs",
-            "CREATE TABLE review_scs (id int, s text)",
-            "INSERT INTO review_scs VALUES (1, 'a\\b'), (2, 'ab'), (3, '50%'), "
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id int, s text)",
+            f"INSERT INTO {table} VALUES (1, 'a\\b'), (2, 'ab'), (3, '50%'), "
             "(4, 'a''b')",
         ],
     )
@@ -1232,15 +1234,15 @@ def test_postgres_literals_without_standard_conforming_strings(driver: str) -> N
         conn = server.factory(server.uri)()
         conn.execute("SET standard_conforming_strings = off")
         conn.commit()
-        lf = pl.scan_database("review_scs", conn)
+        lf = pl.scan_database(table, conn)
     elif driver == "psycopg":
-        lf = _scan("postgres17", driver, "review_scs", connect_options={"options": off})
+        lf = _scan("postgres17", driver, table, connect_options={"options": off})
     else:
         assert POSTGRES is not None
         if driver == "connectorx":
             pytest.importorskip(driver)
         uri = f"{POSTGRES}?options={quote(off)}"
-        lf = pl.scan_database("review_scs", uri, driver=driver)
+        lf = pl.scan_database(table, uri, driver=driver)
     try:
         _check_filters(
             lf,
@@ -3636,6 +3638,14 @@ def test_engine_partitions_are_cancelled_on_an_early_stop() -> None:
         assert lf.filter(pl.col("id") <= 100).head(1).collect().height == 1
         # the last partition alone takes 5 s
         assert time.perf_counter() - start < 3
+        # The cancelled partitions give their connections back after `collect()`
+        # returned, from the threads that drop them. Disposed before that, the Engine
+        # lets them go unclosed: their ResourceWarnings then failed a later test of the
+        # same worker.
+        deadline = time.perf_counter() + 10
+        while engine.pool.checkedout() and time.perf_counter() < deadline:
+            time.sleep(0.05)
+        assert engine.pool.checkedout() == 0
     finally:
         engine.dispose()
         _execute(
@@ -3795,7 +3805,7 @@ def test_float_literals_compare_exactly(name: str) -> None:
 def test_postgres_user_float_schema_over_real_and_numeric(driver: str) -> None:
     # `schema=` Float64 over `real` / `numeric`: the database compares values Polars
     # doesn't read
-    table = "r7_pg_schema_float"
+    table = f"r7_pg_schema_float_{driver}"
     _execute(
         "postgres17",
         [
