@@ -14,6 +14,7 @@ use std::ffi::{CStr, c_void};
 use std::ptr::NonNull;
 use std::sync::{Arc, Once};
 
+pub(crate) use bridge::release_queued_objects;
 use polars_arrow::ffi::ArrowArrayStreamReader;
 use polars_core::prelude::*;
 use polars_core::scalar::Scalar;
@@ -379,10 +380,24 @@ fn find_adbc_driver(py: Python<'_>, name: &str) -> PyResult<Option<(String, Opti
 /// notices), so their sessions are closed while Python still runs; then stops every driver
 /// call of a query that runs on. Python ends a thread that takes the GIL while it finalizes,
 /// which aborts the process inside Rust frames.
+///
+/// A query still running after the wait has its statement cancelled (a thread inside a
+/// driver call would be ended inside Rust frames too), and is given a moment more. Only
+/// then are driver calls stopped: with every query ended, a scan in a user's `atexit` hook
+/// that runs after this one (registered before the first scan imported this module) runs
+/// as usual.
 #[pyfunction]
 fn _at_exit(py: Python<'_>) {
-    py.detach(|| crate::reader::wait_for_scans(std::time::Duration::from_secs(2)));
-    bridge::EXITING.store(true, std::sync::atomic::Ordering::Release);
+    use std::time::Duration;
+    let ended = py.detach(|| {
+        crate::reader::wait_for_scans(Duration::from_secs(2)) || {
+            crate::reader::cancel_running_statements();
+            crate::reader::wait_for_scans(Duration::from_secs(2))
+        }
+    });
+    if !ended {
+        bridge::EXITING.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 #[pymodule]

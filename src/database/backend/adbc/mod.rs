@@ -193,9 +193,11 @@ pub fn connect_options(
     if let Some((user, password)) = creds {
         // Drivers that take a `scheme://` URI (libpq, MySQL, …) read credentials from it
         // and may reject the `username`/`password` options.
+        // and from its query, after the userinfo: the provider's must win
         match uri
             .as_deref()
             .and_then(|u| with_userinfo(u, user.as_deref(), password.as_deref()))
+            .map(|u| without_credential_params(&u, user.is_some(), password.is_some()))
         {
             Some(with_creds) => uri = Some(with_creds),
             None => {
@@ -253,6 +255,18 @@ fn adbc_uri(spec: &ConnectionSpec, dialect: DialectName) -> PolarsResult<Option<
             let uri = spec.uri_without_scheme_driver().unwrap_or_default();
             if dialect == DialectName::Sqlite {
                 return Ok(Some(sqlite_path(&uri)?));
+            }
+            // an alias scheme (`pgsql://`, `tidb://`) as the one the driver reads
+            let canonical = match dialect {
+                DialectName::Postgresql => &["postgresql", "postgres"][..],
+                DialectName::Mysql => &["mysql"],
+                _ => &[],
+            };
+            if let Some((scheme, rest)) = uri.split_once(':')
+                && let Some(first) = canonical.first()
+                && !canonical.iter().any(|c| scheme.eq_ignore_ascii_case(c))
+            {
+                return Ok(Some(format!("{first}:{rest}")));
             }
             Ok(Some(uri))
         },
@@ -485,6 +499,39 @@ fn with_userinfo(uri: &str, user: Option<&str>, password: Option<&str>) -> Optio
     }
     let at = if userinfo.is_empty() { "" } else { "@" };
     Some(format!("{scheme}://{userinfo}{at}{host_and_tail}"))
+}
+
+/// The URI without the query parameters that give the user (`user=`) or the password
+/// (`password=`), which libpq, MySQL and SQLAlchemy read after the userinfo.
+fn without_credential_params(uri: &str, user: bool, password: bool) -> String {
+    let Some((head, query)) = uri.split_once('?') else {
+        return uri.to_string();
+    };
+    let (query, fragment) = match query.split_once('#') {
+        Some((q, f)) => (q, Some(f)),
+        None => (query, None),
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|kv| {
+            let k = kv
+                .split_once('=')
+                .map_or(*kv, |(k, _)| k)
+                .to_ascii_lowercase();
+            !(user && matches!(k.as_str(), "user" | "username" | "uid")
+                || password && matches!(k.as_str(), "password" | "passwd" | "pwd"))
+        })
+        .collect();
+    let mut out = head.to_string();
+    if !kept.is_empty() {
+        out.push('?');
+        out.push_str(&kept.join("&"));
+    }
+    if let Some(f) = fragment {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
 }
 
 /// The URI with its password percent-encoded, if it holds an unencoded `/`, `?` or `#`
@@ -862,6 +909,18 @@ mod tests {
             Some("mysql://u@h")
         );
         assert_eq!(with_userinfo("/tmp/a.db", Some("u"), None), None);
+        assert_eq!(
+            without_credential_params(
+                "postgresql://u:p@h/db?password=x&sslmode=require",
+                false,
+                true
+            ),
+            "postgresql://u:p@h/db?sslmode=require"
+        );
+        assert_eq!(
+            without_credential_params("mysql://h/db?User=a&password=x", true, false),
+            "mysql://h/db?password=x"
+        );
         // An `@` in a parameter isn't the end of the userinfo.
         assert_eq!(
             with_userinfo(

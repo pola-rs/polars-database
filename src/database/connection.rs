@@ -201,24 +201,23 @@ impl ConnectionSpec {
                 }
                 if let Some((_, query)) = uri.split_once('?') {
                     for kv in query.split(['&', '#']) {
-                        if let Some((k, v)) = kv.split_once('=')
-                            && is_secret_key(k)
-                        {
+                        let Some((k, v)) = kv.split_once('=') else {
+                            continue;
+                        };
+                        if is_secret_key(k) {
                             out.push(v.to_string());
+                        } else if k.eq_ignore_ascii_case("odbc_connect")
+                            || k.eq_ignore_ascii_case("odbc_connect_string")
+                        {
+                            for secret in odbc_secrets(&percent_decode(&v.replace('+', " "))) {
+                                out.push(percent_encode_all(&secret));
+                                out.push(secret);
+                            }
                         }
                     }
                 }
             },
-            ConnectionTarget::Odbc(s) => {
-                for (k, v) in odbc_attributes(s) {
-                    if let Some(v) = v
-                        && is_secret_key(k.trim())
-                    {
-                        out.push(v.trim().to_string());
-                        out.push(odbc_unquote(v.trim()));
-                    }
-                }
-            },
+            ConnectionTarget::Odbc(s) => out.extend(odbc_secrets(s)),
             #[cfg(feature = "python")]
             ConnectionTarget::Factory(_) | ConnectionTarget::Live(_) => {},
         }
@@ -389,6 +388,13 @@ pub fn redact_uri(uri: &str) -> String {
             .split('&')
             .map(|kv| match kv.split_once('=') {
                 Some((k, _)) if is_secret_key(k) => format!("{k}=***"),
+                // SQLAlchemy's `mssql+pyodbc://?odbc_connect=…%3BPWD%3D…`, shown decoded
+                Some((k, v))
+                    if k.eq_ignore_ascii_case("odbc_connect")
+                        || k.eq_ignore_ascii_case("odbc_connect_string") =>
+                {
+                    format!("{k}={}", redact_odbc(&percent_decode(&v.replace('+', " "))))
+                },
                 _ => kv.to_string(),
             })
             .collect::<Vec<_>>()
@@ -449,6 +455,33 @@ fn odbc_unquote(v: &str) -> String {
         Some(inner) => inner.strip_suffix('}').unwrap_or(inner).replace("}}", "}"),
         None => v.to_string(),
     }
+}
+
+/// The secret values of an ODBC connection string, as written and unquoted.
+fn odbc_secrets(s: &str) -> Vec<String> {
+    let mut out = vec![];
+    for (k, v) in odbc_attributes(s) {
+        if let Some(v) = v
+            && is_secret_key(k.trim())
+        {
+            out.push(v.trim().to_string());
+            out.push(odbc_unquote(v.trim()));
+        }
+    }
+    out
+}
+
+/// Encodes every byte but unreserved ASCII as `%XX`, as a URI query value is often written.
+fn percent_encode_all(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 pub fn redact_odbc(s: &str) -> String {
@@ -677,6 +710,20 @@ mod tests {
             scrub_secrets("bad dsn PWD={a;Sek}}r3t} / a;Sek}r3t", &spec.secrets()),
             "bad dsn PWD=*** / ***"
         );
+    }
+
+    #[test]
+    fn redacts_odbc_connect() {
+        let uri = "mssql+pyodbc://@h/?odbc_connect=DRIVER%3D%7BX%7D%3BPWD%3D%7BHunter%3B2%7D&x=1";
+        let redacted = redact_uri(uri);
+        assert_eq!(
+            redacted,
+            "mssql+pyodbc://@h/?odbc_connect=DRIVER={X};PWD=***&x=1"
+        );
+        let spec = ConnectionSpec::new(ConnectionTarget::Uri(uri.into()));
+        let secrets = spec.secrets();
+        assert!(secrets.iter().any(|s| s == "Hunter;2"), "{secrets:?}");
+        assert!(!scrub_secrets(uri, &secrets).contains("Hunter"));
     }
 
     #[test]

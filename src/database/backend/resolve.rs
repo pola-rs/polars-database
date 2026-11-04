@@ -250,6 +250,24 @@ fn allowed_for_target(spec: &ConnectionSpec, kind: &BackendKind) -> bool {
     }
 }
 
+/// Parses the `+driver` part of a URI's scheme into a backend.
+///
+/// A URI often comes from configuration (`DATABASE_URL`), so its pin is a bare driver name:
+/// paths to a driver library or manifest are taken only from `driver=`. `+pyodbc` and
+/// `+turbodbc` URIs are SQLAlchemy's (`mssql+pyodbc://…?odbc_connect=…`).
+fn parse_scheme_driver(pin: &str, dialect: DialectName) -> PolarsResult<BackendKind> {
+    polars_ensure!(
+        !pin.is_empty() && pin.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+        InvalidOperation:
+        "the URI scheme's driver part '+{pin}' is not a driver name; a driver library or \
+        manifest can be pinned only with `driver=`"
+    );
+    match pin {
+        "pyodbc" | "turbodbc" => Ok(BackendKind::Sqlalchemy),
+        _ => parse_driver_pin(pin, dialect),
+    }
+}
+
 /// Parses a driver pin (`driver=` or a `+driver` URI suffix) into a backend.
 pub fn parse_driver_pin(pin: &str, dialect: DialectName) -> PolarsResult<BackendKind> {
     let pin = pin.trim();
@@ -373,10 +391,14 @@ pub fn resolve_backend(
 
     // An explicit pin is final: unavailable is an error, never a silent fallback.
     let pin = driver_pin
-        .map(PlSmallStr::from)
-        .or_else(|| spec.scheme_driver());
-    if let Some(pin) = pin {
-        let kind = parse_driver_pin(&pin, dialect)?;
+        .map(|p| (PlSmallStr::from(p), false))
+        .or_else(|| spec.scheme_driver().map(|p| (p, true)));
+    if let Some((pin, from_uri)) = pin {
+        let kind = if from_uri {
+            parse_scheme_driver(&pin, dialect)?
+        } else {
+            parse_driver_pin(&pin, dialect)?
+        };
         let Some(found) = probe(&kind) else {
             if let BackendKind::Adbc { driver } = &kind
                 && adbc_driver_installed(&kind, driver)
@@ -435,4 +457,33 @@ pub fn resolve_backend(
     )
     .unwrap();
     polars_bail!(ComputeError: "{msg}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheme_drivers_are_names() {
+        let pg = DialectName::Postgresql;
+        for path in ["x.toml", "/abs/x.so", "evil.so", "a-b"] {
+            assert!(parse_scheme_driver(path, pg).is_err(), "{path}");
+        }
+        assert_eq!(
+            parse_scheme_driver("psycopg2", pg).unwrap(),
+            BackendKind::Python {
+                module: "psycopg2".into()
+            }
+        );
+        // SQLAlchemy's SQL Server URIs
+        assert_eq!(
+            parse_scheme_driver("pyodbc", DialectName::Mssql).unwrap(),
+            BackendKind::Sqlalchemy
+        );
+        // a path still pins through `driver=`
+        assert!(matches!(
+            parse_driver_pin("/abs/x.so", pg).unwrap(),
+            BackendKind::Adbc { .. }
+        ));
+    }
 }

@@ -655,6 +655,7 @@ fn postgres_native_type(t: &str) -> bool {
             | "text"
             | "character varying"
             | "character"
+            | "bpchar"
             | "\"char\""
             | "date"
             | "timestamp without time zone"

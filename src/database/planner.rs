@@ -933,6 +933,17 @@ fn column_conversion(
     // `NLS_CALENDAR` (a live connection's may be another).
     if dialect == DialectName::Oracle {
         let t = db_type.trim().to_ascii_lowercase();
+        // `NUMBER(p, s)` with `s > p`: drivers type it `decimal(p, s)`, which Arrow (and
+        // Polars) refuse; read as text, it is parsed as the planned `Decimal(s, s)`
+        if let Some((p, s)) = t
+            .strip_prefix("number(")
+            .and_then(|r| r.strip_suffix(')'))
+            .and_then(|a| a.split_once(','))
+            && let (Ok(p), Ok(s)) = (p.trim().parse::<i64>(), s.trim().parse::<i64>())
+            && s > p
+        {
+            return Some(oracle_number_text(column));
+        }
         // `NUMBER(p, -s)`: drivers fail on a negative scale; its values are integers
         if t.starts_with("number(")
             && let Some(DataType::Int64 | DataType::Decimal(_, 0)) = declared_dtype(dialect, &t)
@@ -972,10 +983,29 @@ fn column_conversion(
     // - `±infinity` dates and timestamps: psycopg2 reads them as `date.max` / `date.min`
     //   (ADBC checks them itself).
     // - a multi-dimensional array: ADBC flattens it (other drivers fail).
+    //
+    // A live connection gets no session setup: psycopg returns a `timestamptz` in the
+    // session's time zone, whose instant Python recomputes from its own tzdata (wrong for
+    // old dates: 1900 in Europe/Amsterdam is off by 19 minutes), and pg8000 fails on
+    // such an offset. It is read as its UTC wall-clock time, which the cast to the planned
+    // `Datetime(…, "UTC")` takes as UTC.
     if matches!(dialect, DialectName::Postgresql | DialectName::Redshift) {
+        let t = db_type.trim().to_ascii_lowercase();
+        let utc = !setup_runs
+            && matches!(backend, BackendKind::Python { .. })
+            && t.starts_with("timestamp")
+            && t.ends_with("with time zone");
+        let (value, value_type) = if utc {
+            (
+                format!("({column} AT TIME ZONE 'UTC')"),
+                "timestamp without time zone",
+            )
+        } else {
+            (column.to_string(), db_type)
+        };
         let fail = |what: &str| {
             let msg = dialect.quote_str(&format!("column {column} holds {what}"));
-            format!("CAST({msg} || LEFT(CAST({column} AS TEXT), 0) AS {db_type})")
+            format!("CAST({msg} || LEFT(CAST({column} AS TEXT), 0) AS {value_type})")
         };
         let declared = declared_dtype(dialect, db_type);
         let element = match &declared {
@@ -997,7 +1027,6 @@ fn column_conversion(
         }
         let postgres = dialect == DialectName::Postgresql;
         if postgres && !matches!(backend, BackendKind::Adbc { .. }) {
-            let t = db_type.trim().to_ascii_lowercase();
             let base = t.trim_end_matches("[]");
             if base == "date" || base.starts_with("timestamp") {
                 let infinite = if t.ends_with("[]") {
@@ -1021,7 +1050,10 @@ fn column_conversion(
                 .map(|(when, then)| format!("WHEN {when} THEN {then}"))
                 .collect::<Vec<_>>()
                 .join(" ");
-            return Some(format!("CASE {whens} ELSE {column} END"));
+            return Some(format!("CASE {whens} ELSE {value} END"));
+        }
+        if utc {
+            return Some(value);
         }
     }
     if dialect == DialectName::Duckdb
@@ -1288,10 +1320,7 @@ fn order_by_expr(config: &DatabaseScanConfig, column: &PlSmallStr) -> SqlExpr {
         return SqlExpr::col(column.clone());
     }
     let dialect = config.dialect;
-    let relation = match &config.options.relation {
-        relation @ DatabaseRelation::Table { .. } => quoted_relation(dialect, relation),
-        DatabaseRelation::Query { .. } => dialect.quote_ident("_pl"),
-    };
+    let relation = relation_qualifier(config);
     let qualified = format!("{relation}.{}", dialect.quote_ident(column));
     SqlExpr::Raw(format!(
         "IF({}, NULL, {qualified})",
@@ -1756,6 +1785,14 @@ pub fn compile_scan(
 /// A column as a select item, read through its conversion if it has one.
 fn select_item(config: &DatabaseScanConfig, c: &PlSmallStr) -> SqlSelectItem {
     let dialect = config.dialect;
+    // SQLite reads an unknown double-quoted name as a string literal: a column missing from
+    // the source (`schema=`, or dropped since planning) would read as its own name in every
+    // row. Qualified by the relation, it is an error.
+    let ident = if dialect == DialectName::Sqlite {
+        format!("{}.{}", relation_qualifier(config), dialect.quote_ident(c))
+    } else {
+        dialect.quote_ident(c)
+    };
     let conversion = config
         .column(c)
         .and_then(|m| m.db_type.as_deref())
@@ -1765,7 +1802,7 @@ fn select_item(config: &DatabaseScanConfig, c: &PlSmallStr) -> SqlSelectItem {
                 &config.backend.kind,
                 config.session_setup_runs(),
                 t,
-                &dialect.quote_ident(c),
+                &ident,
             )
         });
     match conversion {
@@ -1773,7 +1810,19 @@ fn select_item(config: &DatabaseScanConfig, c: &PlSmallStr) -> SqlSelectItem {
             sql,
             alias: c.clone(),
         },
+        None if dialect == DialectName::Sqlite => SqlSelectItem::Expr {
+            sql: ident,
+            alias: c.clone(),
+        },
         None => SqlSelectItem::Column(c.clone()),
+    }
+}
+
+/// The quoted relation a scan's columns can be qualified by.
+fn relation_qualifier(config: &DatabaseScanConfig) -> String {
+    match &config.options.relation {
+        relation @ DatabaseRelation::Table { .. } => quoted_relation(config.dialect, relation),
+        DatabaseRelation::Query { .. } => config.dialect.quote_ident("_pl"),
     }
 }
 

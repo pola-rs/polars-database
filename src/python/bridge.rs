@@ -70,6 +70,17 @@ fn exiting() -> bool {
     EXITING.load(Ordering::Acquire)
 }
 
+/// Releases the Python objects dropped without the GIL, which pyo3 queues until this module's
+/// next use of it: the host releases plans on its own threads, or with a GIL this module
+/// doesn't know it holds. A scan's live connection (a DuckDB file kept open), connection
+/// factory or credential provider would stay referenced until the next scan.
+pub(crate) fn release_queued_objects() {
+    // SAFETY: only reads whether the interpreter exists.
+    if !exiting() && unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
+        Python::attach(|_| {});
+    }
+}
+
 fn exiting_err() -> polars_error::PolarsError {
     polars_err!(ComputeError: "the database read was stopped: Python is exiting")
 }
@@ -220,6 +231,9 @@ impl PythonDriverBridge for PyDriverBridge {
         dialect: DialectName,
         batch_size: Option<usize>,
     ) -> PolarsResult<Box<dyn DatabaseSession>> {
+        if exiting() {
+            return Err(exiting_err());
+        }
         let secrets: Arc<[String]> = spec.secrets().into();
         Python::attach(|py| {
             let (target_kind, obj) = target(py, spec)?;

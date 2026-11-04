@@ -1849,3 +1849,155 @@ def test_scan_connectorx_older_than_the_minimum_is_refused(
     monkeypatch.setattr(cx, "__version__", "0.3.3")
     with pytest.raises(Exception, match=rf"connectorx {_bridge._MIN_CONNECTORX}"):
         pl.scan_database("orders", shop_uri, driver="connectorx").collect()
+
+
+@pytest.mark.parametrize("scheme", ["sqlite+x.toml", "sqlite+Evil.so"])
+def test_scan_uri_driver_part_is_never_a_path(tmp_path: Path, scheme: str) -> None:
+    # `+x.toml` read a manifest from the cwd and loaded the library it names: a URI often
+    # comes from configuration (`DATABASE_URL`)
+    (tmp_path / "x.toml").write_text('[Driver]\nshared = "/nonexistent/x.so"\n')
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        with pytest.raises(Exception, match="is not a driver name"):
+            pl.scan_database("t", f"{scheme}:///{tmp_path}/a.db").collect()
+    finally:
+        os.chdir(cwd)
+
+
+def test_scan_odbc_connect_password_is_redacted() -> None:
+    from polars_database import _bridge
+
+    uri = "mssql+pyodbc://@h/?odbc_connect=DRIVER%3D%7BX%7D%3BPWD%3DHunter2Secret"
+    secrets = _bridge._secrets(uri, None, {})
+    assert "Hunter2Secret" in secrets
+    assert "Hunter2Secret" not in _bridge._scrub(f"failed: {uri}", secrets)
+
+
+@pytest.mark.parametrize("driver", ["adbc", "connectorx", "sqlite3", "sqlalchemy"])
+def test_scan_sqlite_missing_column_is_an_error(tmp_path: Path, driver: str) -> None:
+    # SQLite reads an unknown double-quoted name as a string: a `schema=` column the table
+    # doesn't have read as its own name in every row
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, a INTEGER)")
+        conn.execute("INSERT INTO t VALUES (1, 2)")
+        conn.commit()
+    _skip_without_driver(driver)
+    lf = pl.scan_database(
+        "t",
+        f"sqlite:///{path}",
+        driver=driver,
+        schema={"id": pl.Int64, "a": pl.Int64, "nope": pl.String},
+    )
+    with pytest.raises(Exception, match="nope"):
+        lf.collect()
+
+
+def _skip_without_driver(driver: str) -> None:
+    module = {
+        "adbc": "adbc_driver_manager",
+        "connectorx": "connectorx",
+        "sqlalchemy": "sqlalchemy",
+    }.get(driver)
+    if module is not None:
+        pytest.importorskip(module)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "values"),
+    [
+        (pl.Datetime("ms"), ["2026-01-01 10:00:00.789123"]),
+        (pl.Date, ["2026-01-01 10:00:00"]),
+    ],
+)
+def test_scan_schema_coarser_than_the_column_is_an_error(
+    tmp_path: Path, dtype: PolarsDataType, values: list[str]
+) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE TABLE t (ts TIMESTAMP)")
+        conn.executemany("INSERT INTO t VALUES (?)", [[v] for v in values])
+    lf = pl.scan_database("t", f"duckdb:///{path}", schema={"ts": dtype})
+    with pytest.raises(Exception, match="would cut"):
+        lf.collect()
+    # exact values read
+    with duckdb.connect(path) as conn:
+        conn.execute("UPDATE t SET ts = date_trunc('day', ts)")
+    assert lf.collect()["ts"].dtype == dtype
+
+
+def test_scan_schema_float32_overflow_is_an_error(tmp_path: Path) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE TABLE t AS SELECT 1e300::DOUBLE AS f UNION ALL SELECT 0.5")
+    lf = pl.scan_database("t", f"duckdb:///{path}", schema={"f": pl.Float32})
+    with pytest.raises(Exception, match="Float32"):
+        lf.collect()
+
+
+def test_scan_in_an_atexit_hook_registered_before_the_first_scan(
+    shop_db: Path,
+) -> None:
+    # `polars_database` is imported at the first scan, so its `atexit` hook ran before a
+    # user's registered earlier, and stopped every later scan ("Python is exiting")
+    code = textwrap.dedent(
+        f"""
+        import atexit
+        import polars as pl
+
+        def hook():
+            n = pl.scan_database("orders", {f"sqlite:///{shop_db}"!r}).collect().height
+            print("rows", n)
+
+        atexit.register(hook)
+        pl.scan_database("orders", {f"sqlite:///{shop_db}"!r}).head(1).collect()
+        """
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+    )
+    assert out.returncode == 0, out.stderr
+    assert f"rows {N_ROWS}" in out.stdout, out.stderr
+
+
+def test_scan_live_duckdb_connection_is_released_with_the_frame(tmp_path: Path) -> None:
+    # The scan's Python objects were released only at the plugin's next use of the GIL:
+    # the connection kept its file open after `del lf`
+    import gc
+
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    con = duckdb.connect(path)
+    con.execute("CREATE TABLE t AS SELECT 1 AS id")
+    before = sys.getrefcount(con)
+    lf = pl.scan_database("t", con)
+    assert lf.collect().height == 1
+    del lf
+    gc.collect()
+    assert sys.getrefcount(con) == before
+
+
+def test_scan_sqlite3_factory_subclass_from_main(shop_db: Path) -> None:
+    # classified by its own module (`__main__`), it had no backend
+    code = textwrap.dedent(
+        f"""
+        import sqlite3
+        import polars as pl
+
+        class MyConn(sqlite3.Connection):
+            pass
+
+        conn = sqlite3.connect(
+            {str(shop_db)!r}, factory=MyConn, check_same_thread=False
+        )
+        print("rows", pl.scan_database("orders", conn).collect().height)
+        """
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+    )
+    assert out.returncode == 0, out.stderr
+    assert f"rows {N_ROWS}" in out.stdout

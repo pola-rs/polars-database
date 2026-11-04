@@ -205,7 +205,11 @@ unsafe extern "C" fn resolver_clone(h: ResolverHandle) -> ResolverHandle {
 /// # Safety
 /// `h` must be a live resolver handle, not used afterwards.
 pub unsafe extern "C" fn resolver_release(h: ResolverHandle) {
-    ffi_call_infallible(|| unsafe { release_handle::<Resolver>(h.0) })
+    ffi_call_infallible(|| {
+        unsafe { release_handle::<Resolver>(h.0) };
+        #[cfg(feature = "python")]
+        crate::python::release_queued_objects();
+    })
 }
 
 unsafe extern "C" fn resolver_name(_h: ResolverHandle) -> FfiBuf {

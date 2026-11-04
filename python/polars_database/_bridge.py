@@ -91,10 +91,53 @@ def probe(kind: str) -> tuple[str | None, str | None] | None:
 
 
 def _module_of(obj: Any) -> str:
-    module = type(obj).__module__.split(".", 1)[0]
+    """
+    The driver module of a connection (cursor, result); a user's subclass of a driver's
+    class (`sqlite3.connect(factory=MyConn)`) is its base's.
+    """
+    own = None
+    for cls in type(obj).__mro__:
+        module = _top_module(cls)
+        if module in _DRIVER_MODULES:
+            return module
+        if own is None:
+            own = module
+    return own or _top_module(type(obj))
+
+
+def _top_module(cls: type) -> str:
+    module = (getattr(cls, "__module__", None) or "builtins").split(".", 1)[0]
     # compiled driver modules can have a leading underscore (eg: "_duckdb")
     public = module.lstrip("_")
     return public if public != module and _has_module(public) else module
+
+
+# Modules whose classes a user may subclass: a subclass is served as its base
+_DRIVER_MODULES = frozenset(
+    {
+        "adbc_driver_manager",
+        "sqlalchemy",
+        "sqlite3",
+        "duckdb",
+        "psycopg",
+        "psycopg2",
+        "pg8000",
+        "pymysql",
+        "mysql",
+        "MySQLdb",
+        "mariadb",
+        "oracledb",
+        "cx_Oracle",
+        "clickhouse_connect",
+        "pymssql",
+        "pyodbc",
+        "snowflake",
+        "databricks",
+        "google",
+        "trino",
+        "redshift_connector",
+    }
+)
 
 
 def _pool_checkout(
@@ -293,7 +336,25 @@ def _with_credentials(uri: str, creds: tuple[str | None, str | None] | None) -> 
     elif colon:
         # the provider gave no password: keep the URI's (encoded, see `_split_authority`)
         auth += ":" + quote(unquote(old_password), safe="")
+    if creds:
+        # libpq, MySQL drivers and SQLAlchemy read a `?password=` after the userinfo:
+        # the provider's must win
+        rest = _without_query_keys(
+            rest,
+            ({"user", "username", "uid"} if user is not None else set())
+            | ({"password", "passwd", "pwd"} if password is not None else set()),
+        )
     return f"{scheme}://{auth}@{host}{rest}" if auth else f"{scheme}://{host}{rest}"
+
+
+def _without_query_keys(rest: str, keys: set[str]) -> str:
+    """The path and query `rest` without the query parameters named `keys` (any case)."""
+    head, sep, query = rest.partition("?")
+    if not sep or not keys:
+        return rest
+    query, hash_, fragment = query.partition("#")
+    kept = [kv for kv in query.split("&") if kv.partition("=")[0].lower() not in keys]
+    return head + ("?" + "&".join(kept) if kept else "") + hash_ + fragment
 
 
 # Seconds before a connect attempt gives up, where the URI sets none: libpq waits for
@@ -324,6 +385,27 @@ def _with_connect_timeout(uri: str, dialect: str, kind: str) -> str:
 def _strip_driver(uri: str) -> str:
     scheme, sep, rest = uri.partition(":")
     return scheme.split("+", 1)[0] + sep + rest
+
+
+# The scheme drivers read for a dialect whose aliases (`pgsql://`, `neon://`, `tidb://`)
+# scan_database also takes
+_CANONICAL_SCHEMES = {
+    "postgresql": ("postgresql", "postgres"),
+    "mysql": ("mysql",),
+    "mssql": ("mssql",),
+}
+
+
+def _canonical_scheme(uri: str, dialect: str, head: str) -> str:
+    """The URI with an alias scheme written as its dialect's (`pgsql://` as `postgresql://`)."""
+    if (schemes := _CANONICAL_SCHEMES.get(dialect)) is None:
+        return uri
+    scheme, sep, rest = uri.partition(":")
+    base, plus, driver = scheme.partition("+")
+    if base.lower() in schemes or (head == "sqlalchemy" and base.lower() == "mariadb"):
+        # SQLAlchemy has a `mariadb` dialect
+        return uri
+    return f"{schemes[0]}{plus}{driver}{sep}{rest}"
 
 
 def _libpq_uri(uri: str) -> str:
@@ -1087,25 +1169,37 @@ def _secrets(
             out += [p for p in re.split("[/?#@]", password) if p != password]
         if sep:
             query = rest[at + 1 if at is not None else 0 :].partition("?")[2]
-            out += [v for k, v in parse_qsl(query) if _is_secret_option(k)]
+            for k, v in parse_qsl(query):
+                if _is_secret_option(k):
+                    out.append(v)
+                elif k.lower() in ("odbc_connect", "odbc_connect_string"):
+                    # SQLAlchemy's `mssql+pyodbc://?odbc_connect=…%3BPWD%3D…`
+                    odbc = _odbc_secrets(v)
+                    out += odbc + [quote(s, safe="") for s in odbc]
         else:
-            # an ODBC connection string: `PWD=…` or `PWD={…;…}`
-            for m in re.finditer(
-                r"(?i)(?:^|;)\s*([^=;]*)=\s*(\{(?:[^}]|\}\})*\}|[^;]*)",
-                target,
-            ):
-                if not _is_secret_option(m.group(1)):
-                    continue
-                value = m.group(2).strip()
-                out.append(value)
-                if value.startswith("{"):
-                    out.append(value[1:-1].replace("}}", "}"))
+            out += _odbc_secrets(target)
     if creds and creds[1]:
         out += [creds[1], quote(creds[1], safe="")]
     for key, value in options.items():
         if isinstance(value, str) and _is_secret_option(key):
             out.append(value)
     return sorted({s for s in out if s}, key=len, reverse=True)
+
+
+def _odbc_secrets(conn_str: str) -> list[str]:
+    """The secret values of an ODBC connection string: `PWD=…` or `PWD={…;…}`."""
+    out = []
+    for m in re.finditer(
+        r"(?i)(?:^|;)\s*([^=;]*)=\s*(\{(?:[^}]|\}\})*\}|[^;]*)",
+        conn_str,
+    ):
+        if not _is_secret_option(m.group(1)):
+            continue
+        value = m.group(2).strip()
+        out.append(value)
+        if value.startswith("{"):
+            out.append(value[1:-1].replace("}}", "}"))
+    return out
 
 
 # Secrets shorter than this are only replaced where they stand as a value (`:pw@`,
@@ -1475,12 +1569,19 @@ def _session_settings(conn: Any) -> list[str] | None:
 
 
 def _shutdown_socket(conn: Any) -> None:
-    """Stops a PyMySQL connection's result: the server stops sending once it can't."""
+    """
+    Stops a PyMySQL or pg8000 connection's result: the server stops sending once it
+    can't.
+    """
     import socket
 
-    if (sock := getattr(conn, "_sock", None)) is not None:
-        with contextlib.suppress(OSError):
-            sock.shutdown(socket.SHUT_RDWR)
+    # pg8000's `_sock` is a buffered file of its socket `_usock`
+    for name in ("_usock", "_sock"):
+        sock = getattr(conn, name, None)
+        if callable(getattr(sock, "shutdown", None)):
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+            return
 
 
 def _empty_frame(result: Any, *, utc: bool) -> DataFrame:
@@ -1693,9 +1794,10 @@ class _Session:
         # stopped by `cancel` through its socket: the connection is unusable
         self._aborted = False
         module = _module_of(conn)
-        # PyMySQL has no cancel, and closing its unbuffered cursor reads the rest of
-        # the result; a cancelled session is never reused, so its socket can go
-        self._abort_socket = owned and module == "pymysql"
+        # PyMySQL and pg8000 have no cancel, and closing PyMySQL's unbuffered cursor
+        # reads the rest of the result; a cancelled session is never reused, so its
+        # socket can go
+        self._abort_socket = owned and module in ("pymysql", "pg8000")
         # A live connection is never cancelled: a cancel stops whatever runs on it (the
         # user's next statement, once ours ended), and on Postgres aborts the
         # transaction. Its scans' cursors are closed instead.
@@ -2397,7 +2499,8 @@ def _open(
             conn = mod.connect(target, **connect_opts)
         return _Session(conn, owned=True, **session)
 
-    uri = _with_connect_timeout(_with_credentials(target, creds), dialect, kind)
+    uri = _canonical_scheme(_with_credentials(target, creds), dialect, head)
+    uri = _with_connect_timeout(uri, dialect, kind)
     if head == "connectorx":
         unknown = sorted(set(connect_opts) - {"protocol"}) + sorted(
             session["execute_options"]

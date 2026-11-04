@@ -49,6 +49,9 @@ pub fn nans_sort_first(dialect: DialectName) -> bool {
 /// (where an ascending `ORDER BY` puts them first, so partitions read in order stay sorted),
 /// to the last one otherwise. NaNs that fail every comparison go to the first partition if
 /// `nans_first`, to the last one otherwise.
+/// The most partitions a range is split into, whatever `partition_num` asks for.
+pub const MAX_RANGE_PARTITIONS: usize = 65_536;
+
 pub fn range_partitions(
     column: &PlSmallStr,
     lo: f64,
@@ -67,10 +70,20 @@ pub fn range_partitions(
     {
         return vec![Partition { predicate: None }];
     }
-    let step = (hi - lo) / n as f64;
+    // Integer kinds have no more partitions than values; `n` is the user's, unbounded
+    let n = match kind {
+        RangeKind::Float => n,
+        _ => n.min((hi - lo).ceil() as usize + 1),
+    }
+    .min(MAX_RANGE_PARTITIONS);
+    // `hi - lo` overflows to `inf` over a span wider than `f64::MAX`
+    let step = hi / n as f64 - lo / n as f64;
     let mut cuts = Vec::with_capacity(n - 1);
     for i in 1..n {
         let v = lo + step * i as f64;
+        if !v.is_finite() {
+            continue;
+        }
         let v = match kind {
             RangeKind::Int => v.ceil(),
             // No value lies in 1-1900: 100 cuts where 1-99 would, read as itself.
@@ -236,6 +249,53 @@ mod tests {
             range_partitions(&"id".into(), 0.0, 2.0, 8, RangeKind::Int, false, false).len(),
             3
         );
+    }
+
+    #[test]
+    fn partition_counts_are_bounded() {
+        // `partition_num=2**40` allocated a cut per partition
+        let p = range_partitions(
+            &"id".into(),
+            0.0,
+            9.0,
+            1 << 40,
+            RangeKind::Int,
+            false,
+            false,
+        );
+        assert_eq!(p.len(), 10);
+        let p = range_partitions(
+            &"f".into(),
+            0.0,
+            1.0,
+            1 << 40,
+            RangeKind::Float,
+            false,
+            false,
+        );
+        assert_eq!(p.len(), MAX_RANGE_PARTITIONS);
+        // a span wider than `f64::MAX` made an `inf` step
+        let p = range_partitions(
+            &"f".into(),
+            -1e308,
+            1e308,
+            4,
+            RangeKind::Float,
+            false,
+            false,
+        );
+        assert_eq!(p.len(), 4);
+        let finite = |e: &SqlExpr| {
+            fn walk(e: &SqlExpr) -> bool {
+                match e {
+                    SqlExpr::Literal(SqlLiteral::Float(v)) => v.is_finite(),
+                    SqlExpr::Binary(l, _, r) => walk(l) && walk(r),
+                    _ => true,
+                }
+            }
+            walk(e)
+        };
+        assert!(p.iter().all(|p| p.predicate.as_ref().is_none_or(finite)));
     }
 
     fn takes_nulls(p: &Partition) -> bool {

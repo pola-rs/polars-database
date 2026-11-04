@@ -52,6 +52,34 @@ pub fn wait_for_scans(timeout: std::time::Duration) -> bool {
     *live == 0
 }
 
+/// The cancel handles of every partition reader, to stop their statements at exit.
+static RUNNING_STATEMENTS: Mutex<Vec<std::sync::Weak<Mutex<Option<CancelHandle>>>>> =
+    Mutex::new(vec![]);
+
+fn register_statement(cancel: &Arc<Mutex<Option<CancelHandle>>>) {
+    let mut running = RUNNING_STATEMENTS.lock().unwrap();
+    running.retain(|w| w.strong_count() > 0);
+    running.push(Arc::downgrade(cancel));
+}
+
+/// Cancels the statement of every partition reader still running one: a thread inside a
+/// driver call when Python finalizes is ended by Python 3.12 and 3.13 through Rust frames,
+/// which aborts the process.
+pub fn cancel_running_statements() {
+    let running: Vec<_> = RUNNING_STATEMENTS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w.upgrade())
+        .collect();
+    for cancel in running {
+        let handle = cancel.lock().unwrap().clone();
+        if let Some(handle) = handle {
+            let _ = handle();
+        }
+    }
+}
+
 /// The plan of a resolved scan: its config, with the SQL of every partition.
 pub struct ReaderBuilder {
     config: Arc<DatabaseScanConfig>,
@@ -744,7 +772,11 @@ unsafe extern "C" fn builder_clone(h: BuilderHandle) -> BuilderHandle {
 }
 
 unsafe extern "C" fn builder_release(h: BuilderHandle) {
-    ffi_call_infallible(|| unsafe { release_handle::<ReaderBuilder>(h.0) })
+    ffi_call_infallible(|| {
+        unsafe { release_handle::<ReaderBuilder>(h.0) };
+        #[cfg(feature = "python")]
+        crate::python::release_queued_objects();
+    })
 }
 
 unsafe extern "C" fn builder_name(h: BuilderHandle) -> FfiBuf {
@@ -800,7 +832,11 @@ fn polars_ensure_compiled(config: &DatabaseScanConfig) -> PolarsResult<()> {
 }
 
 unsafe extern "C" fn scan_release(h: ScanHandle) {
-    ffi_call_infallible(|| unsafe { release_handle::<Scan>(h.0) })
+    ffi_call_infallible(|| {
+        unsafe { release_handle::<Scan>(h.0) };
+        #[cfg(feature = "python")]
+        crate::python::release_queued_objects();
+    })
 }
 
 unsafe extern "C" fn reader_new(h: ScanHandle, source: FfiStr<'_>) -> FfiResult<ReaderHandle> {
@@ -823,6 +859,8 @@ unsafe extern "C" fn reader_new(h: ScanHandle, source: FfiStr<'_>) -> FfiResult<
                     compiled.partitions.len()
                 )
             })?;
+        let cancel = Arc::new(Mutex::new(None));
+        register_statement(&cancel);
         Ok(ReaderHandle(into_handle(Arc::new(PartitionReader {
             shared,
             schema: scan.schema.clone(),
@@ -830,7 +868,7 @@ unsafe extern "C" fn reader_new(h: ScanHandle, source: FfiStr<'_>) -> FfiResult<
             partition: Arc::new(partition),
             n_rows: Mutex::new(None),
             counted_rows: Mutex::new(None),
-            cancel: Arc::new(Mutex::new(None)),
+            cancel,
             cancelled: Arc::new(AtomicBool::new(false)),
             error: Arc::new(Mutex::new(None)),
         }))))

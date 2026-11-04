@@ -30,7 +30,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlsplit
@@ -1291,15 +1291,17 @@ def test_postgres_statement_timeout_is_not_retried(driver: str) -> None:
 @ORACLE_GROUP
 @pytest.mark.parametrize("connection", ["live", "factory"])
 def test_oracle_linguistic_session(connection: str) -> None:
+    # a table per connection: parametrizations may run at once on other workers
+    table = f"review_nls_{connection}"
     _execute(
         "oracle",
         [
-            "BEGIN EXECUTE IMMEDIATE 'DROP TABLE review_nls'; "
+            f"BEGIN EXECUTE IMMEDIATE 'DROP TABLE {table}'; "
             "EXCEPTION WHEN OTHERS THEN NULL; END;",
-            'CREATE TABLE review_nls ("id" NUMBER(9), s VARCHAR2(10))',
-            "INSERT INTO review_nls VALUES (1, 'abc')",
-            "INSERT INTO review_nls VALUES (2, 'ABC')",
-            "INSERT INTO review_nls VALUES (3, 'x')",
+            f'CREATE TABLE {table} ("id" NUMBER(9), s VARCHAR2(10))',
+            f"INSERT INTO {table} VALUES (1, 'abc')",
+            f"INSERT INTO {table} VALUES (2, 'ABC')",
+            f"INSERT INTO {table} VALUES (3, 'x')",
         ],
     )
     assert SERVERS["oracle"].uri is not None
@@ -1314,7 +1316,7 @@ def test_oracle_linguistic_session(connection: str) -> None:
 
     # a live session keeps its settings; a factory's sessions get the setup
     source = linguistic() if connection == "live" else linguistic
-    lf = pl.scan_database("REVIEW_NLS", source)
+    lf = pl.scan_database(table.upper(), source)
     _check_filters(
         lf,
         [
@@ -4113,20 +4115,22 @@ def test_oracle_numbers_without_arrow_are_exact(
     monkeypatch.setattr(
         OracleCursorProxy, "supports_arrow", classmethod(lambda cls, conn: False)
     )
+    # a table per connection: parametrizations may run at once on other workers
+    table = f"r7_ora_num_{connection}"
     _execute(
         "oracle",
         [
-            "BEGIN EXECUTE IMMEDIATE 'DROP TABLE r7_ora_num'; "
+            f"BEGIN EXECUTE IMMEDIATE 'DROP TABLE {table}'; "
             "EXCEPTION WHEN OTHERS THEN NULL; END;",
-            'CREATE TABLE r7_ora_num ("id" NUMBER(9), n NUMBER(30, 2), '
+            f'CREATE TABLE {table} ("id" NUMBER(9), n NUMBER(30, 2), '
             "m NUMBER(12, 4), i NUMBER(20), f BINARY_DOUBLE)",
-            "INSERT INTO r7_ora_num VALUES "
+            f"INSERT INTO {table} VALUES "
             "(1, 1234567890123456789012345678.12, 12345678.1234, "
             "12345678901234567890, 0.5)",
-            "INSERT INTO r7_ora_num VALUES (2, -0.07, 0.0001, -1, NULL)",
+            f"INSERT INTO {table} VALUES (2, -0.07, 0.0001, -1, NULL)",
         ],
     )
-    lf = _scan("oracle", connection, "R7_ORA_NUM")
+    lf = _scan("oracle", connection, table.upper())
     df = lf.collect().sort("id")
     assert df["N"].to_list() == [
         Decimal("1234567890123456789012345678.12"),
@@ -4135,3 +4139,165 @@ def test_oracle_numbers_without_arrow_are_exact(
     assert df["M"].to_list() == [Decimal("12345678.1234"), Decimal("0.0001")]
     assert df["I"].cast(pl.String).to_list() == ["12345678901234567890", "-1"]
     assert df["F"].to_list() == [0.5, None]
+
+
+@pytest.mark.parametrize("name", ["mysql", "mariadb"])
+def test_mysql_query_decimal_literals_finer_than_the_scale(name: str) -> None:
+    # A query source has no result types: `DECIMAL(6, 2)` plans a wider scale, and
+    # MySQL 8 folded `x < -0.005` to the column's scale with the wrong sign, keeping 0.00
+    _execute(
+        name,
+        [
+            "DROP TABLE IF EXISTS r9_dec",
+            "CREATE TABLE r9_dec (id INT, x DECIMAL(6, 2))",
+            "INSERT INTO r9_dec VALUES (1, 0.00), (2, -0.01), (3, 0.01), (4, NULL)",
+        ],
+    )
+    lf = _scan(name, "pymysql", "SELECT id, x FROM r9_dec")
+    _check_filters(
+        lf,
+        [
+            pl.col("x") < Decimal("-0.005"),
+            pl.col("x") <= Decimal("-0.005"),
+            pl.col("x") > Decimal("-0.005"),
+            pl.col("x") >= Decimal("-0.005"),
+            pl.col("x").is_between(Decimal("-0.005"), Decimal("0.005")),
+            pl.col("x") < -5e-3,
+        ],
+    )
+
+
+@needs_postgres
+@pytest.mark.parametrize("driver", ["adbc", "psycopg", "sqlalchemy"])
+def test_postgres_query_bpchar_keeps_its_padding(driver: str) -> None:
+    # `pg_typeof` writes `character(n)` as `bpchar`, which was read through a cast to
+    # text that strips the padding; `char(n)[]` was a String
+    table = f"r9_bpchar_{driver}"
+    _execute(
+        "postgres17",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id int, ch char(5), cha char(4)[])",
+            f"INSERT INTO {table} VALUES (1, 'ab', ARRAY['a', 'bb'])",
+        ],
+    )
+    for source in [table, f"SELECT id, ch, cha FROM {table}"]:
+        df = _scan("postgres17", driver, source).collect()
+        assert df["ch"].to_list() == ["ab   "], source
+        assert df["cha"].dtype == pl.List(pl.String), source
+        assert df["cha"].to_list() == [["a   ", "bb  "]], source
+
+
+@needs_postgres
+@pytest.mark.parametrize("module", ["psycopg", "pg8000", "psycopg2"])
+def test_postgres_live_timestamptz_in_a_historical_zone(module: str) -> None:
+    # psycopg returned the session zone's wall-clock time, its instant recomputed from
+    # Python's tzdata: 1900 in Amsterdam read 00:19:32 UTC; pg8000 failed
+    table = f"r9_tstz_{module}"
+    _execute(
+        "postgres17",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id int, ts timestamptz)",
+            f"INSERT INTO {table} VALUES (1, '1900-01-01 00:00:00+00'), "
+            "(2, '1800-01-01 00:00:00+00'), (3, '2026-06-01 12:00:00+00')",
+        ],
+    )
+    assert POSTGRES is not None
+    conn = _live_postgres(module)
+    try:
+        cur = conn.cursor()
+        cur.execute("SET TIME ZONE 'Europe/Amsterdam'")
+        cur.close()
+        df = pl.scan_database(table, conn).collect().sort("id")
+    finally:
+        conn.close()
+    assert df["ts"].dtype == pl.Datetime("us", "UTC")
+    assert df["ts"].dt.replace_time_zone(None).to_list() == [
+        datetime(1900, 1, 1),
+        datetime(1800, 1, 1),
+        datetime(2026, 6, 1, 12),
+    ]
+
+
+def _live_postgres(module: str) -> Any:
+    assert POSTGRES is not None
+    if module == "psycopg":
+        import psycopg
+
+        return psycopg.connect(POSTGRES)
+    if module == "psycopg2":
+        import psycopg2
+
+        return psycopg2.connect(POSTGRES)
+    import pg8000.dbapi
+
+    u = urlsplit(POSTGRES)
+    return pg8000.dbapi.connect(
+        user=u.username,
+        password=u.password,
+        host=u.hostname,
+        port=u.port or 5432,
+        database=u.path.lstrip("/"),
+    )
+
+
+@needs_postgres
+@pytest.mark.parametrize("driver", ["connectorx", "psycopg", "psycopg2", "sqlalchemy"])
+def test_postgres_uri_password_parameter_doesnt_override_the_provider(
+    driver: str,
+) -> None:
+    assert POSTGRES is not None
+    password = urlsplit(POSTGRES).password
+    without_password = POSTGRES.replace(f":{password}@", "@", 1)
+    lf = pl.scan_database(
+        "orders",
+        f"{without_password}?password=WRONG",
+        driver=driver,
+        credential_provider=lambda: {"password": password},
+    )
+    assert lf.select(pl.len()).collect().item() > 0
+
+
+@needs_postgres
+@pytest.mark.parametrize("scheme", ["pgsql", "neon", "cockroachdb"])
+@pytest.mark.parametrize("driver", ["adbc", "connectorx", "psycopg", "sqlalchemy"])
+def test_postgres_alias_schemes(scheme: str, driver: str) -> None:
+    assert POSTGRES is not None
+    uri = scheme + POSTGRES[POSTGRES.index(":") :]
+    lf = pl.scan_database("orders", uri, driver=driver)
+    assert lf.select(pl.len()).collect().item() > 0
+
+
+@pytest.mark.skipif(SERVERS["mariadb"].uri is None, reason="no MariaDB URI")
+@pytest.mark.parametrize("driver", [None, "pymysql", "connectorx"])
+def test_mariadb_scheme(driver: str | None) -> None:
+    # `mariadb://` (a SQLAlchemy URL) failed on the default driver
+    uri = SERVERS["mariadb"].uri
+    assert uri is not None
+    uri = "mariadb" + uri[uri.index(":") :]
+    lf = pl.scan_database("orders", uri, driver=driver)
+    assert lf.select(pl.len()).collect().item() > 0
+
+
+@pytest.mark.skipif(SERVERS["oracle"].uri is None, reason="no Oracle URI")
+@ORACLE_GROUP
+@pytest.mark.parametrize("connection", ["oracledb", "sqlalchemy"])
+def test_oracle_number_with_scale_above_precision(connection: str) -> None:
+    # Arrow refused the drivers' `decimal(5, 7)`, failing the whole scan
+    table = f"r9_ora_ns_{connection}"
+    _execute(
+        "oracle",
+        [
+            f"BEGIN EXECUTE IMMEDIATE 'DROP TABLE {table}'; "
+            "EXCEPTION WHEN OTHERS THEN NULL; END;",
+            f'CREATE TABLE {table} ("id" NUMBER(9), ns NUMBER(5, 7))',
+            f"INSERT INTO {table} VALUES (1, 0.0012345)",
+            f"INSERT INTO {table} VALUES (2, -0.0000001)",
+        ],
+    )
+    # (a query's such column still fails: its type is known only after it is read, #105)
+    df = _scan("oracle", connection, table.upper()).collect().sort("id")
+    assert df["NS"].dtype == pl.Decimal(7, 7)
+    assert df["NS"].to_list() == [Decimal("0.0012345"), Decimal("-0.0000001")]
+    assert df.drop("NS")["id"].to_list() == [1, 2]

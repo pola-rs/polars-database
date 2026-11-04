@@ -127,6 +127,14 @@ def _literal(v: Any, dialect: str | None) -> Any:
             whole, _, frac = x.lstrip("-").partition(".")
             fits = len(frac) <= 9 and len(whole.lstrip("0")) <= 29
             return _raw(f"{'NUMERIC' if fits else 'BIGNUMERIC'} '{x}'")
+        if dialect == "mysql" and "." in x:
+            # MySQL 8 folds a bare literal finer than a DECIMAL column's scale to that
+            # scale with the wrong sign (`x < -0.005` keeps 0.00); a typed one compares
+            # exactly. DECIMAL holds 65 digits, 30 of them fractional.
+            whole, _, frac = x.lstrip("-").partition(".")
+            frac = frac.rstrip("0")
+            if len(frac) <= 30 and len(whole.lstrip("0")) + len(frac) <= 65:
+                return _cast(x, f"DECIMAL(65, {len(frac)})")
         return _number(x)
     if kind == "String":
         return _string(x, dialect)

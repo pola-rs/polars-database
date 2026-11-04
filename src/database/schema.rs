@@ -89,6 +89,17 @@ pub fn declared_dtype(dialect: DialectName, db_type: &str) -> Option<DataType> {
         };
         return Some(DataType::Datetime(unit, tz));
     }
+    // Postgres `timestamptz` is an instant, read as UTC (a live connection's session zone
+    // may be another: see `column_conversion`).
+    if matches!(dialect, DialectName::Postgresql | DialectName::Redshift)
+        && t.starts_with("timestamp")
+        && t.ends_with("with time zone")
+    {
+        return Some(DataType::Datetime(
+            TimeUnit::Microseconds,
+            Some(TimeZone::UTC),
+        ));
+    }
     // Postgres `time`: its `24:00:00` is checked on the way (see `column_conversion`).
     if matches!(dialect, DialectName::Postgresql | DialectName::Redshift)
         && (t == "time without time zone"
@@ -165,6 +176,11 @@ pub fn declared_dtype(dialect: DialectName, db_type: &str) -> Option<DataType> {
         ),
         None => (args.trim().parse::<usize>().ok()?, 0),
     };
+    // Oracle (and Postgres 15+) allow a scale above the precision: `NUMBER(5, 7)` holds
+    // 0.0012345, a `Decimal(7, 7)`
+    if s > p && (1..=38).contains(&s) {
+        return Some(DataType::Decimal(s, s));
+    }
     if !(1..=38).contains(&p) || s > p {
         return None;
     }
@@ -339,9 +355,44 @@ fn decimal_text_scale(v: &str) -> usize {
 /// A cast between integers and floats (or from a decimal to an integer) must not round
 /// either: a strict cast truncates `1000.5` to `1000`, and `2**53 + 1` becomes
 /// `9007199254740992.0`. Columns typed from a sample (SQLite, which has no column types)
-/// may hold values of both kinds.
+/// may hold values of both kinds. Nor may a `schema=` dtype coarser than the column cut a
+/// value (a `Datetime("ms")` or `Date` over microseconds) or overflow (`Float32`); the
+/// nearest float of a decimal or double is its reading.
 fn check_numeric_exact(src: &Column, cast: &Column) -> PolarsResult<()> {
     let (from, to) = (src.dtype(), cast.dtype());
+    if from.is_float() && to == &DataType::Float32 {
+        // the nearest `Float32` is the reading, but not an overflow to infinity
+        let finite = src.as_materialized_series().is_finite()?;
+        let overflow = cast.as_materialized_series().is_infinite()? & finite;
+        if let Some(i) = overflow.iter().position(|v| v == Some(true)) {
+            polars_bail!(
+                SchemaMismatch:
+                "database column '{}' has the value {}, which is out of the range of Float32;                 read the column as pl.Float64",
+                src.name(), src.get(i)?
+            )
+        }
+        return Ok(());
+    }
+    let coarser_time = match (from, to) {
+        (DataType::Datetime(f, _), DataType::Datetime(t, _))
+        | (DataType::Duration(f), DataType::Duration(t)) => time_unit_ns(*t) > time_unit_ns(*f),
+        (DataType::Datetime(_, _), DataType::Date) => true,
+        _ => false,
+    };
+    if coarser_time {
+        let back = cast.cast(from)?;
+        let same = src
+            .as_materialized_series()
+            .equal_missing(back.as_materialized_series())?;
+        if let Some(i) = same.iter().position(|v| v != Some(true)) {
+            polars_bail!(
+                SchemaMismatch:
+                "database column '{}' has the value {}, which {to} would cut; read the column                 as {from}",
+                src.name(), src.get(i)?
+            )
+        }
+        return Ok(());
+    }
     let lossy = (to.is_integer() && (from.is_float() || from.is_decimal()))
         || (to.is_float() && from.is_integer());
     if !lossy {
@@ -365,6 +416,14 @@ fn check_numeric_exact(src: &Column, cast: &Column) -> PolarsResult<()> {
         schema_overrides={{'{}': {alt}}} (or as pl.String)",
         src.name(), src.get(i)?, src.name()
     )
+}
+
+fn time_unit_ns(tu: TimeUnit) -> i64 {
+    match tu {
+        TimeUnit::Nanoseconds => 1,
+        TimeUnit::Microseconds => 1_000,
+        TimeUnit::Milliseconds => 1_000_000,
+    }
 }
 
 /// A `TIME` read as a duration (PyMySQL returns `timedelta`s) as a time of day. MySQL `TIME`
