@@ -4301,3 +4301,100 @@ def test_oracle_number_with_scale_above_precision(connection: str) -> None:
     assert df["NS"].dtype == pl.Decimal(7, 7)
     assert df["NS"].to_list() == [Decimal("0.0012345"), Decimal("-0.0000001")]
     assert df.drop("NS")["id"].to_list() == [1, 2]
+
+
+@pytest.mark.parametrize("server", ["mysql", "mariadb"])
+def test_mysql_decimal_partition_cuts_near_zero(server: str) -> None:
+    # MySQL 8 misorders a float cut in (-0.01, 0) on DECIMAL(10,2): `0.00` was read twice
+    _execute(
+        server,
+        [
+            "DROP TABLE IF EXISTS review_dec_cuts",
+            "CREATE TABLE review_dec_cuts (x DECIMAL(10,2))",
+            "INSERT INTO review_dec_cuts "
+            "WITH RECURSIVE r(i) AS (SELECT -300 UNION ALL SELECT i + 1 FROM r "
+            "WHERE i < 300) SELECT i / 100 FROM r",
+        ],
+    )
+    for n in [600, 7]:
+        lf = _scan(server, "pymysql", "review_dec_cuts", partition_on="x", partition_num=n)
+        out = lf.collect()["x"]
+        assert out.len() == 601, n
+        assert out.n_unique() == 601, n
+
+
+@needs_postgres
+@pytest.mark.parametrize(
+    "driver", ["adbc", "connectorx", "psycopg", "psycopg2", "pg8000"]
+)
+def test_postgres_arrays_of_types_read_as_text(driver: str) -> None:
+    # the whole array was one string: `'{6b0b9f4e-…}'`
+    table = f"review_text_arrays_{driver}"
+    _execute(
+        "postgres17",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"DROP TYPE IF EXISTS {table}_mood",
+            f"CREATE TYPE {table}_mood AS ENUM ('happy', 'sad')",
+            f"CREATE TABLE {table} (id int PRIMARY KEY, u uuid[], j jsonb[], "
+            f"m {table}_mood[], w numeric(50,2)[])",
+            f"INSERT INTO {table} VALUES (1, "
+            "ARRAY['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11']::uuid[], "
+            """ARRAY['{"a": 1}']::jsonb[], ARRAY['happy', 'sad']::"""
+            f"{table}_mood[], ARRAY[1.50]::numeric(50,2)[]), (2, NULL, NULL, NULL, NULL)",
+        ],
+    )
+    # (ConnectorX can't read a query's `uuid[]`, #105; a query's `numeric(50,2)[]` is
+    # `numeric[]`, without its precision)
+    sources = [table] if driver == "connectorx" else [table, f"SELECT * FROM {table}"]
+    for source in sources:
+        out = _scan("postgres17", driver, source).collect().sort("id")
+        assert out.schema["u"] == pl.List(pl.String), source
+        assert out.drop("w").rows() == [
+            (1, ["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"], ['{"a": 1}'], ["happy", "sad"]),
+            (2, None, None, None),
+        ], source
+    out = _scan("postgres17", driver, table).collect().sort("id")
+    assert out["w"].to_list() == [["1.50"], None]
+
+
+@pytest.mark.skipif(SERVERS["clickhouse"].uri is None, reason="no ClickHouse URI")
+def test_clickhouse_array_of_decimals() -> None:
+    # `Array(Decimal(10, 2))` was inferred as a List of a Decimal without precision,
+    # which failed the whole table's discovery
+    from decimal import Decimal
+
+    _execute(
+        "clickhouse",
+        [
+            "DROP TABLE IF EXISTS review_ch_array_decimal",
+            "CREATE TABLE review_ch_array_decimal (id Int32, "
+            "v Array(Decimal(10, 2)), ok Int32) ENGINE = MergeTree ORDER BY id",
+            "INSERT INTO review_ch_array_decimal VALUES (1, [1.5, -2.25], 7)",
+        ],
+    )
+    lf = _scan("clickhouse", "clickhouse_connect", "review_ch_array_decimal")
+    assert lf.collect_schema()["v"] == pl.List(pl.Decimal(10, 2))
+    assert lf.select("ok").collect()["ok"].to_list() == [7]
+    assert lf.collect()["v"].to_list() == [[Decimal("1.50"), Decimal("-2.25")]]
+
+
+@needs_clickhouse
+def test_clickhouse_connectorx_low_cardinality_array_is_refused() -> None:
+    # ConnectorX reads an `Array(LowCardinality(String))` as one string
+    pytest.importorskip("connectorx")
+    table = "review_ch_lc_array"
+    _execute(
+        "clickhouse",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id Int32, a Array(LowCardinality(String))) "
+            "ENGINE = MergeTree ORDER BY id",
+            f"INSERT INTO {table} VALUES (1, ['x', 'y'])",
+        ],
+    )
+    for source in [table, f"SELECT id, a FROM {table}"]:
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="column 'a'"):
+            _scan("clickhouse", "connectorx", source).collect()
+        out = _scan("clickhouse", "clickhouse_connect", source).collect()
+        assert out["a"].to_list() == [["x", "y"]]

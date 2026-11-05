@@ -392,15 +392,16 @@ pub fn query_info(
                 }
             }
         } else if dialect == DialectName::Clickhouse && !columns.is_empty() {
-            // ConnectorX runs only `SELECT`s: the types of an aggregate over no rows (one
-            // row; `LIMIT 0` doesn't run the query). It drops `LowCardinality`, which
-            // doesn't change the values.
+            // ConnectorX runs only `SELECT`s: the types of the columns of no rows joined to
+            // one row (`LIMIT 0` doesn't run the query). An aggregate would drop
+            // `LowCardinality`, which ConnectorX reads differently inside an array.
             let sql = format!(
-                "SELECT {} FROM (SELECT * FROM {from} LIMIT 0) pl_q",
+                "SELECT {} FROM (SELECT 1) pl_d LEFT JOIN (SELECT * FROM {from} LIMIT 0) pl_q \
+                ON 1 = 1",
                 columns
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| format!("toTypeName(any({})) AS c{i}", q(c)))
+                    .map(|(i, c)| format!("toTypeName({}) AS c{i}", q(c)))
                     .collect::<Vec<_>>()
                     .join(", ")
             );

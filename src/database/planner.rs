@@ -546,7 +546,7 @@ pub fn resolve_scan(
             };
             if dialect.text_conversion(t, name).is_some() {
                 // read as text by the dialect rules; the value stays text
-                *dtype = DataType::String;
+                *dtype = dialect.text_conversion_dtype(t);
             } else if let Some(declared) = declared_dtype(dialect, t) {
                 // A query's Postgres `numeric` shows no precision (`pg_typeof` has no type
                 // modifier): psycopg's result description has it, other drivers' don't.
@@ -559,6 +559,17 @@ pub fn resolve_scan(
                     && matches!(dtype, DataType::Decimal(p, _) if *p <= 38);
                 if !precision_from_driver {
                     *dtype = declared;
+                }
+            }
+        }
+        // A DuckDB query's column of a type read as text (bit strings, `VARINT`, …) is read
+        // through its conversion: text, as from a table, not the type's bytes.
+        if dialect == DialectName::Duckdb && is_query {
+            for (name, dtype) in discovered.iter_mut() {
+                if let Some(t) = info.compare_types.get(name.as_str())
+                    && dialect.text_conversion(t, name).is_some()
+                {
+                    *dtype = dialect.text_conversion_dtype(t);
                 }
             }
         }
@@ -720,8 +731,9 @@ pub fn resolve_scan(
 }
 
 /// ConnectorX reads other row counts than there are from a ClickHouse array of `Nullable(…)`,
-/// `DateTime64` or decimal values (none, or more), and nothing tells: reading such a column
-/// is an error. Arrays of plain numbers, strings, dates and booleans read right.
+/// `DateTime64` or decimal values (none, or more), and nothing tells, and an array of
+/// `LowCardinality(…)` as one string: reading such a column is an error. Arrays of plain
+/// numbers, strings, dates and booleans read right.
 fn check_connectorx_arrays(
     config: &DatabaseScanConfig,
     columns: &[PlSmallStr],
@@ -743,8 +755,8 @@ fn check_connectorx_arrays(
         polars_ensure!(
             !wrong,
             InvalidOperation:
-            "ConnectorX reads this ClickHouse array wrong (column '{}'), silently dropping \
-            or adding rows; pin another driver, e.g. driver=\"adbc\" or \"clickhouse_connect\"",
+            "ConnectorX reads this ClickHouse array wrong (column '{}'): its rows, or the \
+            values; pin another driver, e.g. driver=\"adbc\" or \"clickhouse_connect\"",
             c.name
         );
     }
@@ -753,10 +765,6 @@ fn check_connectorx_arrays(
 
 /// A ClickHouse array element type (lower-cased) ConnectorX reads right.
 fn connectorx_clickhouse_array_element(t: &str) -> bool {
-    let t = t
-        .strip_prefix("lowcardinality(")
-        .and_then(|r| r.strip_suffix(')'))
-        .unwrap_or(t);
     matches!(
         t,
         "int8"

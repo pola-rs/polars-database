@@ -1,5 +1,6 @@
 use std::fmt;
 
+use polars_core::prelude::DataType;
 use polars_error::{PolarsResult, polars_bail};
 use serde::{Deserialize, Serialize};
 use strum_macros::{EnumIter, IntoStaticStr};
@@ -267,6 +268,15 @@ impl DialectName {
         }
     }
 
+    /// The dtype of a column read through [`Self::text_conversion`].
+    pub fn text_conversion_dtype(self, db_type: &str) -> DataType {
+        if self == Self::Postgresql && db_type.trim().ends_with("[]") {
+            DataType::List(Box::new(DataType::String))
+        } else {
+            DataType::String
+        }
+    }
+
     /// SQL that reads a column of a declared type as text, for types that drivers can't
     /// export to Arrow consistently (or at all): Postgres `uuid`/`json(b)` (bytes or Python
     /// objects depending on the driver), ClickHouse `UUID` and `Enum*`, Oracle `JSON`. `column`
@@ -278,6 +288,13 @@ impl DialectName {
             db_type.trim().to_ascii_lowercase()
         };
         let t = t.as_str();
+        // A Postgres array is read as an array of text (`text[]`), not as one string
+        if self == Self::Postgresql
+            && let Some(inner) = t.strip_suffix("[]")
+            && (wide_decimal(inner) || !postgres_native_type(t))
+        {
+            return Some(format!("CAST({column} AS TEXT[])"));
+        }
         // Decimals wider than Polars' 38 digits: their exact text.
         if wide_decimal(t) {
             return Some(self.cast_to_text(column));

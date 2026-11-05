@@ -7,7 +7,7 @@ use std::sync::Arc;
 use polars_arrow::datatypes::{ArrowDataType, Field as ArrowField};
 use polars_arrow::ffi as arrow_ffi;
 use polars_core::prelude::*;
-use polars_error::{PolarsError, PolarsResult, polars_bail};
+use polars_error::{PolarsError, PolarsResult, polars_bail, polars_err};
 use polars_io_ext_ffi::common::{ArrowSchema, FfiError, FfiErrorKind, FfiResult};
 
 use crate::PACKAGE_NAME;
@@ -134,5 +134,16 @@ pub fn struct_field_to_schema(field: &ArrowField) -> PolarsResult<Schema> {
     let ArrowDataType::Struct(fields) = field.dtype() else {
         polars_bail!(ComputeError: "expected an Arrow struct schema, got {:?}", field.dtype());
     };
-    Ok(fields.iter().map(Field::from).collect())
+    // Polars panics on an Arrow type it has no dtype for
+    fields
+        .iter()
+        .map(|f| {
+            std::panic::catch_unwind(|| Field::from(f)).map_err(|payload| {
+                polars_err!(
+                    ComputeError: "column '{}' has a type Polars can't read: {}",
+                    f.name, panic_message(&*payload)
+                )
+            })
+        })
+        .collect()
 }

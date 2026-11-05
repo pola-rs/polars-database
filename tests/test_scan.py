@@ -2001,3 +2001,97 @@ def test_scan_sqlite3_factory_subclass_from_main(shop_db: Path) -> None:
     )
     assert out.returncode == 0, out.stderr
     assert f"rows {N_ROWS}" in out.stdout
+
+
+@pytest.mark.parametrize(
+    ("dtype", "lo", "hi"),
+    [
+        ("BIGINT", "-9223372036854775808", "9223372036854775807"),
+        ("UBIGINT", "0", "18446744073709551615"),
+        ("DECIMAL(38,0)", "-" + "9" * 38, "9" * 38),
+    ],
+)
+def test_scan_partitions_over_a_range_wider_than_usize(
+    tmp_path: Path, dtype: str, lo: str, hi: str
+) -> None:
+    # the range's width overflowed the partition count
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute(
+            f"CREATE TABLE t AS SELECT * FROM (VALUES (({lo})::{dtype}), "
+            f"(({hi})::{dtype})) v(x)"
+        )
+    lf = pl.scan_database("t", f"duckdb:///{path}", partition_on="x", partition_num=2)
+    assert sorted(str(v) for v in lf.collect()["x"]) == sorted([lo, hi])
+
+
+def test_scan_fixed_size_array_column(tmp_path: Path) -> None:
+    # the plugin was built without `dtype-array`
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE t AS SELECT * FROM (VALUES (1, [1, 2]::INTEGER[2]), "
+            "(2, NULL), (3, [NULL, 4]::INTEGER[2])) v(id, a)"
+        )
+    uri = f"duckdb:///{path}"
+    expected = pl.DataFrame(
+        {"id": [1, 2, 3], "a": [[1, 2], None, [None, 4]]},
+        schema={"id": pl.Int32, "a": pl.Array(pl.Int32, 2)},
+    )
+    for source in ["t", "SELECT * FROM t"]:
+        lf = pl.scan_database(source, uri)
+        assert_frame_equal(lf.collect().sort("id"), expected)
+        out = lf.filter(pl.col("a").arr.first() == 1).collect()
+        assert out["id"].to_list() == [1]
+
+
+def test_scan_duckdb_bit_strings_in_a_query_are_text(tmp_path: Path) -> None:
+    # a query planned the type's bytes and read their text: `b'0101'`
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE t AS SELECT 1 AS id, '0101'::BIT AS b, "
+            "123456789012345678901234567890123456789012::VARINT AS v"
+        )
+    uri = f"duckdb:///{path}"
+    expected = pl.DataFrame(
+        {"id": [1], "b": ["0101"], "v": ["123456789012345678901234567890123456789012"]},
+        schema={"id": pl.Int32, "b": pl.String, "v": pl.String},
+    )
+    for source in ["t", "SELECT * FROM t"]:
+        assert_frame_equal(pl.scan_database(source, uri).collect(), expected)
+
+
+def test_scan_duckdb_maps_and_nested_arrays(tmp_path: Path) -> None:
+    # without `dtype-map` / `dtype-array`, a MAP read as a list of structs and a list of
+    # arrays failed
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE t AS SELECT 1 AS id, MAP {'k': 1} AS m, "
+            "[[1, 2]::INTEGER[2], NULL] AS la"
+        )
+    uri = f"duckdb:///{path}"
+    for source in ["t", "SELECT * FROM t"]:
+        lf = pl.scan_database(source, uri)
+        expected = pl.read_database(
+            "SELECT * FROM t", duckdb.connect(path, read_only=True)
+        )
+        assert lf.collect_schema() == expected.schema, source
+        assert_frame_equal(lf.collect(), expected)
+        assert lf.filter(pl.col("m").map.len() == 1).collect().height == 1
+
+
+@pytest.mark.parametrize(
+    "dtype", [pl.Float16, pl.Array(pl.Int64, 2), pl.Map(pl.String, pl.Int64)]
+)
+def test_scan_overrides_of_dtypes_the_plugin_was_built_without(
+    shop_uri: str, dtype: pl.DataType
+) -> None:
+    # Polars panicked on Arrow types the plugin's own Polars had no dtype for
+    lf = pl.scan_database("orders", shop_uri, schema_overrides={"status": dtype})
+    assert lf.collect_schema()["status"] == dtype

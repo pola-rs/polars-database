@@ -19,6 +19,9 @@ pub struct Partition {
 pub enum RangeKind {
     Int,
     Float,
+    /// A decimal of this scale: cuts are rounded to it and written as decimal literals (MySQL
+    /// 8 misorders a float literal between minus one unit of the scale and 0).
+    Decimal(usize),
     Date,
     /// A MySQL `YEAR`: an integer that holds 0 or 1901-2155, compared with an integer 1-99
     /// as a year (1970-2069).
@@ -72,8 +75,9 @@ pub fn range_partitions(
     }
     // Integer kinds have no more partitions than values; `n` is the user's, unbounded
     let n = match kind {
-        RangeKind::Float => n,
-        _ => n.min((hi - lo).ceil() as usize + 1),
+        RangeKind::Float | RangeKind::Decimal(_) => n,
+        // `as usize` saturates over a span wider than `usize::MAX`
+        _ => n.min(((hi - lo).ceil() as usize).saturating_add(1)),
     }
     .min(MAX_RANGE_PARTITIONS);
     // `hi - lo` overflows to `inf` over a span wider than `f64::MAX`
@@ -95,6 +99,7 @@ pub fn range_partitions(
             // partitions are open-ended, so clamped cuts lose no rows.
             RangeKind::Date => v.ceil().clamp(MIN_DATE_DAYS as f64, MAX_DATE_DAYS as f64),
             RangeKind::Float => v,
+            RangeKind::Decimal(scale) => format!("{v:.scale$}").parse::<f64>().unwrap_or(v),
         };
         if cuts.last().is_none_or(|last| v > *last) {
             cuts.push(v);
@@ -104,6 +109,8 @@ pub fn range_partitions(
         SqlExpr::Literal(match kind {
             RangeKind::Int | RangeKind::Year => SqlLiteral::Int(v as i128),
             RangeKind::Float => SqlLiteral::Float(v),
+            // `+ 0.0` writes -0 as 0
+            RangeKind::Decimal(scale) => SqlLiteral::Decimal(format!("{:.scale$}", v + 0.0)),
             RangeKind::Date => SqlLiteral::Date(date_text(v as i32)),
         })
     };
@@ -161,7 +168,7 @@ pub fn range_kind(dtype: &DataType) -> Option<RangeKind> {
             // Oracle keys are `NUMBER(p, 0)`. Cut points are shared by adjacent half-open
             // ranges, so a rounded cut never loses or duplicates a row.
             DataType::Decimal(_, 0) => Some(RangeKind::Int),
-            DataType::Decimal(_, _) => Some(RangeKind::Float),
+            DataType::Decimal(_, scale) => Some(RangeKind::Decimal(*scale)),
             _ => None,
         }
     }
@@ -368,6 +375,50 @@ mod tests {
         }
         assert!(cuts.contains(&100), "{cuts:?}");
         assert!(!cuts.iter().any(|c| (1..100).contains(c)), "{cuts:?}");
+    }
+
+    #[test]
+    fn integer_ranges_wider_than_usize() {
+        // BIGINT, UBIGINT / UHUGEINT and DECIMAL(38, 0) extremes.
+        for (lo, hi) in [
+            (i64::MIN as f64, i64::MAX as f64),
+            (0.0, u128::MAX as f64),
+            (-1e38, 1e38),
+        ] {
+            let p = range_partitions(&"x".into(), lo, hi, 2, RangeKind::Int, false, false);
+            assert_eq!(p.len(), 2, "{lo} {hi}");
+        }
+    }
+
+    #[test]
+    fn decimal_cuts_are_decimal_literals_of_the_scale() {
+        let p = range_partitions(
+            &"x".into(),
+            -3.0,
+            3.0,
+            600,
+            RangeKind::Decimal(2),
+            false,
+            false,
+        );
+        let mut cuts = vec![];
+        for part in &p {
+            if let Some(SqlExpr::Binary(_, SqlBinOp::Lt, r)) =
+                part.predicate.as_ref().map(|e| match e {
+                    SqlExpr::Binary(_, SqlBinOp::And, r) => r.as_ref(),
+                    e => e,
+                })
+            {
+                match r.as_ref() {
+                    SqlExpr::Literal(SqlLiteral::Decimal(d)) => cuts.push(d.clone()),
+                    l => panic!("{l:?}"),
+                }
+            }
+        }
+        assert_eq!(cuts.len(), p.len() - 1);
+        assert!(cuts.contains(&"-0.01".to_string()), "{cuts:?}");
+        assert!(cuts.contains(&"0.00".to_string()), "{cuts:?}");
+        assert!(cuts.iter().all(|c| c.split_once('.').unwrap().1.len() == 2));
     }
 
     #[test]

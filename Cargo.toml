@@ -27,6 +27,7 @@ chrono = { workspace = true }
 polars-arrow = { workspace = true }
 polars-core = { workspace = true, features = [
   "serde",
+  "dtype-array",
   "dtype-date",
   "dtype-datetime",
   "dtype-time",
@@ -42,6 +43,8 @@ polars-core = { workspace = true, features = [
   "dtype-u8",
   "dtype-u16",
   "dtype-u128",
+  "dtype-f16",
+  "dtype-map",
 ] }
 polars-config = { workspace = true }
 polars-error = { workspace = true }
