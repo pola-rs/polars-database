@@ -4603,7 +4603,7 @@ def test_clickhouse_long_is_in_of_long_strings(driver: str) -> None:
     # 9000 UUIDs in `IN (…)`: "Max query size exceeded" (256 KiB)
     import uuid
 
-    table = "r13_ch_long_in"
+    table = f"r13_ch_long_in_{driver}"  # each its own: xdist runs them side by side
     values = [str(uuid.UUID(int=k)) for k in range(9000)]
     _execute(
         "clickhouse",
