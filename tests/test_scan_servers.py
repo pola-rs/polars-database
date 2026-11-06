@@ -4597,6 +4597,61 @@ def test_clickhouse_connectorx_question_marks() -> None:
         _execute("clickhouse", [f"DROP TABLE IF EXISTS {table}"])
 
 
+@needs_clickhouse
+@pytest.mark.parametrize("driver", ["clickhouse_connect", "adbc", "connectorx"])
+def test_clickhouse_long_is_in_of_long_strings(driver: str) -> None:
+    # 9000 UUIDs in `IN (…)`: "Max query size exceeded" (256 KiB)
+    import uuid
+
+    table = "r13_ch_long_in"
+    values = [str(uuid.UUID(int=k)) for k in range(9000)]
+    _execute(
+        "clickhouse",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id Int32, s String) ENGINE = MergeTree ORDER BY id",
+            f"INSERT INTO {table} VALUES (1, '{values[5]}'), (2, 'x')",
+        ],
+    )
+    try:
+        lf = _scan("clickhouse", driver, table)
+        out = lf.filter(pl.col("s").is_in(values)).collect()
+        assert out["id"].to_list() == [1]
+    finally:
+        _execute("clickhouse", [f"DROP TABLE IF EXISTS {table}"])
+
+
+@needs_clickhouse
+def test_clickhouse_connectorx_quotes_and_backslashes() -> None:
+    # ConnectorX parses the SQL itself: "Single quoted string is not closed"
+    pytest.importorskip("connectorx")
+    table = "r13_ch_quotes"
+    values = ["a\\'b", "\\'", "''", "it's"]
+    rows = ", ".join(
+        "({}, '{}')".format(i, v.replace("\\", "\\\\").replace("'", "\\'"))
+        for i, v in enumerate(values)
+    )
+    _execute(
+        "clickhouse",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id Int32, s String) ENGINE = MergeTree ORDER BY id",
+            f"INSERT INTO {table} VALUES {rows}",
+        ],
+    )
+    try:
+        lf = _scan("clickhouse", "connectorx", table)
+        for i, v in enumerate(values):
+            for predicate in [
+                pl.col("s") == v,
+                pl.col("s").str.starts_with(v),
+                pl.col("s").str.contains(v, literal=True),
+            ]:
+                assert i in lf.filter(predicate).collect()["id"].to_list(), predicate
+    finally:
+        _execute("clickhouse", [f"DROP TABLE IF EXISTS {table}"])
+
+
 @needs_postgres
 def test_adbc_connect_errors_scrub_query_passwords() -> None:
     # libpq quoted a `?password=` it couldn't decode: `invalid percent-encoded token`

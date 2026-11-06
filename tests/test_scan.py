@@ -1074,6 +1074,91 @@ def test_scan_sqlite_filter_on_large_integers_read_as_floats(
 
 
 @pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
+def test_scan_sqlite_numbers_text_past_the_sample(tmp_path: Path, driver: str) -> None:
+    # a column without affinity typed Int64 / Float64 from its sample: the read parses an
+    # integer's or a real's text, which SQLite compares as text, above every number
+    _importorskip_sqlite_driver(driver)
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, i, f)")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?, ?)", [(k, k, k + 0.5) for k in range(3000)]
+        )
+        conn.execute("INSERT INTO t VALUES (3000, '1', '1.5')")
+        conn.execute("INSERT INTO t VALUES (3001, '2', '2')")
+        conn.commit()
+    uri = f"sqlite:///{path}"
+    lf = pl.scan_database("t", uri, driver=driver)
+    df = lf.filter(pl.col("id") >= 3000).collect()
+    assert df.rows() == [(3000, 1, 1.5), (3001, 2, 2.0)]
+    for predicate in [
+        pl.col("i") == 1,
+        (pl.col("i") > 3) & (pl.col("id") >= 3000),
+        pl.col("i").is_in([1, 2]),
+        pl.col("f") < 2.5,
+        pl.col("f") == 2.0,
+    ]:
+        got = lf.filter(predicate).collect().sort("id")
+        expected = lf.collect().filter(predicate).sort("id")
+        assert_frame_equal(got, expected)
+    # other text (`'+1'`, `'1e0'`) isn't read as a number: it fails, as `'abc'` does
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("INSERT INTO t VALUES (3002, '+1', '1e0')")
+        conn.commit()
+    for column in ["i", "f"]:
+        with pytest.raises(Exception):  # noqa: B017
+            pl.scan_database("t", uri, driver=driver).select(column).collect()
+
+
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
+def test_scan_sqlite_blobs_in_a_text_column(tmp_path: Path, driver: str) -> None:
+    # a blob past the sample reads as its text, which the database compared as a blob
+    _importorskip_sqlite_driver(driver)
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT COLLATE NOCASE)")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?)", [(k, f"v{k % 50}") for k in range(3000)]
+        )
+        conn.execute("INSERT INTO t VALUES (3000, X'7631')")
+        conn.commit()
+    lf = pl.scan_database("t", f"sqlite:///{path}", driver=driver)
+    assert lf.filter(pl.col("id") == 3000).collect()["s"].to_list() == ["v1"]
+    for predicate in [
+        pl.col("s") == "v1",
+        pl.col("s") == "V1",  # the column's collation still applies
+        pl.col("s") != "v1",
+        (pl.col("s") >= "v1") & (pl.col("s") < "v10"),
+        pl.col("s").is_in(["v1", "v2"]),
+        pl.col("s").str.starts_with("v1"),
+    ]:
+        assert lf.filter(predicate).select(pl.len()).collect().item() == (
+            pl.scan_database("t", f"sqlite:///{path}", driver=driver, pushdown=False)
+            .filter(predicate)
+            .select(pl.len())
+            .collect()
+            .item()
+        ), predicate
+    assert "(CAST(\"s\" AS TEXT)) = 'v1'" in _sql(lf.filter(pl.col("s") == "v1"))
+
+
+def test_scan_sqlite_connectorx_quotes_and_backslashes(tmp_path: Path) -> None:
+    # ConnectorX parses the SQL itself, reading `\'` as an escaped quote
+    pytest.importorskip("connectorx")
+    values = ["a\\'b", "\\'", "''", "a\\b", "it's"]
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, s TEXT)")
+        conn.executemany("INSERT INTO t VALUES (?, ?)", list(enumerate(values)))
+        conn.commit()
+    lf = pl.scan_database("t", f"sqlite:///{path}", driver="connectorx")
+    for i, v in enumerate(values):
+        assert lf.filter(pl.col("s") == v).collect()["id"].to_list() == [i], v
+        got = lf.filter(pl.col("s").str.contains(v, literal=True)).collect()
+        assert i in got["id"].to_list(), v
+
+
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
 def test_scan_sqlite_reals_as_text_as_polars_writes_them(
     tmp_path: Path, driver: str
 ) -> None:

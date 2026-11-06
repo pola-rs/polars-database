@@ -844,8 +844,11 @@ pub fn resolve_scan(
                 },
                 ref dt
                     if dt.is_integer()
-                        && (connectorx || affinity.get(&c.name) != Some(&DataType::Int64)) =>
+                        && affinity.get(&c.name).is_some_and(|a| a != &DataType::Int64) =>
                 {
+                    c.db_type = Some(SQLITE_UNTYPED_INTEGER.into())
+                },
+                ref dt if dt.is_integer() && (connectorx || !affinity.contains_key(&c.name)) => {
                     c.db_type = Some(SQLITE_INTEGER.into())
                 },
                 DataType::Binary if connectorx => c.db_type = Some(CONNECTORX_SQLITE_VALUE.into()),
@@ -1032,8 +1035,13 @@ const CONNECTORX_DECIMAL: &str = "<connectorx decimal>";
 /// The `db_type` of a SQLite String / Float64 column: its values converted to text / reals.
 const SQLITE_TEXT: &str = "<sqlite text>";
 const SQLITE_REAL: &str = "<sqlite real>";
-/// The `db_type` of a SQLite integer column: an integral real read as an integer.
+/// The `db_type` of a SQLite integer column: an integral real (or an integer's text) read
+/// as an integer. A query's column, or an INTEGER one read through ConnectorX, is compared
+/// as it is (an index on it serves).
 const SQLITE_INTEGER: &str = "<sqlite integer>";
+/// The `db_type` of a SQLite table's integer column of another affinity (none, NUMERIC):
+/// as [`SQLITE_INTEGER`], compared through the conversion.
+const SQLITE_UNTYPED_INTEGER: &str = "<sqlite untyped integer>";
 /// The `db_type` of a SQLite column retyped to an integer by `schema_overrides`: a real cut
 /// to an integer, as the cast to the override cuts it.
 const SQLITE_INTEGER_CUT: &str = "<sqlite integer cut>";
@@ -1181,18 +1189,28 @@ fn column_conversion(
         // `+x` is `x`, of any class, but an expression
         return Some(format!("+{column}"));
     }
+    // Text in a column read as numbers is parsed by the read (`'1'` as 1), while SQLite
+    // compares it as text, above every number: an integer's or a real's text as SQLite
+    // writes it is read as that number, other text marked so that no read parses it (`'+1'`,
+    // `'1e0'`; it fails, as `'abc'` does).
+    let integer_text = format!("CAST(CAST({column} AS INTEGER) AS TEXT) = {column}");
+    let other_text = format!("WHEN typeof({column}) = 'text' THEN char(1) || {column}");
     if db_type == SQLITE_REAL {
-        // a text value stays text, and fails the read
         return Some(format!(
-            "CASE WHEN typeof({column}) = 'integer' THEN CAST({column} AS REAL) ELSE {column} END"
+            "CASE WHEN typeof({column}) = 'integer' THEN CAST({column} AS REAL) \
+            WHEN typeof({column}) = 'text' AND ({integer_text} \
+            OR CAST(CAST({column} AS REAL) AS TEXT) = {column}) THEN CAST({column} AS REAL) \
+            {other_text} ELSE {column} END"
         ));
     }
-    if db_type == SQLITE_INTEGER {
+    if db_type == SQLITE_INTEGER || db_type == SQLITE_UNTYPED_INTEGER {
         // another real stays a real, and fails the read (`1.5`, `1e19`): `CAST` would cut
         // it; `CAST(x AS INTEGER) = x` compares exactly, not as reals
         return Some(format!(
             "CASE WHEN typeof({column}) = 'real' AND CAST({column} AS INTEGER) = {column} \
-            THEN CAST({column} AS INTEGER) ELSE {column} END"
+            THEN CAST({column} AS INTEGER) \
+            WHEN typeof({column}) = 'text' AND {integer_text} THEN CAST({column} AS INTEGER) \
+            {other_text} ELSE {column} END"
         ));
     }
     if db_type == SQLITE_INTEGER_CUT {
@@ -1728,20 +1746,31 @@ fn converted_select_list(
 }
 
 /// The SQL a filter compares a column through, where not the column itself: a SQLite column
-/// read converted to reals, which may hold integers (no REAL affinity). The database
-/// compares `2**53 + 1` exactly, while Polars reads it as `9007199254740992.0`, so the
-/// converted value is compared, as read. (An index on the column isn't used then.)
+/// read converted, whose values the database would compare as other values than Polars
+/// reads. One read as reals or integers without that affinity may hold integers (`2**53 +
+/// 1`, read as `9007199254740992.0`), integral reals or numbers' text (`'1'`, read as 1); a
+/// text one blobs (`X'7631'`, read as `'v1'`). The converted value is compared, as read (an
+/// index on the column isn't used then); a text one as `CAST(x AS TEXT)`, which keeps its
+/// collation (it holds no numbers: TEXT affinity, see `catalog::compares_as_text`).
 pub(crate) fn compared_column_sql(config: &DatabaseScanConfig, column: &str) -> Option<String> {
     let c = config.column(column)?;
-    if config.dialect != DialectName::Sqlite || c.db_type.as_deref() != Some(SQLITE_REAL) {
+    if config.dialect != DialectName::Sqlite {
+        return None;
+    }
+    let db_type = c.db_type.as_deref()?;
+    let quoted = config.dialect.quote_ident(column);
+    if db_type == SQLITE_TEXT && c.dtype == DataType::String {
+        return Some(format!("CAST({quoted} AS TEXT)"));
+    }
+    if db_type != SQLITE_REAL && db_type != SQLITE_UNTYPED_INTEGER {
         return None;
     }
     column_conversion(
         config.dialect,
         &config.backend.kind,
         config.session_setup_runs(),
-        SQLITE_REAL,
-        &config.dialect.quote_ident(column),
+        db_type,
+        &quoted,
     )
 }
 

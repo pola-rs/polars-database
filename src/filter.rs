@@ -387,11 +387,18 @@ impl Translator<'_> {
             )
             && !(self.dialect() == DialectName::Duckdb
                 && matches!(&self.config.backend.kind, BackendKind::Python { module } if module == "duckdb"));
-        // ConnectorX's ClickHouse client reads every `?` as a bind placeholder
-        let question = s.contains('?')
-            && self.dialect() == DialectName::Clickhouse
-            && matches!(self.config.backend.kind, BackendKind::ConnectorX);
-        !(placeholder || escape || nul || question)
+        // ConnectorX's ClickHouse client reads every `?` as a bind placeholder; it parses
+        // SQLite and ClickHouse SQL itself, reading `\'` as an escaped quote (`'a\''b'`
+        // isn't closed), and a run of quotes (`''''''`) wrongly
+        let connectorx = matches!(self.config.backend.kind, BackendKind::ConnectorX);
+        let question = connectorx && s.contains('?') && self.dialect() == DialectName::Clickhouse;
+        let quotes = connectorx
+            && matches!(
+                self.dialect(),
+                DialectName::Sqlite | DialectName::Clickhouse
+            )
+            && (s.contains('\\') || s.contains("''"));
+        !(placeholder || escape || nul || question || quotes)
     }
 
     /// Whether a literal compared with the column means the same value to the database.
@@ -677,7 +684,14 @@ impl Translator<'_> {
         let mut class = self.leaf_class(name, dtype, CmpOp::Eq)?;
 
         let col = || Box::new(self.compared(name));
-        let mut expr = if lits.len() <= self.dialect().max_in_list() {
+        // (a string's quotes and escapes, the separator; another literal's text)
+        let bytes: usize = lits
+            .iter()
+            .map(|l| l.as_str().map_or(32, |s| s.len() + s.len() / 8 + 4))
+            .sum();
+        let mut expr = if lits.len() <= self.dialect().max_in_list()
+            && bytes <= self.dialect().max_in_list_bytes()
+        {
             SqlExpr::InList(col(), lits, false)
         } else {
             // Too long for one statement: a range that contains every value.

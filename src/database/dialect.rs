@@ -441,6 +441,15 @@ impl DialectName {
         }
     }
 
+    /// Longest `IN (…)` list pushed as-is, in bytes of its literals: ClickHouse refuses a
+    /// statement over `max_query_size` (256 KiB by default).
+    pub fn max_in_list_bytes(self) -> usize {
+        match self {
+            Self::Clickhouse => 64 << 10,
+            _ => 16 << 20,
+        }
+    }
+
     /// Whether `LIMIT`/`TOP`/`FETCH FIRST` is known to work for this dialect.
     pub fn supports_limit(self) -> bool {
         !matches!(self, Self::Generic | Self::Flightsql)
