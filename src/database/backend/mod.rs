@@ -308,8 +308,8 @@ pub fn open_session(
     Ok(session)
 }
 
-/// Casts columns that are `Null` on one side to the other side's dtype, and numeric columns
-/// typed apart to their supertype, so the frames stack.
+/// Casts columns that are `Null` on one side to the other side's dtype, numeric columns
+/// typed apart to their supertype, and numbers next to text to text, so the frames stack.
 fn align_null_columns(mut a: DataFrame, mut b: DataFrame) -> PolarsResult<(DataFrame, DataFrame)> {
     use polars_core::prelude::DataType;
     use polars_core::utils::try_get_supertype;
@@ -343,6 +343,14 @@ fn align_null_columns(mut a: DataFrame, mut b: DataFrame) -> PolarsResult<(DataF
             let c = a.columns()[i].cast(&st)?;
             a.replace_column(i, c)?;
             let c = b.columns()[i].cast(&st)?;
+            b.replace_column(i, c)?;
+        } else if (da == DataType::String && numeric(&db))
+            || (db == DataType::String && numeric(&da))
+        {
+            // A SQLite column of numbers and text, typed per batch: read as text
+            let c = a.columns()[i].cast(&DataType::String)?;
+            a.replace_column(i, c)?;
+            let c = b.columns()[i].cast(&DataType::String)?;
             b.replace_column(i, c)?;
         }
     }

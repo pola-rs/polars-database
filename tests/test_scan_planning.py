@@ -1029,6 +1029,27 @@ def test_volatile_functions_make_a_query_not_repeatable(
 
 
 @pytest.mark.parametrize(
+    ("query", "columns", "all_columns"),
+    [
+        ("SELECT id, x FROM t WHERE random() < 0.5", [], False),
+        ("SELECT random() AS r, id FROM t", ["r"], False),
+        ("SELECT id, (SELECT abs(random())) AS r FROM t", ["r"], False),
+        ("SELECT * FROM (SELECT random() AS r FROM t) AS s", [], True),
+        ("SELECT random() AS r FROM t UNION ALL SELECT 1", [], True),
+        ("SELECT random(), * FROM t", [], True),
+    ],
+)
+def test_volatile_output_columns(
+    query: str, columns: list[str], all_columns: bool
+) -> None:
+    from polars_database._sqlglot import inspect_query
+
+    facts = inspect_query(query, "sqlite")
+    assert facts["volatile_columns"] == columns
+    assert facts["all_columns_volatile"] is all_columns
+
+
+@pytest.mark.parametrize(
     ("uri", "userinfo", "host"),
     [
         # an `@` in a parameter isn't the end of the userinfo, port or not

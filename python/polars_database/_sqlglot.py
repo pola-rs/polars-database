@@ -729,6 +729,37 @@ def _relations(stmt: Any) -> set[str]:
     return names
 
 
+def _volatile_columns(stmt: Any, calls: list[Any]) -> list[str] | None:
+    """
+    The output columns whose values come from volatile functions, `None` if that can't be
+    told (all of them, then). A filter pushed on such a column is wrong where the database
+    merges the wrapped query into the filter's and runs the function again for it
+    (SQLite): `random() AS r` is then filtered on one value and returns another.
+    """
+    projections = (
+        {id(p): p for p in stmt.selects} if isinstance(stmt, exp.Select) else {}
+    )
+    columns: list[str] = []
+    for call in calls:
+        node = call
+        while node is not None and id(node) not in projections:
+            if node is stmt:
+                break
+            node = node.parent
+        if node is not None and id(node) in projections:
+            if node.is_star or not node.alias_or_name:
+                # `t.*`, or a name the database makes up (`random()`)
+                return None
+            columns.append(node.alias_or_name)
+            continue
+        if call.find_ancestor(exp.Select) is not stmt:
+            # in a subquery or CTE, whose columns the outer query may return
+            return None
+        # a condition or ordering of the query itself (`WHERE random() < 0.5`) only
+        # picks rows, as it would without the filter
+    return columns
+
+
 def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
     """Facts about a user query that decide whether it can be wrapped."""
     facts: dict[str, Any] = {
@@ -743,6 +774,8 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
         "nested_queries": False,
         "side_effects": False,
         "side_effects_outside_rows": False,
+        "volatile_columns": [],
+        "all_columns_volatile": False,
         "body": None,
     }
     try:
@@ -783,10 +816,21 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
     )
     facts["nested_queries"] = _nested_queries(stmt)
     relations = _relations(stmt)
-    volatile = any(
-        _is_volatile(node, dialect, relations)
+    volatile_calls = [
+        node
         for node in stmt.find_all(exp.Func, exp.Dot, exp.Column, exp.Literal)
-    )
+        if _is_volatile(node, dialect, relations)
+    ]
+    volatile = bool(volatile_calls)
+    # a function sqlglot doesn't know may be the user's own: SQLite's `create_function`
+    # makes non-deterministic ones by default (Postgres doesn't push a filter through a
+    # volatile one)
+    unknown = list(stmt.find_all(exp.Anonymous)) if dialect == "sqlite" else []
+    columns = _volatile_columns(stmt, volatile_calls + unknown)
+    if columns is None:
+        facts["all_columns_volatile"] = True
+    else:
+        facts["volatile_columns"] = columns
     # anywhere in the query: a nested LIMIT without a unique ORDER BY picks rows too
     facts["repeatable"] = (
         stmt.find(exp.Limit, exp.Fetch, exp.Offset, exp.TableSample) is None

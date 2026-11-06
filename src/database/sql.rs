@@ -302,6 +302,11 @@ pub struct QueryFacts {
     /// Such a function is in a set operation, a query without `FROM`, or a condition,
     /// where MariaDB runs it under a `LIMIT 0`.
     pub side_effects_outside_rows: bool,
+    /// Output columns whose values come from volatile functions (`random() AS r`).
+    pub volatile_columns: Vec<PlSmallStr>,
+    /// A volatile function's values may reach any output column (through a subquery, a
+    /// CTE or `*`).
+    pub all_columns_volatile: bool,
     /// The query without the semicolons and comments after its last token, if it parses.
     pub body: Option<PlSmallStr>,
 }

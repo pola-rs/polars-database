@@ -194,6 +194,10 @@ struct QueryDiscovery {
     side_effects: bool,
     /// `QueryFacts::side_effects_outside_rows`.
     side_effects_outside_rows: bool,
+    /// `QueryFacts::volatile_columns`.
+    volatile_columns: Vec<PlSmallStr>,
+    /// `QueryFacts::all_columns_volatile`.
+    all_columns_volatile: bool,
     /// Every session is read-only ([`read_only_session`]): the database refuses a write.
     read_only_session: bool,
     /// The SQL that finds its schema without running it, where the usual probe would
@@ -362,6 +366,19 @@ pub fn resolve_scan(
                 driver's sessions are read-only; pass partition_on=None, or partition a table"
             );
         }
+        // Partitions are read side by side: the query's own order would hold only within each.
+        if let Ok(facts) = &facts
+            && facts.top_level_order_by_without_limit
+            && matches!(
+                options.partitioning,
+                PartitionSpec::Column { .. } | PartitionSpec::Predicates(_)
+            )
+        {
+            polars_bail!(
+                InvalidOperation:
+                "this query can't be partitioned: its ORDER BY would only order the rows                 within each partition; pass partition_on=None, or sort after the scan"
+            );
+        }
         // `SELECT …; -- done`: the trailing `;` and comments can't go inside `(...)`.
         if let Ok(QueryFacts {
             body: Some(body), ..
@@ -393,6 +410,11 @@ pub fn resolve_scan(
             side_effects_outside_rows: facts
                 .as_ref()
                 .is_ok_and(|f| f.parses && f.side_effects_outside_rows),
+            volatile_columns: facts
+                .as_ref()
+                .map(|f| f.volatile_columns.clone())
+                .unwrap_or_default(),
+            all_columns_volatile: facts.as_ref().is_ok_and(|f| f.all_columns_volatile),
             read_only_session,
             probe: None,
         };
@@ -583,6 +605,20 @@ pub fn resolve_scan(
                 }
             }
         }
+        // DuckDB's Python driver types an empty result's columns `Null`, and some results
+        // aren't sampled (an empty table, a query with a `LIMIT` or a volatile function):
+        // such a column's DuckDB type gives its dtype, not the fallback String.
+        if dialect == DialectName::Duckdb {
+            for (name, dtype) in discovered.iter_mut() {
+                if sampled.contains(name.as_str())
+                    && let Some(t) = info.compare_types.get(name.as_str())
+                    && dialect.text_conversion(t, name).is_none()
+                    && let Some(declared) = duckdb_type_dtype(t)
+                {
+                    *dtype = declared;
+                }
+            }
+        }
         // A DuckDB query's column of a type read as text (bit strings, `VARINT`, …) is read
         // through its conversion: text, as from a table, not the type's bytes.
         if dialect == DialectName::Duckdb && is_query {
@@ -686,29 +722,24 @@ pub fn resolve_scan(
         }
     }
 
-    // ConnectorX can't read a SQLite column whose values have several storage classes
-    // (`'abc'` and `1`), which a String (or a Float64: `1` and `1.5`) column may hold. It
-    // reads a column by its declared type where the values' class allows: a `BOOLEAN`'s
-    // integers as booleans (2 as true), and it fails on a `DATE` / `BLOB` / … column's
-    // integers. An expression has no declared type: its values are read by their class,
-    // as the other drivers read them.
-    if matches!(backend.kind, BackendKind::ConnectorX) && dialect == DialectName::Sqlite {
-        for c in columns.iter_mut() {
-            match c.dtype {
-                DataType::String => c.db_type = Some(SQLITE_TEXT.into()),
-                DataType::Float64 => c.db_type = Some(CONNECTORX_SQLITE_REAL.into()),
-                DataType::Int64 | DataType::Binary => {
-                    c.db_type = Some(CONNECTORX_SQLITE_VALUE.into())
-                },
-                _ => {},
-            }
-        }
-    }
-    // ADBC writes a real in a String column with 6 significant digits.
-    if matches!(backend.kind, BackendKind::Adbc { .. }) && dialect == DialectName::Sqlite {
-        for c in columns.iter_mut().filter(|c| c.dtype == DataType::String) {
-            c.db_type = Some(SQLITE_TEXT.into());
-        }
+    // The columns read as text when retyped to String: a sampled number (`2**53 + 1`
+    // next to `1.5`) would be read as a float first, and then turned into text.
+    let numeric_or_text: Vec<bool> = columns
+        .iter()
+        .map(|c| c.dtype == DataType::String || c.dtype.is_primitive_numeric())
+        .collect();
+
+    // A filter on a volatile function's column (`random() AS r`) isn't pushed: SQLite merges
+    // the wrapped query into the filter's and calls the function again for it, returning
+    // rows whose value fails the filter.
+    for c in columns.iter_mut().filter(|c| {
+        query.all_columns_volatile
+            || query
+                .volatile_columns
+                .iter()
+                .any(|v| v.eq_ignore_ascii_case(&c.name))
+    }) {
+        c.comparable = false;
     }
 
     let schema = match &options.schema_overrides {
@@ -735,6 +766,29 @@ pub fn resolve_scan(
         },
         _ => schema,
     };
+
+    // A SQLite column has no type: one typed from a sample may hold values of several
+    // storage classes (`'abc'` and `1`, `1` and `1.5`). Drivers type a batch by its own
+    // values, so it would depend on the batch which of them round or fail: `2**53 + 1` next
+    // to `1.5` read as `9007199254740992.0`, also when retyped to String. Each column is
+    // read converted to its dtype's class instead (ADBC also writes a real as text with 6
+    // significant digits). ConnectorX reads a column by its declared type where the
+    // values' class allows: a `BOOLEAN`'s integers as booleans (2 as true), and it fails
+    // on a `DATE` / `BLOB` / … column's integers. An expression has no declared type: its
+    // values are read by their class, as the other drivers read them.
+    if dialect == DialectName::Sqlite {
+        let connectorx = matches!(backend.kind, BackendKind::ConnectorX);
+        for (c, numeric_or_text) in columns.iter_mut().zip(numeric_or_text) {
+            match c.dtype {
+                DataType::String if numeric_or_text => c.db_type = Some(SQLITE_TEXT.into()),
+                DataType::Float64 => c.db_type = Some(SQLITE_REAL.into()),
+                DataType::Int64 | DataType::Binary if connectorx => {
+                    c.db_type = Some(CONNECTORX_SQLITE_VALUE.into())
+                },
+                _ => {},
+            }
+        }
+    }
 
     Ok(DatabaseScanConfig {
         fingerprint: options.fingerprint(),
@@ -813,6 +867,38 @@ fn connectorx_clickhouse_array_element(t: &str) -> bool {
 }
 
 /// A dtype with its time zones (also in lists) as UTC.
+/// The dtype DuckDB's scalar type `t` reads as (time zones in UTC); `None` for the others.
+fn duckdb_type_dtype(t: &str) -> Option<DataType> {
+    use DataType as D;
+    let t = t.trim().to_ascii_uppercase();
+    if let Some(args) = t.strip_prefix("DECIMAL(").and_then(|a| a.strip_suffix(')')) {
+        let (p, s) = args.split_once(',')?;
+        return Some(D::Decimal(p.trim().parse().ok()?, s.trim().parse().ok()?));
+    }
+    Some(match t.as_str() {
+        "BOOLEAN" => D::Boolean,
+        "TINYINT" => D::Int8,
+        "SMALLINT" => D::Int16,
+        "INTEGER" => D::Int32,
+        "BIGINT" => D::Int64,
+        "UTINYINT" => D::UInt8,
+        "USMALLINT" => D::UInt16,
+        "UINTEGER" => D::UInt32,
+        "UBIGINT" => D::UInt64,
+        "FLOAT" => D::Float32,
+        "DOUBLE" => D::Float64,
+        "VARCHAR" => D::String,
+        "BLOB" => D::Binary,
+        "DATE" => D::Date,
+        "TIME" => D::Time,
+        "TIMESTAMP" => D::Datetime(TimeUnit::Microseconds, None),
+        "TIMESTAMP_MS" => D::Datetime(TimeUnit::Milliseconds, None),
+        "TIMESTAMP_NS" => D::Datetime(TimeUnit::Nanoseconds, None),
+        "TIMESTAMP WITH TIME ZONE" => D::Datetime(TimeUnit::Microseconds, Some(TimeZone::UTC)),
+        _ => return None,
+    })
+}
+
 fn in_utc(dtype: &DataType) -> DataType {
     match dtype {
         DataType::Datetime(tu, Some(_)) => DataType::Datetime(*tu, Some(TimeZone::UTC)),
@@ -878,10 +964,9 @@ fn alias_shadows_column(dialect: DialectName) -> bool {
 
 /// The `db_type` of a query's decimal column read through ConnectorX: selected as text.
 const CONNECTORX_DECIMAL: &str = "<connectorx decimal>";
-/// The `db_type` of a SQLite String / Float64 column read through ConnectorX (String: or
-/// ADBC): its values converted to text / reals, as the other drivers read them.
+/// The `db_type` of a SQLite String / Float64 column: its values converted to text / reals.
 const SQLITE_TEXT: &str = "<sqlite text>";
-const CONNECTORX_SQLITE_REAL: &str = "<connectorx sqlite real>";
+const SQLITE_REAL: &str = "<sqlite real>";
 /// The `db_type` of a SQLite Int64 / Binary column read through ConnectorX: its values as
 /// they are, without the column's declared type.
 const CONNECTORX_SQLITE_VALUE: &str = "<connectorx sqlite value>";
@@ -918,8 +1003,8 @@ fn column_conversion(
         // `+x` is `x`, of any class, but an expression
         return Some(format!("+{column}"));
     }
-    if db_type == CONNECTORX_SQLITE_REAL {
-        // a text value stays text, and fails the read as it does with other drivers
+    if db_type == SQLITE_REAL {
+        // a text value stays text, and fails the read
         return Some(format!(
             "CASE WHEN typeof({column}) = 'integer' THEN CAST({column} AS REAL) ELSE {column} END"
         ));

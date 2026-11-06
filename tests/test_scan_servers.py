@@ -891,7 +891,7 @@ def test_clickhouse_datetime_and_enum(driver: str) -> None:
 
 @needs_postgres
 def test_postgres_live_connection_left_outside_a_transaction() -> None:
-    import psycopg
+    psycopg = pytest.importorskip("psycopg")
 
     assert POSTGRES is not None
     with psycopg.connect(POSTGRES) as conn:
@@ -1780,7 +1780,7 @@ def test_postgres_cancel_on_a_shared_live_connection() -> None:
     # a live connection is never cancelled
     import threading
 
-    import psycopg
+    psycopg = pytest.importorskip("psycopg")
 
     from polars_database import _bridge
 
@@ -1851,7 +1851,7 @@ def test_mysql_scans_sharing_an_unbuffered_live_connection(driver: str) -> None:
     uri = SERVERS["mysql"].uri
     assert uri is not None
     if driver == "pymysql":
-        import pymysql
+        pymysql = pytest.importorskip("pymysql")
 
         conn = pymysql.connect(**_parts(uri), cursorclass=pymysql.cursors.SSCursor)
     else:
@@ -1877,7 +1877,7 @@ def test_mysql_user_statements_during_an_unbuffered_live_scan(driver: str) -> No
     uri = SERVERS["mysql"].uri
     assert uri is not None
     if driver == "pymysql":
-        import pymysql
+        pymysql = pytest.importorskip("pymysql")
 
         conn = pymysql.connect(**_parts(uri), cursorclass=pymysql.cursors.SSCursor)
     else:
@@ -2239,7 +2239,7 @@ def test_oracle_wide_query_is_described() -> None:
 def test_postgres_live_early_stops_dont_leave_cursors_behind() -> None:
     # early-stopped scans' cursors are closed in the transaction they live in, and
     # names aren't reused: another scan never declares a cursor that still exists
-    import psycopg
+    psycopg = pytest.importorskip("psycopg")
 
     assert POSTGRES is not None
     q = "SELECT g AS id FROM generate_series(1, 200000) g"
@@ -2280,7 +2280,7 @@ def test_mysql_bigint_unsigned_query_source(driver: str) -> None:
 @pytest.mark.parametrize("kind", ["live", "factory"])
 def test_postgres_psycopg2_bytea(kind: str) -> None:
     # psycopg2 returns bytea as memoryview values
-    import psycopg2
+    psycopg2 = pytest.importorskip("psycopg2")
 
     assert POSTGRES is not None
     _execute(
@@ -2304,7 +2304,7 @@ def test_postgres_psycopg2_bytea(kind: str) -> None:
 def test_postgres_unparseable_write_runs_nowhere_and_queries_run_once() -> None:
     # sqlglot can't parse `USING <`: a WITH it can't check is refused where sessions
     # aren't read-only, and a query is never run whole to find its schema
-    import psycopg
+    psycopg = pytest.importorskip("psycopg")
 
     assert POSTGRES is not None
     _execute(
@@ -3448,7 +3448,7 @@ def test_postgres_query_with_a_writing_function_runs_once() -> None:
             "VOLATILE AS $$ INSERT INTO rvc_pg_log VALUES (i); SELECT i $$",
         ],
     )
-    import psycopg
+    psycopg = pytest.importorskip("psycopg")
 
     assert POSTGRES is not None
     query = "SELECT id, rvc_pg_logged(id) AS f FROM rvc_pg_src"
@@ -4025,7 +4025,7 @@ def test_factory_connection_of_the_mariadb_module_is_restored_or_discarded(
     import sys
     import types
 
-    import pymysql  # type: ignore[import-untyped]
+    pymysql = pytest.importorskip("pymysql")
 
     from polars_database import _bridge
 
@@ -4070,7 +4070,7 @@ def test_factory_connection_of_the_mariadb_module_is_restored_or_discarded(
 def test_postgres_c_collation_in_another_server_encoding() -> None:
     # `COLLATE "C"` orders by the bytes of the server encoding: code point order only in
     # UTF-8. In WIN1251, '№' (0xB9, U+2116) sorts before 'А' (0xC0, U+0410).
-    import psycopg
+    psycopg = pytest.importorskip("psycopg")
 
     assert POSTGRES is not None
     with psycopg.connect(POSTGRES, autocommit=True) as conn:
@@ -4223,17 +4223,17 @@ def test_postgres_live_timestamptz_in_a_historical_zone(module: str) -> None:
 def _live_postgres(module: str) -> Any:
     assert POSTGRES is not None
     if module == "psycopg":
-        import psycopg
+        psycopg = pytest.importorskip("psycopg")
 
         return psycopg.connect(POSTGRES)
     if module == "psycopg2":
-        import psycopg2
+        psycopg2 = pytest.importorskip("psycopg2")
 
         return psycopg2.connect(POSTGRES)
-    import pg8000.dbapi
+    pg8000_dbapi = pytest.importorskip("pg8000.dbapi")
 
     u = urlsplit(POSTGRES)
-    return pg8000.dbapi.connect(
+    return pg8000_dbapi.connect(
         user=u.username,
         password=u.password,
         host=u.hostname,
@@ -4489,11 +4489,10 @@ def test_mysql_indexed_columns_round_literals(server: str) -> None:
 @pytest.mark.parametrize("server", ["mysql", "mariadb"])
 def test_mysql_high_not_precedence(server: str) -> None:
     # `NOT x IS NULL` is `(NOT x) IS NULL` under HIGH_NOT_PRECEDENCE
-    import pymysql  # type: ignore[import-untyped]
-
     uri = SERVERS[server].uri
     if uri is None:
         pytest.skip(f"no {server} URI")
+    pymysql = pytest.importorskip("pymysql")
     _execute(
         server,
         [
@@ -4631,7 +4630,7 @@ def test_psycopg2_bytea_arrays() -> None:
         connection: Any = POSTGRES
         kwargs: dict[str, Any] = {"driver": driver}
         if driver == "factory":
-            import psycopg2
+            psycopg2 = pytest.importorskip("psycopg2")
 
             connection, kwargs = (lambda: psycopg2.connect(POSTGRES)), {}
         for source in ["r11_bytea_arrays", "SELECT id, b FROM r11_bytea_arrays"]:

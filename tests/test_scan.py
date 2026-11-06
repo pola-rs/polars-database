@@ -943,6 +943,125 @@ def test_scan_sqlite_strings_without_text_affinity(
     )
 
 
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
+@pytest.mark.parametrize("batch_size", [None, 1])
+def test_scan_sqlite_large_integers_next_to_reals(
+    tmp_path: Path, driver: str, batch_size: int | None
+) -> None:
+    # a batch typed by its own values read `2**53 + 1` next to `1.5` as a float, also
+    # when retyped to String; alone in a batch, it was an error
+    _importorskip_sqlite_driver(driver)
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, x)")
+        conn.executemany("INSERT INTO t VALUES (?, ?)", [(1, 2**53 + 1), (2, 1.5)])
+        conn.commit()
+    uri = f"sqlite:///{path}"
+    text = pl.scan_database(
+        "t",
+        uri,
+        driver=driver,
+        batch_size=batch_size,
+        schema_overrides={"x": pl.String},
+    )
+    assert text.collect()["x"].to_list() == [str(2**53 + 1), "1.5"]
+    floats = pl.scan_database("t", uri, driver=driver, batch_size=batch_size)
+    assert floats.collect()["x"].to_list() == [float(2**53 + 1), 1.5]
+
+
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
+def test_scan_sqlite_numbers_then_text_in_small_batches(
+    tmp_path: Path, driver: str
+) -> None:
+    # row drivers type each batch of the planning sample on its own: Int64, then String
+    _importorskip_sqlite_driver(driver)
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, x)")
+        conn.executemany("INSERT INTO t VALUES (?, ?)", enumerate([1, 1, 1, "abc"]))
+        conn.commit()
+    lf = pl.scan_database("t", f"sqlite:///{path}", driver=driver, batch_size=2)
+    assert lf.collect()["x"].to_list() == ["1", "1", "1", "abc"]
+
+
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
+def test_scan_sqlite_filter_on_a_volatile_column(tmp_path: Path, driver: str) -> None:
+    # SQLite merges the wrapped query into the filter's and calls random() again for it
+    _importorskip_sqlite_driver(driver)
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(200)])
+        conn.commit()
+    lf = pl.scan_database(
+        "SELECT random() AS r, id FROM t", f"sqlite:///{path}", driver=driver
+    )
+    df = lf.filter(pl.col("r") > 0, pl.col("id") < 100).collect()
+    assert (df["r"] > 0).all()
+    assert (df["id"] < 100).all()
+    # the filter on `id` is still pushed
+    assert '"id" < 100' in _sql(lf.filter(pl.col("r") > 0, pl.col("id") < 100))
+    assert "WHERE" not in _sql(lf.filter(pl.col("r") > 0))
+
+
+def test_scan_sqlite_filter_on_a_user_function_column(tmp_path: Path) -> None:
+    # a function sqlglot doesn't know may be volatile: `create_function` makes it so
+    import random
+
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(200)])
+        conn.commit()
+    with closing(sqlite3.connect(path, check_same_thread=False)) as live:
+        live.create_function("myrand", 0, random.random)
+        lf = pl.scan_database("SELECT id, myrand() AS r FROM t", live)
+        assert "WHERE" not in _sql(lf.filter(pl.col("r") > 0.5))
+        assert (lf.filter(pl.col("r") > 0.5).collect()["r"] > 0.5).all()
+
+
+def test_scan_query_with_order_by_is_not_partitioned(tmp_path: Path) -> None:
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x)")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?)", [(i, (i * 37) % 101) for i in range(100)]
+        )
+        conn.commit()
+    with pytest.raises(pl.exceptions.InvalidOperationError, match="ORDER BY"):
+        pl.scan_database(
+            "SELECT * FROM t ORDER BY x DESC",
+            f"sqlite:///{path}",
+            partition_on="id",
+            partition_num=4,
+        ).collect()
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["e", "SELECT * FROM e", "SELECT * FROM s LIMIT 3", "SELECT i, f, d FROM s"],
+)
+def test_scan_duckdb_unsampled_columns_keep_their_types(
+    tmp_path: Path, source: str
+) -> None:
+    # the Python driver types an empty result's columns Null; an empty table, or a query
+    # that isn't sampled (LIMIT), was read as all String
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE TABLE e (i INT, f DOUBLE, d DATE)")
+        conn.execute(
+            "CREATE TABLE s AS SELECT i::INT AS i, i * 1.5 AS f, "
+            "DATE '2020-01-01' + i::INT AS d FROM range(5) r(i)"
+        )
+    lf = pl.scan_database(source, f"duckdb:///{path}")
+    schema = lf.collect_schema()
+    assert schema["i"] == pl.Int32
+    assert schema["d"] == pl.Date
+    assert schema["f"].is_float() or schema["f"].is_decimal()
+    lf.filter(pl.col("i") > 1).collect()
+
+
 @pytest.mark.parametrize("driver", ["sqlite3", "sqlalchemy", "live"])
 def test_scan_row_driver_with_leading_nulls(tmp_path: Path, driver: str) -> None:
     # more leading NULLs than a row driver's default inference length (100)

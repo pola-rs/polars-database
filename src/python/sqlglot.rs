@@ -70,6 +70,10 @@ impl SqlRenderer for SqlglotRenderer {
                 Some(v) if !v.is_none() => Some(v.extract()?),
                 _ => None,
             };
+            let volatile_columns: Vec<String> = match d.get_item("volatile_columns")? {
+                Some(v) if !v.is_none() => v.extract()?,
+                _ => vec![],
+            };
             let body: Option<String> = match d.get_item("body")? {
                 Some(v) if !v.is_none() => Some(v.extract()?),
                 _ => None,
@@ -86,6 +90,8 @@ impl SqlRenderer for SqlglotRenderer {
                 nested_queries: get("nested_queries")?,
                 side_effects: get("side_effects")?,
                 side_effects_outside_rows: get("side_effects_outside_rows")?,
+                volatile_columns: volatile_columns.into_iter().map(Into::into).collect(),
+                all_columns_volatile: get("all_columns_volatile")?,
                 body: body.map(Into::into),
             })
         })

@@ -367,7 +367,8 @@ fn check_numeric_exact(src: &Column, cast: &Column) -> PolarsResult<()> {
         if let Some(i) = overflow.iter().position(|v| v == Some(true)) {
             polars_bail!(
                 SchemaMismatch:
-                "database column '{}' has the value {}, which is out of the range of Float32;                 read the column as pl.Float64",
+                "database column '{}' has the value {}, which is out of the range of Float32; \
+                read the column as pl.Float64",
                 src.name(), src.get(i)?
             )
         }
@@ -400,7 +401,8 @@ fn check_numeric_exact(src: &Column, cast: &Column) -> PolarsResult<()> {
         if let Some(i) = same.iter().position(|v| v != Some(true)) {
             polars_bail!(
                 SchemaMismatch:
-                "database column '{}' has the value {}, which {to} would cut; read the column                 as {from}",
+                "database column '{}' has the value {}, which {to} would cut; read the column \
+                as {from}",
                 src.name(), src.get(i)?
             )
         }
