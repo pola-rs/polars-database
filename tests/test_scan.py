@@ -944,7 +944,7 @@ def test_scan_sqlite_strings_without_text_affinity(
 
 
 @pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
-@pytest.mark.parametrize("batch_size", [None, 1])
+@pytest.mark.parametrize("batch_size", [None, 1, 2])
 def test_scan_sqlite_large_integers_next_to_reals(
     tmp_path: Path, driver: str, batch_size: int | None
 ) -> None:
@@ -967,6 +967,148 @@ def test_scan_sqlite_large_integers_next_to_reals(
     assert text.collect()["x"].to_list() == [str(2**53 + 1), "1.5"]
     floats = pl.scan_database("t", uri, driver=driver, batch_size=batch_size)
     assert floats.collect()["x"].to_list() == [float(2**53 + 1), 1.5]
+    # also when retyped to a decimal, through Float64 otherwise
+    decimals = pl.scan_database(
+        "t",
+        uri,
+        driver=driver,
+        batch_size=batch_size,
+        schema_overrides={"x": pl.Decimal(30, 1)},
+    )
+    assert decimals.collect()["x"].to_list() == [
+        Decimal(2**53 + 1),
+        Decimal("1.5"),
+    ]
+
+
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
+@pytest.mark.parametrize("batch_size", [None, 1, 2])
+def test_scan_sqlite_large_integers_next_to_integral_reals(
+    tmp_path: Path, driver: str, batch_size: int | None
+) -> None:
+    # retyped to an integer, `2**53 + 1` next to `2.0` or `1.5` was read through Float64
+    # (the cast to an override cuts `1.5`)
+    _importorskip_sqlite_driver(driver)
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, x)")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?)",
+            [(1, 2**53 + 1), (2, 2.0), (3, 1.5), (4, -2.5)],
+        )
+        conn.commit()
+    for dtype in [pl.Int64, pl.UInt64]:
+        lf = pl.scan_database(
+            "t",
+            f"sqlite:///{path}",
+            driver=driver,
+            batch_size=batch_size,
+            schema_overrides={"x": dtype},
+        ).filter(pl.col("id") < 4 if dtype == pl.UInt64 else True)
+        assert (
+            lf.collect()["x"].to_list()
+            == [2**53 + 1, 2, 1, -2][: 3 if dtype == pl.UInt64 else 4]
+        ), dtype
+
+
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
+def test_scan_sqlite_view_union_of_reals_and_integers(
+    tmp_path: Path, driver: str
+) -> None:
+    # `pragma_table_info` types a compound view's column by its first branch: REAL here,
+    # while the other branch holds integers
+    _importorskip_sqlite_driver(driver)
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE a (id INTEGER, x REAL)")
+        conn.execute("CREATE TABLE b (id INTEGER, x INTEGER)")
+        conn.executemany("INSERT INTO a VALUES (?, ?)", [(1, 1.5), (3, 2.0)])
+        conn.executemany("INSERT INTO b VALUES (?, ?)", [(2, 2**53 + 1), (4, 7)])
+        conn.execute(
+            "CREATE VIEW v AS SELECT id, x FROM a UNION ALL SELECT id, x FROM b"
+        )
+        conn.execute(
+            "CREATE VIEW w AS SELECT id, x FROM b UNION ALL SELECT id, x FROM a"
+        )
+        conn.commit()
+    uri = f"sqlite:///{path}"
+    for view in ["v", "w"]:
+        for batch_size in [None, 1]:
+            lf = pl.scan_database(view, uri, driver=driver, batch_size=batch_size)
+            df = lf.collect().sort("id")
+            assert df["x"].to_list() == [1.5, float(2**53), 2.0, 7.0], (
+                view,
+                batch_size,
+            )
+            got = lf.filter(pl.col("x") == 2.0**53).collect()["id"].to_list()
+            assert got == [2], view
+
+
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
+def test_scan_sqlite_filter_on_large_integers_read_as_floats(
+    tmp_path: Path, driver: str
+) -> None:
+    # the database compared `2**53 + 1` exactly; Polars reads it as `2.0**53`
+    _importorskip_sqlite_driver(driver)
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, x, r REAL)")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?, ?)", [(1, 2**53 + 1, 1.0), (2, 1.5, 2.5)]
+        )
+        conn.commit()
+    lf = pl.scan_database("t", f"sqlite:///{path}", driver=driver)
+    big = float(2**53)
+    for predicate, expected in [
+        (pl.col("x") == big, [1]),
+        (pl.col("x") > big, []),
+        (pl.col("x") >= big, [1]),
+        (pl.col("x").is_in([big]), [1]),
+        (pl.col("x").is_between(big, big), [1]),
+        (pl.col("x") < 2, [2]),
+    ]:
+        assert lf.filter(predicate).collect()["id"].to_list() == expected, predicate
+    assert "WHERE" in _sql(lf.filter(pl.col("x") == big))
+    # a REAL column holds no integers: compared as it is (an index on it serves)
+    assert 'WHERE "t"."r" > 2.0' in _sql(lf.filter(pl.col("r") > 2.0))
+
+
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
+def test_scan_sqlite_reals_as_text_as_polars_writes_them(
+    tmp_path: Path, driver: str
+) -> None:
+    # (a table `s` and a column `v`: names in the conversion's SQL)
+    # SQLite writes `1.0e+20`, `1.0e-05`, `Inf`; some of its builds round a real's text
+    # to another real
+    import random
+
+    _importorskip_sqlite_driver(driver)
+    values = [1e20, 1e-5, float("inf"), -float("inf"), 1.0, 0.1, 1 / 3, 1e-7, 1e15]
+    values += [1e16, 123456789012345680.0, 1234567890123456.7, -2.5, 2.0**53]
+    values += [5e-324, 1e-310, 1.7976931348623157e308, 2.0**63, -9.846175033433891]
+    values += [2.2790121708605243e274]
+    rng = random.Random(7)
+    values += [rng.uniform(-1, 1) * 10 ** rng.randint(-300, 300) for _ in range(2000)]
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE s (id INTEGER, x REAL, v)")
+        conn.executemany(
+            "INSERT INTO s VALUES (?, ?, ?)", [(i, v, v) for i, v in enumerate(values)]
+        )
+        conn.execute("INSERT INTO s VALUES (10000, NULL, 7)")
+        # text that starts as the reader's marker of a real does
+        conn.execute("INSERT INTO s VALUES (10001, NULL, char(1) || '1:0')")
+        conn.commit()
+    lf = pl.scan_database(
+        "s",
+        f"sqlite:///{path}",
+        driver=driver,
+        schema_overrides={"x": pl.String, "v": pl.String},
+    )
+    expected = pl.Series([*values, None, None]).cast(pl.String).to_list()
+    df = lf.collect()
+    assert df["x"].to_list() == expected
+    assert df["v"].to_list() == [*expected[:-2], "7", "\x011:0"]
 
 
 @pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
@@ -1018,6 +1160,159 @@ def test_scan_sqlite_filter_on_a_user_function_column(tmp_path: Path) -> None:
         lf = pl.scan_database("SELECT id, myrand() AS r FROM t", live)
         assert "WHERE" not in _sql(lf.filter(pl.col("r") > 0.5))
         assert (lf.filter(pl.col("r") > 0.5).collect()["r"] > 0.5).all()
+
+
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
+@pytest.mark.parametrize("source", ["v", "w", "SELECT * FROM v", "SELECT id, r FROM w"])
+def test_scan_sqlite_volatile_views(tmp_path: Path, driver: str, source: str) -> None:
+    # SQLite merges the view into the filter's query and calls random() again for it;
+    # each partition reads the view again
+    _importorskip_sqlite_driver(driver)
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE ids (id INTEGER PRIMARY KEY)")
+        conn.executemany("INSERT INTO ids VALUES (?)", [(i,) for i in range(300)])
+        conn.execute("CREATE VIEW v AS SELECT id, random() AS r FROM ids")
+        conn.execute("CREATE VIEW w AS SELECT * FROM v")
+        conn.commit()
+    uri = f"sqlite:///{path}"
+    lf = pl.scan_database(source, uri, driver=driver)
+    df = lf.filter(pl.col("r") > 0, pl.col("id") < 200).collect()
+    assert (df["r"] > 0).all()
+    assert (df["id"] < 200).all()
+    if source == "v":
+        # the filter on `id` is still pushed
+        assert '"id" < 200' in _sql(lf.filter(pl.col("r") > 0, pl.col("id") < 200))
+    with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+        pl.scan_database(
+            source, uri, driver=driver, partition_on="id", partition_num=4
+        ).collect()
+
+
+def test_scan_sqlite_views_without_volatile_functions() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/t.db"
+        with closing(sqlite3.connect(path)) as conn:
+            conn.execute("CREATE TABLE ids (id INTEGER PRIMARY KEY, x)")
+            conn.executemany(
+                "INSERT INTO ids VALUES (?, ?)", [(i, i) for i in range(50)]
+            )
+            # `abs` and `printf` are deterministic; `(a, b)` names the columns
+            conn.execute(
+                "CREATE VIEW v (a, b) AS SELECT id, printf('%d', abs(x)) FROM ids"
+            )
+            conn.commit()
+        lf = pl.scan_database(
+            "v", f"sqlite:///{path}", partition_on="a", partition_num=4
+        )
+        assert sorted(lf.collect()["a"].to_list()) == list(range(50))
+        assert '"a" < 5' in _sql(lf.filter(pl.col("a") < 5))
+
+
+def test_scan_sqlite_partition_over_a_user_function(tmp_path: Path) -> None:
+    # a function sqlglot doesn't know may be volatile: `create_function` makes it so,
+    # unless `deterministic=True`; each partition would call it again
+    import random
+
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(200)])
+        conn.commit()
+    with closing(sqlite3.connect(path, check_same_thread=False)) as live:
+        live.create_function("myrand", 0, random.Random(1).random)
+        live.create_function("twice", 1, lambda v: 2 * v, deterministic=True)
+        for query in [
+            "SELECT id, myrand() AS r FROM t",
+            "SELECT id FROM t WHERE myrand() < 0.5",
+        ]:
+            lf = pl.scan_database(query, live, partition_on="id", partition_num=4)
+            with pytest.raises(pl.exceptions.InvalidOperationError, match="myrand"):
+                lf.collect()
+        lf = pl.scan_database(
+            "SELECT id, twice(id) AS d FROM t", live, partition_on="d", partition_num=4
+        )
+        assert sorted(lf.collect()["d"].to_list()) == [2 * i for i in range(200)]
+        # a temporary view over it, scanned as a table
+        live.execute("CREATE TEMP VIEW uv AS SELECT id, myrand() AS r FROM t")
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+            pl.scan_database("uv", live, partition_on="id", partition_num=4).collect()
+        df = pl.scan_database("uv", live).filter(pl.col("r") > 0.5).collect()
+        assert (df["r"] > 0.5).all()
+
+
+def test_scan_sqlite_volatile_views_in_attached_databases(tmp_path: Path) -> None:
+    # an unqualified name resolves in `temp`, `main`, then the attached databases; a
+    # view's own names in its database first
+    with closing(sqlite3.connect(tmp_path / "aux.db")) as conn:
+        conn.execute("CREATE TABLE ids (id INTEGER PRIMARY KEY)")
+        conn.executemany("INSERT INTO ids VALUES (?)", [(i,) for i in range(300)])
+        conn.execute("CREATE VIEW av AS SELECT id, random() AS r FROM ids")
+        conn.execute("CREATE VIEW aw AS SELECT * FROM av")
+        conn.commit()
+    with closing(
+        sqlite3.connect(tmp_path / "main.db", check_same_thread=False)
+    ) as live:
+        live.execute("CREATE TABLE av (id INTEGER, r REAL)")
+        live.execute(f"ATTACH '{tmp_path / 'aux.db'}' AS aux")
+        for source in ["aw", "aux.aw", "aux.av", "SELECT * FROM aw"]:
+            df = pl.scan_database(source, live).filter(pl.col("r") > 0).collect()
+            assert (df["r"] > 0).all(), source
+            lf = pl.scan_database(source, live, partition_on="id", partition_num=4)
+            with pytest.raises(
+                pl.exceptions.InvalidOperationError, match="partitioned"
+            ):
+                lf.collect()
+
+
+def test_scan_partition_with_schema_and_unknown_functions(tmp_path: Path) -> None:
+    # without I/O nothing tells whether `quote` is volatile: taken to be as before
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE ids (id INTEGER PRIMARY KEY)")
+        conn.executemany("INSERT INTO ids VALUES (?)", [(i,) for i in range(50)])
+        conn.commit()
+    lf = pl.scan_database(
+        "SELECT id, quote(id) AS q FROM ids",
+        f"sqlite:///{path}",
+        schema={"id": pl.Int64, "q": pl.String},
+        partition_on="id",
+        partition_num=4,
+    )
+    assert sorted(lf.collect()["id"].to_list()) == list(range(50))
+
+
+def test_scan_duckdb_volatile_views(tmp_path: Path) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE TABLE ids AS SELECT range AS id FROM range(300)")
+        conn.execute("CREATE VIEW v AS SELECT id, random() AS r FROM ids")
+        conn.execute("CREATE VIEW c AS SELECT id, abs(id) AS a FROM ids")
+        # a view's own names resolve in its schema
+        conn.execute("CREATE SCHEMA s")
+        conn.execute("CREATE VIEW s.v AS SELECT id FROM main.ids WHERE random() < 0.5")
+        conn.execute("CREATE VIEW s.w AS SELECT * FROM v")
+        # a macro is as volatile as its body
+        conn.execute("CREATE MACRO twice(x) AS 2 * x")
+        conn.execute("CREATE MACRO noisy(x) AS x + random()")
+    uri = f"duckdb:///{path}"
+    for source in ["s.w", "SELECT id, noisy(id) AS n FROM ids"]:
+        lf = pl.scan_database(source, uri, partition_on="id", partition_num=4)
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+            lf.collect()
+    lf = pl.scan_database(
+        "SELECT id, twice(id) AS d FROM ids", uri, partition_on="d", partition_num=4
+    )
+    assert sorted(lf.collect()["d"].to_list()) == [2 * i for i in range(300)]
+    df = pl.scan_database("v", uri).filter(pl.col("r") > 0.5).collect()
+    assert (df["r"] > 0.5).all()
+    with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+        pl.scan_database("v", uri, partition_on="id", partition_num=4).collect()
+    lf = pl.scan_database("c", uri, partition_on="id", partition_num=4)
+    assert sorted(lf.collect()["id"].to_list()) == list(range(300))
 
 
 def test_scan_query_with_order_by_is_not_partitioned(tmp_path: Path) -> None:

@@ -307,6 +307,11 @@ pub struct QueryFacts {
     /// A volatile function's values may reach any output column (through a subquery, a
     /// CTE or `*`).
     pub all_columns_volatile: bool,
+    /// Lower-cased names of the functions the parser doesn't know: the database says
+    /// whether they are volatile ([`volatile_functions`](super::catalog::volatile_functions)).
+    pub unknown_functions: Vec<PlSmallStr>,
+    /// The tables (or views) it reads, `[catalog.][schema.]name` as written; not its CTEs.
+    pub tables: Vec<Vec<PlSmallStr>>,
     /// The query without the semicolons and comments after its last token, if it parses.
     pub body: Option<PlSmallStr>,
 }
@@ -317,6 +322,9 @@ pub trait SqlRenderer: Send + Sync {
     fn id(&self) -> PlSmallStr;
     fn render(&self, query: &SqlQuery, dialect: DialectName) -> PolarsResult<String>;
     fn inspect_query(&self, sql: &str, dialect: DialectName) -> PolarsResult<QueryFacts>;
+    /// The facts of a view's query, from its definition (its `CREATE VIEW` statement, or
+    /// only its query): the output columns are the view's.
+    fn inspect_view(&self, sql: &str, dialect: DialectName) -> PolarsResult<QueryFacts>;
 }
 
 type RendererFactory = Arc<dyn Fn() -> PolarsResult<Arc<dyn SqlRenderer>> + Send + Sync>;

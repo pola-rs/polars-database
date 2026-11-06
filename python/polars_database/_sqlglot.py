@@ -729,6 +729,59 @@ def _relations(stmt: Any) -> set[str]:
     return names
 
 
+def _cte_in_scope(table: Any) -> bool:
+    """Whether a CTE of the query (or of an enclosing one) has the table's name."""
+    if table.args.get("db"):
+        return False
+    name = table.name.lower()
+    node = table.parent
+    while node is not None:
+        with_ = node.args.get("with_") or node.args.get("with")
+        if with_ is not None and any(
+            c.alias_or_name.lower() == name for c in with_.expressions
+        ):
+            return True
+        node = node.parent
+    return False
+
+
+def _tables(stmt: Any, dialect: str | None) -> list[list[str]]:
+    """
+    The tables (or views) a query reads, as `[catalog.][schema.]name` parts, unquoted names
+    folded as the dialect folds them (`Orders` is `orders` on Postgres, `ORDERS` on
+    Oracle): not its CTEs. A table function may be a view too (ClickHouse's parameterized
+    `v(p = 1)`).
+    """
+    from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
+
+    stmt = normalize_identifiers(stmt.copy(), dialect=dialect)
+    tables: list[list[str]] = []
+    for t in stmt.find_all(exp.Table):
+        if isinstance(t.this, exp.Identifier):
+            name = t.name
+        elif isinstance(t.this, exp.Anonymous):
+            name = str(t.this.name)
+        else:
+            continue
+        if not name or _cte_in_scope(t):
+            continue
+        parts = [p for p in (t.catalog, t.db, name) if p]
+        if parts not in tables:
+            tables.append(parts)
+    return tables
+
+
+def _unknown_functions(stmt: Any) -> list[str]:
+    """Lower-cased names of the functions sqlglot doesn't know, but table functions."""
+    return sorted(
+        {
+            str(n.name).lower()
+            for n in stmt.find_all(exp.Anonymous)
+            if n.name and not isinstance(n.parent, exp.Table)
+        }
+    )
+
+
 def _volatile_columns(stmt: Any, calls: list[Any]) -> list[str] | None:
     """
     The output columns whose values come from volatile functions, `None` if that can't be
@@ -760,9 +813,9 @@ def _volatile_columns(stmt: Any, calls: list[Any]) -> list[str] | None:
     return columns
 
 
-def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
-    """Facts about a user query that decide whether it can be wrapped."""
-    facts: dict[str, Any] = {
+def _no_facts() -> dict[str, Any]:
+    """The facts of a query that doesn't parse."""
+    return {
         "parses": False,
         "single_select": False,
         "has_cte": False,
@@ -776,8 +829,15 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
         "side_effects_outside_rows": False,
         "volatile_columns": [],
         "all_columns_volatile": False,
+        "unknown_functions": [],
+        "tables": [],
         "body": None,
     }
+
+
+def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
+    """Facts about a user query that decide whether it can be wrapped."""
+    facts = _no_facts()
     try:
         # a comment after the last `;` parses as a statement of its own
         statements = [
@@ -831,6 +891,11 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
         facts["all_columns_volatile"] = True
     else:
         facts["volatile_columns"] = columns
+    # The database says whether these are volatile (`catalog::volatile_functions`): a
+    # user's function may be (`random()` inside), and each partition would run it again.
+    facts["unknown_functions"] = _unknown_functions(stmt)
+    # A view among them may call a volatile function (`catalog::view_definition`).
+    facts["tables"] = _tables(stmt, dialect)
     # anywhere in the query: a nested LIMIT without a unique ORDER BY picks rows too
     facts["repeatable"] = (
         stmt.find(exp.Limit, exp.Fetch, exp.Offset, exp.TableSample) is None
@@ -855,4 +920,60 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
     selects = stmt.selects
     if selects and not any(isinstance(s, exp.Star) or s.is_star for s in selects):
         facts["output_columns"] = [s.alias_or_name for s in selects]
+    return facts
+
+
+def inspect_view(sql: str, dialect: str | None) -> dict[str, Any]:
+    """
+    `inspect_query`'s facts about a view's query, from its definition: the whole `CREATE
+    VIEW` statement or only its query. Its output columns (and volatile ones) are the
+    view's, named by its column list if it has one.
+    """
+    try:
+        statements = [
+            s
+            for s in sqlglot.parse(sql, read=dialect)
+            if s is not None and not isinstance(s, exp.Semicolon)
+        ]
+    except sqlglot.errors.SqlglotError:
+        statements = []
+    if len(statements) != 1:
+        return _no_facts()
+    stmt = statements[0]
+    names: list[str] | None = None
+    if isinstance(stmt, exp.Create):
+        if str(stmt.args.get("kind") or "").upper() != "VIEW" or not isinstance(
+            stmt.expression, exp.Query
+        ):
+            return _no_facts()
+        if isinstance(stmt.this, exp.Schema):
+            names = [c.name for c in stmt.this.expressions]
+        stmt = stmt.expression
+    named = names is None
+    if (
+        names is not None
+        and isinstance(stmt, exp.Select)
+        and len(stmt.selects) == len(names)
+        and not any(s.is_star for s in stmt.selects)
+    ):
+        # `CREATE VIEW v (a, b) AS SELECT x, random() …`: the view's names, by position
+        stmt.set(
+            "expressions",
+            [
+                exp.alias_(s.unalias(), exp.to_identifier(n, quoted=True))
+                for s, n in zip(stmt.selects, names, strict=True)
+            ],
+        )
+        named = True
+    try:
+        query = stmt.sql(dialect=dialect)
+    except sqlglot.errors.SqlglotError:
+        return _no_facts()
+    facts = inspect_query(query, dialect)
+    if not named:
+        # its names aren't the query's: a volatile column may be any of them
+        facts["output_columns"] = names
+        if facts["volatile_columns"]:
+            facts["volatile_columns"] = []
+            facts["all_columns_volatile"] = True
     return facts

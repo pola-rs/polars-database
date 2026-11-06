@@ -845,6 +845,310 @@ impl CatalogQueries {
     }
 }
 
+/// What the catalog says a relation is, for [`view_definition`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ViewLookup {
+    /// A table, a materialized view (its rows are stored), or nothing by that name.
+    NotAView,
+    /// A view: its query, or its whole `CREATE VIEW` statement (empty where the catalog
+    /// hides it: MySQL without `SHOW VIEW`), and where it was found: the qualifier its
+    /// own unqualified names are resolved in (SQLite's schema; DuckDB's database and
+    /// schema), or empty.
+    View {
+        sql: String,
+        qualifier: Vec<PlSmallStr>,
+    },
+    /// The dialect has no lookup, or it failed.
+    Unknown,
+}
+
+/// The definition of the view `parts` (`[catalog.][schema.]name`, unquoted, as the
+/// database folds them), whose query the database runs again each time the view is read:
+/// SQLite and MySQL merge it into the reading query, calling its functions again for a
+/// filter. `context`: the qualifier of the view whose query names it, where an unqualified
+/// name is looked up first (SQLite, DuckDB).
+pub fn view_definition(
+    session: &mut dyn DatabaseSession,
+    dialect: DialectName,
+    parts: &[PlSmallStr],
+    context: &[PlSmallStr],
+) -> ViewLookup {
+    let verbose = polars_core::config::verbose();
+    let mut run = |sql: &str| match session.query(sql) {
+        Ok(df) => Some(df),
+        Err(e) => {
+            if verbose {
+                eprintln!("[scan_database]: catalog lookup of a view failed: {e}");
+            }
+            None
+        },
+    };
+    let Some(name) = parts.last().map(|p| p.as_str()) else {
+        return ViewLookup::Unknown;
+    };
+    let schema = (parts.len() >= 2).then(|| parts[parts.len() - 2].as_str());
+    let s = |v: &str| dialect.quote_str(v);
+    let qualified = parts
+        .iter()
+        .map(|p| dialect.quote_ident(p))
+        .collect::<Vec<_>>()
+        .join(".");
+    // One row, `(is_view, definition, qualifier...)`, for the relation the name resolves
+    // to; no row where nothing has that name.
+    let sql = match dialect {
+        // An unqualified name resolves in `temp`, `main`, then the attached databases (a
+        // view's own names in its database first).
+        DialectName::Sqlite => {
+            let schemas: Vec<String> = match schema {
+                Some(sc) => vec![sc.to_string()],
+                None => {
+                    let Some(df) = run("SELECT name FROM pragma_database_list ORDER BY \
+                        CASE name WHEN 'temp' THEN 0 WHEN 'main' THEN 1 ELSE 2 END, seq")
+                    else {
+                        return ViewLookup::Unknown;
+                    };
+                    let mut schemas: Vec<String> = context.iter().map(|c| c.to_string()).collect();
+                    for row in 0..df.height() {
+                        if let Some(n) = cell_str(&df, 0, row)
+                            && !schemas.iter().any(|s| s.eq_ignore_ascii_case(&n))
+                        {
+                            schemas.push(n);
+                        }
+                    }
+                    schemas
+                },
+            };
+            let lookups = schemas
+                .iter()
+                .enumerate()
+                .map(|(i, sc)| {
+                    format!(
+                        "SELECT {i} AS o, type = 'view' AS v, sql, {} AS q FROM {}.sqlite_master \
+                        WHERE type IN ('table', 'view') AND name = {} COLLATE NOCASE",
+                        s(sc),
+                        dialect.quote_ident(sc),
+                        s(name)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" UNION ALL ");
+            format!("SELECT v, sql, q FROM ({lookups}) ORDER BY o LIMIT 1")
+        },
+        DialectName::Postgresql => format!(
+            "SELECT c.relkind = 'v', CASE WHEN c.relkind = 'v' THEN pg_get_viewdef(c.oid) END \
+            FROM pg_class c WHERE c.oid = to_regclass({})",
+            s(&qualified)
+        ),
+        DialectName::Mysql | DialectName::Singlestore => format!(
+            "SELECT TABLE_TYPE = 'VIEW', (SELECT VIEW_DEFINITION FROM information_schema.VIEWS v \
+            WHERE v.TABLE_SCHEMA = t.TABLE_SCHEMA AND v.TABLE_NAME = t.TABLE_NAME) \
+            FROM information_schema.TABLES t WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {}",
+            schema.map_or_else(|| "DATABASE()".to_string(), s),
+            s(name)
+        ),
+        // A view's own names resolve in its database and schema.
+        DialectName::Duckdb => {
+            let (database, schema) = match (parts.len(), context) {
+                (1, [db, sc]) => (Some(db.as_str()), Some(sc.as_str())),
+                _ => (
+                    (parts.len() >= 3).then(|| parts[parts.len() - 3].as_str()),
+                    schema,
+                ),
+            };
+            let schema = schema.map_or_else(
+                || "lower(current_schema())".to_string(),
+                |sc| format!("lower({})", s(sc)),
+            );
+            let database = database.map_or_else(
+                || "(lower(current_database()), 'temp')".to_string(),
+                |db| format!("(lower({}))", s(db)),
+            );
+            // a temporary view hides a table of the same name
+            format!(
+                "SELECT is_view, sql, database_name, schema_name FROM (\
+                SELECT 0 AS o, true AS is_view, sql, temporary, database_name, schema_name \
+                FROM duckdb_views() \
+                WHERE NOT internal AND lower(view_name) = lower({n}) \
+                AND lower(schema_name) = {schema} AND lower(database_name) IN {database} \
+                UNION ALL SELECT 1, false, NULL, temporary, database_name, schema_name \
+                FROM duckdb_tables() \
+                WHERE lower(table_name) = lower({n}) AND lower(schema_name) = {schema} \
+                AND lower(database_name) IN {database}) \
+                ORDER BY temporary DESC, o LIMIT 1",
+                n = s(name)
+            )
+        },
+        DialectName::Clickhouse => format!(
+            "SELECT engine = 'View', as_select FROM system.tables \
+            WHERE database = {} AND name = {}",
+            schema.map_or_else(|| "currentDatabase()".to_string(), s),
+            s(name)
+        ),
+        // through a synonym (the user's, or public); `TEXT_VC` holds the first 4000
+        // characters, the `LONG` `TEXT` all of them
+        DialectName::Oracle => {
+            let owner =
+                schema.map_or_else(|| "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')".to_string(), s);
+            let n = s(name);
+            let found = format!(
+                "(v.owner, v.view_name) IN (SELECT {owner}, {n} FROM dual \
+                UNION ALL SELECT table_owner, table_name FROM all_synonyms \
+                WHERE owner IN ({owner}, 'PUBLIC') AND synonym_name = {n})"
+            );
+            let Some(df) = run(&format!(
+                "SELECT 1, CASE WHEN v.text_length <= 4000 THEN v.text_vc END, \
+                v.owner, v.view_name FROM all_views v WHERE {found}"
+            )) else {
+                return ViewLookup::Unknown;
+            };
+            if df.height() == 0 {
+                return ViewLookup::NotAView;
+            }
+            let sql = cell_str(&df, 1, 0).or_else(|| {
+                let (owner, view) = (cell_str(&df, 2, 0)?, cell_str(&df, 3, 0)?);
+                let long = run(&format!(
+                    "SELECT text FROM all_views WHERE owner = {} AND view_name = {}",
+                    s(&owner),
+                    s(&view)
+                ))?;
+                cell_str(&long, 0, 0)
+            });
+            return ViewLookup::View {
+                sql: sql.unwrap_or_default(),
+                qualifier: vec![],
+            };
+        },
+        DialectName::Mssql => format!(
+            "SELECT CASE WHEN o.type = 'V' THEN 1 ELSE 0 END, \
+            CASE WHEN o.type = 'V' THEN OBJECT_DEFINITION(o.object_id) END \
+            FROM sys.objects o WHERE o.object_id = OBJECT_ID({})",
+            dialect.quote_str(&qualified)
+        ),
+        _ => return ViewLookup::Unknown,
+    };
+    let Some(df) = run(&sql) else {
+        return ViewLookup::Unknown;
+    };
+    if df.height() == 0 {
+        return ViewLookup::NotAView;
+    }
+    let is_view = match cell(&df, 0, 0) {
+        Some(AnyValue::Boolean(b)) => b,
+        _ => cell_u64(&df, 0, 0).is_some_and(|v| v != 0),
+    };
+    if !is_view {
+        return ViewLookup::NotAView;
+    }
+    let qualifier = (2..df.width())
+        .filter_map(|c| cell_str(&df, c, 0).map(PlSmallStr::from))
+        .collect();
+    ViewLookup::View {
+        sql: cell_str(&df, 1, 0).unwrap_or_default(),
+        qualifier,
+    }
+}
+
+/// What the catalog says of the functions sqlglot doesn't know ([`volatile_functions`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FunctionLookup {
+    /// One of them is volatile.
+    pub volatile: bool,
+    /// The SQL expressions of those defined in SQL (DuckDB macros, ClickHouse SQL
+    /// functions), which the catalog doesn't classify: volatile if their bodies are.
+    pub bodies: Vec<String>,
+}
+
+/// Whether any of the functions `names` (lower-cased) may return other values each time
+/// it runs, by the catalog's word: `None` where the dialect has no lookup, or it failed.
+/// A name the catalog doesn't list is taken to be a built-in function: the volatile ones
+/// sqlglot doesn't know are listed in `_VOLATILE_FUNCTIONS`.
+pub fn volatile_functions(
+    session: &mut dyn DatabaseSession,
+    dialect: DialectName,
+    names: &[PlSmallStr],
+) -> Option<FunctionLookup> {
+    if names.is_empty() {
+        return Some(FunctionLookup::default());
+    }
+    let list = names
+        .iter()
+        .map(|n| dialect.quote_str(n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let upper = names
+        .iter()
+        .map(|n| dialect.quote_str(&n.to_uppercase()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // `(volatile count[, body])` rows
+    let sql = match dialect {
+        // `STABLE` functions return the same within a statement; `now()`-like ones are
+        // known
+        DialectName::Postgresql | DialectName::Redshift => format!(
+            "SELECT COUNT(*) FROM pg_proc WHERE lower(proname) IN ({list}) AND provolatile = 'v'"
+        ),
+        DialectName::Mysql | DialectName::Singlestore => format!(
+            "SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_TYPE = 'FUNCTION' \
+            AND LOWER(ROUTINE_NAME) IN ({list}) AND IS_DETERMINISTIC <> 'YES'"
+        ),
+        // the connection's functions (a live one's own among them), with
+        // `SQLITE_DETERMINISTIC` (0x800) or not; one it doesn't have fails the read
+        DialectName::Sqlite => format!(
+            "SELECT COUNT(*) FROM pragma_function_list \
+            WHERE lower(name) IN ({list}) AND (flags & 2048) = 0"
+        ),
+        // macros have no stability: their bodies say
+        DialectName::Duckdb => format!(
+            "SELECT 0, macro_definition FROM duckdb_functions() \
+            WHERE lower(function_name) IN ({list}) AND function_type IN ('macro', 'table_macro') \
+            UNION ALL SELECT COUNT(*), NULL FROM duckdb_functions() \
+            WHERE lower(function_name) IN ({list}) \
+            AND stability IN ('VOLATILE', 'CONSISTENT_WITHIN_QUERY')"
+        ),
+        // the user's executable functions may do anything; a SQL one is `f AS (x) -> body`
+        DialectName::Clickhouse => format!(
+            "SELECT origin = 'ExecutableUserDefined', \
+            if(origin = 'SQLUserDefined', substring(create_query, position(create_query, '->') + 2), NULL) \
+            FROM system.functions WHERE lower(name) IN ({list}) AND origin != 'System'"
+        ),
+        // also functions of packages (`pkg.f(…)`), but not `STANDARD`'s built-ins
+        DialectName::Oracle => format!(
+            "SELECT COUNT(*) FROM all_procedures WHERE deterministic = 'NO' \
+            AND ((object_type = 'FUNCTION' AND object_name IN ({upper})) \
+            OR (object_type = 'PACKAGE' AND procedure_name IN ({upper}))) \
+            AND NOT (owner = 'SYS' AND object_name = 'STANDARD')"
+        ),
+        DialectName::Mssql => format!(
+            "SELECT COUNT(*) FROM sys.objects WHERE type IN ('FN', 'IF', 'TF', 'FS', 'FT') \
+            AND LOWER(name) IN ({list}) \
+            AND ISNULL(OBJECTPROPERTY(object_id, 'IsDeterministic'), 0) = 0"
+        ),
+        _ => return None,
+    };
+    let df = match session.query(&sql) {
+        Ok(df) => df,
+        Err(e) => {
+            if polars_core::config::verbose() {
+                eprintln!("[scan_database]: catalog lookup of functions failed: {e}");
+            }
+            return None;
+        },
+    };
+    let mut out = FunctionLookup::default();
+    for row in 0..df.height() {
+        out.volatile |= match cell(&df, 0, row) {
+            Some(AnyValue::Boolean(b)) => b,
+            _ => cell_u64(&df, 0, row).is_some_and(|n| n > 0),
+        };
+        if df.width() > 1
+            && let Some(body) = cell_str(&df, 1, row)
+        {
+            out.bodies.push(body);
+        }
+    }
+    Some(out)
+}
+
 fn cell(df: &DataFrame, col: usize, row: usize) -> Option<AnyValue<'_>> {
     let c = df.columns().get(col)?;
     (row < c.len()).then(|| c.get(row).ok()).flatten()

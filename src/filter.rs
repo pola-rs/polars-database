@@ -463,6 +463,15 @@ impl Translator<'_> {
         SqlExpr::binary(col, SqlBinOp::Eq, SqlExpr::lit(SqlLiteral::Bool(value)))
     }
 
+    /// The column as a comparison's operand: through its conversion where the database
+    /// would compare other values than Polars reads (see `planner::compared_column_sql`).
+    fn compared(&self, name: &PlSmallStr) -> SqlExpr {
+        match crate::database::planner::compared_column_sql(self.config, name) {
+            Some(sql) => SqlExpr::Raw(sql),
+            None => SqlExpr::col(name.clone()),
+        }
+    }
+
     /// Whether predicates on the column can be pushed at all (see `ColumnMeta::comparable`).
     fn comparable(&self, column: &str) -> bool {
         self.config.column(column).is_none_or(|c| c.comparable)
@@ -667,7 +676,7 @@ impl Translator<'_> {
         }
         let mut class = self.leaf_class(name, dtype, CmpOp::Eq)?;
 
-        let col = || Box::new(SqlExpr::col(name.clone()));
+        let col = || Box::new(self.compared(name));
         let mut expr = if lits.len() <= self.dialect().max_in_list() {
             SqlExpr::InList(col(), lits, false)
         } else {
@@ -860,7 +869,7 @@ impl Translator<'_> {
             CmpOp::Gt => SqlBinOp::Gt,
             CmpOp::GtEq => SqlBinOp::GtEq,
         };
-        let col = || SqlExpr::col(name.clone());
+        let col = || self.compared(name);
 
         let av = lit.value();
         if av.is_null() {

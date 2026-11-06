@@ -417,6 +417,7 @@ impl PartitionReader {
                 .filter(|n| config.schema.contains(n))
                 .cloned()
                 .collect::<Vec<_>>();
+            let batch = crate::database::planner::decode_sqlite_reals(batch, config)?;
             let batch = cast_to_schema(&batch, &config.schema.try_project(&names)?, overrides)?;
             match &mut out {
                 None => out = Some(batch),
@@ -576,8 +577,10 @@ impl PartitionStream {
     }
 
     fn cast(&self, df: &DataFrame) -> PolarsResult<DataFrame> {
-        let overrides = self.shared.config.options.schema_overrides.as_deref();
-        cast_to_schema(df, &self.projected, overrides)
+        let config = &self.shared.config;
+        let overrides = config.options.schema_overrides.as_deref();
+        let df = crate::database::planner::decode_sqlite_reals(df.clone(), config)?;
+        cast_to_schema(&df, &self.projected, overrides)
     }
 
     /// The next non-empty batch, cast to the planned schema; `None` at the end.

@@ -4757,3 +4757,177 @@ def test_oracledb_pool_session_after_a_failed_read() -> None:
             assert [r[0] for r in cur.fetchall()] == ["LINGUISTIC", "BINARY_CI"]
     finally:
         pool.close(force=True)
+
+
+# A view's query runs each time the view is read: MySQL merges it into the reading query,
+# calling rand() again for a filter, and each partition reads other values
+VOLATILE_VIEWS: dict[str, tuple[list[str], float]] = {
+    "postgres17": (
+        [
+            "DROP VIEW IF EXISTS review_volatile_v",
+            "DROP TABLE IF EXISTS review_volatile_ids",
+            "CREATE TABLE review_volatile_ids (id int PRIMARY KEY)",
+            "INSERT INTO review_volatile_ids SELECT generate_series(0, 299)",
+            "CREATE VIEW review_volatile_v AS "
+            "SELECT id, random() AS r FROM review_volatile_ids",
+        ],
+        0.5,
+    ),
+    "mysql": (
+        [
+            "DROP VIEW IF EXISTS review_volatile_v",
+            "DROP TABLE IF EXISTS review_volatile_ids",
+            "CREATE TABLE review_volatile_ids (id int PRIMARY KEY)",
+            "INSERT INTO review_volatile_ids VALUES "
+            + ", ".join(f"({i})" for i in range(300)),
+            "CREATE VIEW review_volatile_v AS "
+            "SELECT id, rand() AS r FROM review_volatile_ids",
+            # MySQL's view definition leaves out the column list
+            "DROP VIEW IF EXISTS review_volatile_cl",
+            "CREATE VIEW review_volatile_cl (id, b) AS "
+            "SELECT id, rand() AS r FROM review_volatile_ids",
+        ],
+        0.5,
+    ),
+    "clickhouse": (
+        [
+            "DROP VIEW IF EXISTS review_volatile_v",
+            "DROP TABLE IF EXISTS review_volatile_ids",
+            "CREATE TABLE review_volatile_ids (id Int32) ENGINE = MergeTree ORDER BY id",
+            "INSERT INTO review_volatile_ids SELECT number FROM numbers(300)",
+            "CREATE VIEW review_volatile_v AS "
+            "SELECT id, rand() AS r FROM review_volatile_ids",
+            "DROP VIEW IF EXISTS review_volatile_pv",
+            "CREATE VIEW review_volatile_pv AS SELECT id FROM review_volatile_ids "
+            "WHERE randCanonical() < {p:Float64}",
+        ],
+        2.0**31,
+    ),
+    "oracle": (
+        [
+            'DROP VIEW IF EXISTS "review_volatile_v"',
+            'DROP TABLE IF EXISTS "review_volatile_ids"',
+            'CREATE TABLE "review_volatile_ids" ("id" NUMBER(10) PRIMARY KEY)',
+            'INSERT INTO "review_volatile_ids" '
+            "SELECT level - 1 FROM dual CONNECT BY level <= 300",
+            'CREATE VIEW "review_volatile_v" AS '
+            'SELECT "id", CAST(DBMS_RANDOM.VALUE AS BINARY_DOUBLE) AS "r" '
+            'FROM "review_volatile_ids"',
+            'CREATE OR REPLACE SYNONYM "review_volatile_s" FOR "review_volatile_v"',
+        ],
+        0.5,
+    ),
+}
+VOLATILE_VIEWS["mariadb"] = VOLATILE_VIEWS["mysql"]
+
+
+def _runnable_drivers(name: str, drivers: list[str] | None = None) -> list[str]:
+    out = []
+    for driver in drivers or list(SERVERS[name].drivers):
+        module = DRIVER_MODULES.get(driver, driver)
+        if module is not None and not _installed(module):
+            continue
+        unrunnable = KNOWN_UNRUNNABLE.get((name, driver))
+        if unrunnable is not None and unrunnable() is not None:
+            continue
+        out.append(driver)
+    return out
+
+
+@pytest.mark.parametrize(
+    "name",
+    [pytest.param(name, marks=_server_marks(name)) for name in sorted(VOLATILE_VIEWS)],
+)
+def test_volatile_views(name: str) -> None:
+    statements, threshold = VOLATILE_VIEWS[name]
+    _execute(name, statements)
+    for driver in _runnable_drivers(name):
+        df = (
+            _scan(name, driver, "review_volatile_v")
+            .filter(pl.col("r") > threshold)
+            .collect()
+        )
+        assert (df["r"] > threshold).all(), driver
+        quote = '"' if name == "oracle" else ""
+        for source in [
+            "review_volatile_v",
+            f"SELECT * FROM {quote}review_volatile_v{quote}",
+        ]:
+            lf = _scan(name, driver, source, partition_on="id", partition_num=4)
+            with pytest.raises(
+                pl.exceptions.InvalidOperationError, match="partitioned"
+            ):
+                lf.collect()
+    # through a synonym; a parameterized view; unquoted names in another case
+    more = {
+        "oracle": ['"review_volatile_s"', 'SELECT * FROM "review_volatile_s"'],
+        "clickhouse": ["SELECT * FROM review_volatile_pv(p = 0.5)"],
+        "postgres17": ["SELECT * FROM REVIEW_Volatile_V"],
+    }.get(name, [])
+    for source in more:
+        lf = _scan(
+            name, _default_driver(name), source, partition_on="id", partition_num=4
+        )
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+            lf.collect()
+    if name in ("mysql", "mariadb"):
+        for driver in _runnable_drivers(name):
+            lf = _scan(name, driver, "review_volatile_cl")
+            df = lf.filter(pl.col("b") > threshold).collect()
+            assert (df["b"] > threshold).all(), driver
+    # a table and a view without volatile functions still partition
+    lf = _scan(
+        name,
+        _default_driver(name),
+        "review_volatile_ids",
+        partition_on="id",
+        partition_num=4,
+    )
+    assert sorted(lf.collect()["id"].to_list()) == list(range(300))
+
+
+@pytest.mark.parametrize("name", ["postgres17", "mariadb"])
+def test_partition_over_a_volatile_user_function(name: str) -> None:
+    # a read-only session can't write, but each partition calls the function again
+    if name == "postgres17":
+        functions = [
+            "CREATE OR REPLACE FUNCTION review_myrand() RETURNS float8 "
+            "LANGUAGE sql VOLATILE AS 'SELECT random()'",
+            "CREATE OR REPLACE FUNCTION review_twice(x int) RETURNS int "
+            "LANGUAGE sql IMMUTABLE AS 'SELECT 2 * x'",
+        ]
+        drivers = ["psycopg", "adbc"]
+    else:
+        functions = [
+            "DROP FUNCTION IF EXISTS review_myrand",
+            "DROP FUNCTION IF EXISTS review_twice",
+            "CREATE FUNCTION review_myrand() RETURNS double NOT DETERMINISTIC NO SQL "
+            "RETURN rand()",
+            "CREATE FUNCTION review_twice(x int) RETURNS int DETERMINISTIC NO SQL "
+            "RETURN 2 * x",
+        ]
+        drivers = ["pymysql", "adbc"]
+    # a table of its own: `test_volatile_views` may drop the other meanwhile
+    tables = [
+        t.replace("review_volatile_", "review_volatile_fn_")
+        for t in VOLATILE_VIEWS[name][0][1:4]
+    ]
+    _execute(name, tables + functions)
+    for driver in _runnable_drivers(name, drivers):
+        lf = _scan(
+            name,
+            driver,
+            "SELECT id, review_myrand() AS r FROM review_volatile_fn_ids",
+            partition_on="r",
+            partition_num=4,
+        )
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="review_myrand"):
+            lf.collect()
+        lf = _scan(
+            name,
+            driver,
+            "SELECT id, review_twice(id) AS d FROM review_volatile_fn_ids",
+            partition_on="d",
+            partition_num=4,
+        )
+        assert sorted(lf.collect()["d"].to_list()) == [2 * i for i in range(300)]

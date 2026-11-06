@@ -1049,6 +1049,104 @@ def test_volatile_output_columns(
     assert facts["all_columns_volatile"] is all_columns
 
 
+def test_unknown_functions_and_tables() -> None:
+    from polars_database._sqlglot import inspect_query
+
+    facts = inspect_query(
+        "WITH c AS (SELECT * FROM s.t) SELECT myrand(), abs(x), Other(1) "
+        "FROM c JOIN v ON c.id = v.id JOIN c AS d ON 1 = 1",
+        "sqlite",
+    )
+    assert facts["unknown_functions"] == ["myrand", "other"]
+    assert sorted(facts["tables"]) == [["s", "t"], ["v"]]
+    # a CTE hides a table of its name only where it is in scope; unquoted names fold
+    # as the dialect folds them; a table function may be a (parameterized) view
+    facts = inspect_query(
+        "SELECT * FROM V WHERE id IN (WITH v AS (SELECT 1 AS id) SELECT id FROM v) "
+        'UNION ALL SELECT * FROM "Q"',
+        "postgres",
+    )
+    assert sorted(facts["tables"]) == [["Q"], ["v"]]
+    assert inspect_query("SELECT * FROM v", "oracle")["tables"] == [["V"]]
+    facts = inspect_query("SELECT * FROM pv(p = 0.5)", "clickhouse")
+    assert facts["tables"] == [["pv"]]
+    assert facts["unknown_functions"] == []
+
+
+@pytest.mark.parametrize(
+    ("view", "dialect", "outputs", "columns", "all_columns", "repeatable"),
+    [
+        (
+            "CREATE VIEW v AS SELECT id, random() AS r FROM t",
+            "sqlite",
+            ["id", "r"],
+            ["r"],
+            False,
+            False,
+        ),
+        (
+            "CREATE VIEW v (a, b) AS SELECT id, random() FROM t",
+            "sqlite",
+            ["a", "b"],
+            ["b"],
+            False,
+            False,
+        ),
+        (
+            "CREATE VIEW v (a, b) AS SELECT * FROM (SELECT id, random() AS r FROM t)",
+            "sqlite",
+            ["a", "b"],
+            [],
+            True,
+            False,
+        ),
+        (
+            "CREATE VIEW v AS SELECT id FROM t WHERE random() > 0",
+            "sqlite",
+            ["id"],
+            [],
+            False,
+            False,
+        ),
+        (
+            "CREATE VIEW v AS SELECT id FROM t LIMIT 5",
+            "sqlite",
+            ["id"],
+            [],
+            False,
+            False,
+        ),
+        ("SELECT id, abs(x) AS a FROM t", "postgres", ["id", "a"], [], False, True),
+        (
+            "select `db`.`t`.`id` AS `id`,rand() AS `r` from `db`.`t`",
+            "mysql",
+            ["id", "r"],
+            ["r"],
+            False,
+            False,
+        ),
+        ("", "mysql", None, [], False, False),
+        ("CREATE TABLE t (id INT)", "sqlite", None, [], False, False),
+    ],
+)
+def test_inspect_view(
+    view: str,
+    dialect: str,
+    outputs: list[str] | None,
+    columns: list[str],
+    all_columns: bool,
+    repeatable: bool,
+) -> None:
+    from polars_database._sqlglot import inspect_view
+
+    facts = inspect_view(view, dialect)
+    assert facts["parses"] is (outputs is not None or all_columns)
+    assert facts["output_columns"] == outputs
+    assert facts["volatile_columns"] == columns
+    assert facts["all_columns_volatile"] is all_columns
+    assert facts["repeatable"] is repeatable
+
+
 @pytest.mark.parametrize(
     ("uri", "userinfo", "host"),
     [

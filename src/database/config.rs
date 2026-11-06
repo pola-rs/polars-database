@@ -87,6 +87,10 @@ pub struct DatabaseScanConfig {
     /// Why the relation is read as given, without pushdown (`pushdown=False`, or a query that
     /// can't be wrapped).
     pub pushdown_disabled: Option<PlSmallStr>,
+    /// The source runs a volatile function its SQL doesn't show (in a view it reads, or a
+    /// function sqlglot doesn't know): it may return other rows each time it runs.
+    #[serde(default)]
+    pub volatile_source: bool,
     /// Partition bounds already queried, by the bounds SQL: optimizing the plan again
     /// (another `collect`, `explain`) doesn't query them again. The outer partitions are
     /// open-ended, so stale bounds only skew partition sizes, never lose rows.

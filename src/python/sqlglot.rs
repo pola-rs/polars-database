@@ -57,10 +57,22 @@ impl SqlRenderer for SqlglotRenderer {
     }
 
     fn inspect_query(&self, sql: &str, dialect: DialectName) -> PolarsResult<QueryFacts> {
+        self.facts("inspect_query", sql, dialect)
+            .map_err(|e| polars_err!(ComputeError: "sqlglot could not inspect the query: {e}"))
+    }
+
+    fn inspect_view(&self, sql: &str, dialect: DialectName) -> PolarsResult<QueryFacts> {
+        self.facts("inspect_view", sql, dialect)
+            .map_err(|e| polars_err!(ComputeError: "sqlglot could not inspect the view: {e}"))
+    }
+}
+
+impl SqlglotRenderer {
+    fn facts(&self, function: &str, sql: &str, dialect: DialectName) -> PyResult<QueryFacts> {
         Python::attach(|py| {
             let d = self
                 .module
-                .call_method1(py, "inspect_query", (sql, dialect_name(dialect)))?;
+                .call_method1(py, function, (sql, dialect_name(dialect)))?;
             let d = d.bind(py).cast::<PyDict>()?;
             let get = |k: &str| -> PyResult<bool> {
                 Ok(d.get_item(k)?
@@ -78,6 +90,14 @@ impl SqlRenderer for SqlglotRenderer {
                 Some(v) if !v.is_none() => Some(v.extract()?),
                 _ => None,
             };
+            let unknown_functions: Vec<String> = match d.get_item("unknown_functions")? {
+                Some(v) if !v.is_none() => v.extract()?,
+                _ => vec![],
+            };
+            let tables: Vec<Vec<String>> = match d.get_item("tables")? {
+                Some(v) if !v.is_none() => v.extract()?,
+                _ => vec![],
+            };
             PyResult::Ok(QueryFacts {
                 parses: get("parses")?,
                 single_select: get("single_select")?,
@@ -92,9 +112,13 @@ impl SqlRenderer for SqlglotRenderer {
                 side_effects_outside_rows: get("side_effects_outside_rows")?,
                 volatile_columns: volatile_columns.into_iter().map(Into::into).collect(),
                 all_columns_volatile: get("all_columns_volatile")?,
+                unknown_functions: unknown_functions.into_iter().map(Into::into).collect(),
+                tables: tables
+                    .into_iter()
+                    .map(|t| t.into_iter().map(Into::into).collect())
+                    .collect(),
                 body: body.map(Into::into),
             })
         })
-        .map_err(|e| polars_err!(ComputeError: "sqlglot could not inspect the query: {e}"))
     }
 }

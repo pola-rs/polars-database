@@ -320,9 +320,11 @@ pub fn resolve_scan(
         wrappable: true,
         ..Default::default()
     };
+    let mut query_facts: Option<QueryFacts> = None;
     if let DatabaseRelation::Query { sql } = &options.relation {
         let sql = sql.clone();
         let facts = sql_renderer().and_then(|r| r.inspect_query(&sql, dialect));
+        query_facts = facts.as_ref().ok().filter(|f| f.parses).cloned();
         let read_only_session =
             read_only_session(dialect, &backend.kind, options.connection.is_live());
         check_read_only(&sql, facts.as_ref().ok(), read_only_session)?;
@@ -444,6 +446,10 @@ pub fn resolve_scan(
     }
 
     let mut columns: Vec<ColumnMeta>;
+    let mut volatility = SourceVolatility::default();
+    // The type affinity of a SQLite table's columns (`sqlite_affinity_dtype`): a REAL
+    // column holds no integers, an INTEGER column no integral reals.
+    let mut affinity: PlHashMap<PlSmallStr, DataType> = PlHashMap::new();
     let mut stats = TableStats::default();
     let schema: SchemaRef;
 
@@ -473,6 +479,7 @@ pub fn resolve_scan(
                 },
             })
             .collect();
+        // No I/O to ask the database about views and the functions sqlglot doesn't know.
         schema = schema_;
     } else {
         let backend_impl = open_backend(&backend, options.fetch.batch_size)?;
@@ -534,6 +541,23 @@ pub fn resolve_scan(
             },
         };
         stats = info.stats;
+        let names = discovered.iter_names().cloned().collect::<Vec<_>>();
+        volatility = source_volatility(
+            session.as_mut(),
+            dialect,
+            &options.relation,
+            query_facts.as_ref(),
+            &names,
+        );
+        // a view's columns hold what its query gives, whatever `pragma_table_info` says
+        // (the first branch's type, of a `UNION`)
+        if dialect == DialectName::Sqlite && volatility.plain_table {
+            affinity.extend(
+                info.compare_types
+                    .iter()
+                    .map(|(n, t)| (n.clone(), sqlite_affinity_dtype(t))),
+            );
+        }
         // A query's result types decide how the database compares its columns, and fix
         // their dtypes as a table's declared types do: the same column reads the same
         // from a table and a query, whichever driver reads it. They are looked up where
@@ -729,6 +753,25 @@ pub fn resolve_scan(
         .map(|c| c.dtype == DataType::String || c.dtype.is_primitive_numeric())
         .collect();
 
+    // Each partition reads the source again: a volatile function in a view it reads, or one
+    // sqlglot doesn't know (a user's), would give other rows each time.
+    if let Some(reason) = &volatility.volatile
+        && matches!(
+            options.partitioning,
+            PartitionSpec::Column { .. } | PartitionSpec::Predicates(_)
+        )
+    {
+        polars_bail!(
+            InvalidOperation:
+            "this source can't be partitioned: each partition reads it again, and {reason} \
+            may return other rows or values each time; pass partition_on=None"
+        );
+    }
+    query.all_columns_volatile |= volatility.all_columns;
+    query
+        .volatile_columns
+        .extend(volatility.columns.iter().cloned());
+
     // A filter on a volatile function's column (`random() AS r`) isn't pushed: SQLite merges
     // the wrapped query into the filter's and calls the function again for it, returning
     // rows whose value fails the filter.
@@ -770,21 +813,42 @@ pub fn resolve_scan(
     // A SQLite column has no type: one typed from a sample may hold values of several
     // storage classes (`'abc'` and `1`, `1` and `1.5`). Drivers type a batch by its own
     // values, so it would depend on the batch which of them round or fail: `2**53 + 1` next
-    // to `1.5` read as `9007199254740992.0`, also when retyped to String. Each column is
-    // read converted to its dtype's class instead (ADBC also writes a real as text with 6
-    // significant digits). ConnectorX reads a column by its declared type where the
-    // values' class allows: a `BOOLEAN`'s integers as booleans (2 as true), and it fails
-    // on a `DATE` / `BLOB` / … column's integers. An expression has no declared type: its
-    // values are read by their class, as the other drivers read them.
+    // to `1.5` read as `9007199254740992.0`, also when retyped to String, Decimal or an
+    // integer. Each column is read converted to its dtype's class instead (ADBC also writes
+    // a real as text with 6 significant digits): text, reals, integers (an integral real as
+    // one), and a decimal as exact text; a REAL column holds only reals (and text), an
+    // INTEGER one no integral reals, so they are read as they are. ConnectorX reads
+    // a column by its declared type where the values' class allows: a `BOOLEAN`'s integers
+    // as booleans (2 as true), and it fails on a `DATE` / `BLOB` / … column's integers. An
+    // expression has no declared type: its values are read by their class, as the other
+    // drivers read them.
     if dialect == DialectName::Sqlite {
         let connectorx = matches!(backend.kind, BackendKind::ConnectorX);
+        let overridden = |name: &PlSmallStr| {
+            options
+                .schema_overrides
+                .as_ref()
+                .is_some_and(|o| o.contains(name))
+        };
         for (c, numeric_or_text) in columns.iter_mut().zip(numeric_or_text) {
             match c.dtype {
                 DataType::String if numeric_or_text => c.db_type = Some(SQLITE_TEXT.into()),
-                DataType::Float64 => c.db_type = Some(SQLITE_REAL.into()),
-                DataType::Int64 | DataType::Binary if connectorx => {
-                    c.db_type = Some(CONNECTORX_SQLITE_VALUE.into())
+                DataType::Decimal(_, _) => c.db_type = Some(SQLITE_TEXT.into()),
+                DataType::Float32 | DataType::Float64
+                    if affinity.get(&c.name) != Some(&DataType::Float64) =>
+                {
+                    c.db_type = Some(SQLITE_REAL.into())
                 },
+                ref dt if dt.is_integer() && overridden(&c.name) => {
+                    c.db_type = Some(SQLITE_INTEGER_CUT.into())
+                },
+                ref dt
+                    if dt.is_integer()
+                        && (connectorx || affinity.get(&c.name) != Some(&DataType::Int64)) =>
+                {
+                    c.db_type = Some(SQLITE_INTEGER.into())
+                },
+                DataType::Binary if connectorx => c.db_type = Some(CONNECTORX_SQLITE_VALUE.into()),
                 _ => {},
             }
         }
@@ -801,6 +865,7 @@ pub fn resolve_scan(
         compiled: None,
         connection_share: None,
         pushdown_disabled,
+        volatile_source: volatility.volatile.is_some(),
         bounds_cache: Default::default(),
     })
 }
@@ -967,9 +1032,124 @@ const CONNECTORX_DECIMAL: &str = "<connectorx decimal>";
 /// The `db_type` of a SQLite String / Float64 column: its values converted to text / reals.
 const SQLITE_TEXT: &str = "<sqlite text>";
 const SQLITE_REAL: &str = "<sqlite real>";
+/// The `db_type` of a SQLite integer column: an integral real read as an integer.
+const SQLITE_INTEGER: &str = "<sqlite integer>";
+/// The `db_type` of a SQLite column retyped to an integer by `schema_overrides`: a real cut
+/// to an integer, as the cast to the override cuts it.
+const SQLITE_INTEGER_CUT: &str = "<sqlite integer cut>";
 /// The `db_type` of a SQLite Int64 / Binary column read through ConnectorX: its values as
 /// they are, without the column's declared type.
 const CONNECTORX_SQLITE_VALUE: &str = "<connectorx sqlite value>";
+
+/// The marker that starts a real's exact value in a [`SQLITE_TEXT`] column, and escapes a
+/// text that starts with it.
+const SQLITE_REAL_MARK: char = '\u{1}';
+
+/// A SQLite real `x`, exactly, as `\u{1}[-]m:k` for `m · 2^k` (`\u{1}inf`, `\u{1}-inf`),
+/// which [`decode_sqlite_reals`] writes as Polars writes a Float64. SQLite's own text of a
+/// real (`printf`, `CAST`) depends on its build, some of which round wrongly (to another
+/// real); scaling by powers of two is exact on any. (-0.0 reads as 0.0: SQLite doesn't
+/// tell them apart.)
+fn sqlite_real_exact(column: &str) -> String {
+    format!(
+        "CASE WHEN {column} = 9e999 THEN char(1) || 'inf' \
+        WHEN {column} = -9e999 THEN char(1) || '-inf' \
+        ELSE char(1) || CASE WHEN {column} < 0 THEN '-' ELSE '' END || (\
+        WITH RECURSIVE __polars_real(v, k) AS (SELECT abs({column}), 0 UNION ALL \
+        SELECT CASE WHEN v >= 9223372036854775808.0 THEN v / 1024 ELSE v * 1024 END, \
+        CASE WHEN v >= 9223372036854775808.0 THEN k + 10 ELSE k - 10 END FROM __polars_real \
+        WHERE v >= 9223372036854775808.0 OR v <> CAST(v AS INTEGER)) \
+        SELECT CAST(v AS INTEGER) || ':' || k FROM __polars_real \
+        WHERE v < 9223372036854775808.0 AND v = CAST(v AS INTEGER) LIMIT 1) END"
+    )
+}
+
+/// `x · 2^k`, exactly where the result is a real.
+fn ldexp(mut x: f64, mut k: i32) -> f64 {
+    let pow2 = |e: i32| f64::from_bits(((e + 1023) as u64) << 52);
+    while k > 1000 {
+        x *= pow2(1000);
+        k -= 1000;
+    }
+    while k < -1000 {
+        x *= pow2(-1000);
+        k += 1000;
+    }
+    x * pow2(k)
+}
+
+/// A SQLite [`SQLITE_TEXT`] column's batch with its reals (`sqlite_real_exact`) written as
+/// Polars writes a Float64, and escaped text unescaped.
+pub(crate) fn decode_sqlite_reals(
+    mut df: DataFrame,
+    config: &DatabaseScanConfig,
+) -> PolarsResult<DataFrame> {
+    if config.dialect != DialectName::Sqlite {
+        return Ok(df);
+    }
+    let names: Vec<PlSmallStr> = config
+        .columns
+        .iter()
+        .filter(|c| c.db_type.as_deref() == Some(SQLITE_TEXT))
+        .map(|c| c.name.clone())
+        .collect();
+    for name in names {
+        let Ok(col) = df.column(&name) else {
+            continue;
+        };
+        let Ok(ca) = col.str() else {
+            // all NULL
+            continue;
+        };
+        if !ca.iter().flatten().any(|v| v.starts_with(SQLITE_REAL_MARK)) {
+            continue;
+        }
+        let mut reals: Vec<Option<f64>> = Vec::with_capacity(ca.len());
+        let mut texts: Vec<Option<&str>> = Vec::with_capacity(ca.len());
+        for v in ca.iter() {
+            let (real, text) = match v.map(|v| (v, v.strip_prefix(SQLITE_REAL_MARK))) {
+                None => (None, None),
+                Some((v, None)) => (None, Some(v)),
+                Some((_, Some(rest))) if rest.starts_with(SQLITE_REAL_MARK) => (None, Some(rest)),
+                Some((_, Some(rest))) => {
+                    let value = match rest {
+                        "inf" => f64::INFINITY,
+                        "-inf" => f64::NEG_INFINITY,
+                        _ => {
+                            let parsed = rest.split_once(':').and_then(|(m, k)| {
+                                let negative = m.starts_with('-');
+                                let m = m.trim_start_matches('-').parse::<u64>().ok()?;
+                                let x = ldexp(m as f64, k.parse::<i32>().ok()?);
+                                Some(if negative { -x } else { x })
+                            });
+                            polars_ensure!(
+                                parsed.is_some(),
+                                ComputeError:
+                                "database column '{name}' read a real as '{rest}', which isn't \
+                                the expected `m:k`"
+                            );
+                            parsed.unwrap()
+                        },
+                    };
+                    (Some(value), None)
+                },
+            };
+            reals.push(real);
+            texts.push(text);
+        }
+        // as Polars writes them
+        let reals = Float64Chunked::from_iter_options(name.clone(), reals.into_iter())
+            .cast(&DataType::String)?;
+        let decoded: StringChunked = reals
+            .str()?
+            .iter()
+            .zip(texts)
+            .map(|(real, text)| real.or(text))
+            .collect();
+        df.replace(&name, decoded.with_name(name.clone()).into_column())?;
+    }
+    Ok(df)
+}
 
 /// SQL that converts a column of a declared type where the backend can't read it as is, or
 /// `None` to select it as it is. `setup_runs`: the session setup runs (see `resolve_scan`).
@@ -987,16 +1167,14 @@ fn column_conversion(
         return Some(dialect.cast_to_text(column));
     }
     if db_type == SQLITE_TEXT {
-        // SQLite writes a real as text with 15 significant digits: the fewest digits
-        // (15 to 17) that read back as the same real
-        let digits = |n: u32| format!("printf('%!.{n}g', {column})");
+        // a real exactly, which the reader writes as Polars writes a Float64 (as the
+        // column read as reals, then cast, would be); a text starting with the marker
+        // escaped by another
+        let text = format!("CAST({column} AS TEXT)");
         return Some(format!(
-            "CASE WHEN typeof({column}) <> 'real' THEN CAST({column} AS TEXT) \
-            WHEN CAST({p15} AS REAL) = {column} THEN {p15} \
-            WHEN CAST({p16} AS REAL) = {column} THEN {p16} ELSE {p17} END",
-            p15 = digits(15),
-            p16 = digits(16),
-            p17 = digits(17),
+            "CASE WHEN typeof({column}) = 'real' THEN {} \
+            WHEN substr({text}, 1, 1) = char(1) THEN char(1) || {text} ELSE {text} END",
+            sqlite_real_exact(column)
         ));
     }
     if db_type == CONNECTORX_SQLITE_VALUE {
@@ -1007,6 +1185,22 @@ fn column_conversion(
         // a text value stays text, and fails the read
         return Some(format!(
             "CASE WHEN typeof({column}) = 'integer' THEN CAST({column} AS REAL) ELSE {column} END"
+        ));
+    }
+    if db_type == SQLITE_INTEGER {
+        // another real stays a real, and fails the read (`1.5`, `1e19`): `CAST` would cut
+        // it; `CAST(x AS INTEGER) = x` compares exactly, not as reals
+        return Some(format!(
+            "CASE WHEN typeof({column}) = 'real' AND CAST({column} AS INTEGER) = {column} \
+            THEN CAST({column} AS INTEGER) ELSE {column} END"
+        ));
+    }
+    if db_type == SQLITE_INTEGER_CUT {
+        // as the cast to an override cuts it (a real out of range stays one, and fails)
+        return Some(format!(
+            "CASE WHEN typeof({column}) = 'real' AND {column} >= -9223372036854775808.0 \
+            AND {column} < 9223372036854775808.0 THEN CAST({column} AS INTEGER) \
+            ELSE {column} END"
         ));
     }
     if let Some(sql) = dialect.text_conversion(db_type, column) {
@@ -1531,6 +1725,24 @@ fn converted_select_list(
         })
         .collect::<Vec<_>>();
     any.then_some(items)
+}
+
+/// The SQL a filter compares a column through, where not the column itself: a SQLite column
+/// read converted to reals, which may hold integers (no REAL affinity). The database
+/// compares `2**53 + 1` exactly, while Polars reads it as `9007199254740992.0`, so the
+/// converted value is compared, as read. (An index on the column isn't used then.)
+pub(crate) fn compared_column_sql(config: &DatabaseScanConfig, column: &str) -> Option<String> {
+    let c = config.column(column)?;
+    if config.dialect != DialectName::Sqlite || c.db_type.as_deref() != Some(SQLITE_REAL) {
+        return None;
+    }
+    column_conversion(
+        config.dialect,
+        &config.backend.kind,
+        config.session_setup_runs(),
+        SQLITE_REAL,
+        &config.dialect.quote_ident(column),
+    )
 }
 
 /// Select items as fixed SQL, for the discovery queries that don't go through the renderer.
@@ -2122,9 +2334,186 @@ fn repeatable(facts: &QueryFacts, dialect: DialectName, read_only_session: bool)
     facts.repeatable && (!facts.side_effects || !functions_write || read_only_session)
 }
 
+/// Where a source runs volatile functions its own SQL doesn't show ([`source_volatility`]).
+#[derive(Debug, Default)]
+struct SourceVolatility {
+    /// Why it may return other rows or values each time it runs, if it may.
+    volatile: Option<PlSmallStr>,
+    /// Its columns whose values may differ each time (a view's `random() AS r`).
+    columns: Vec<PlSmallStr>,
+    /// Any of its columns' values may differ each time.
+    all_columns: bool,
+    /// The source is a table the catalog says is no view: its declared types hold.
+    plain_table: bool,
+}
+
+const UNKNOWN_FUNCTIONS: &str = "a function sqlglot doesn't know (it may be a user's \
+    volatile function, which the catalog can't tell)";
+
+/// The views a scan reads (the table, or those its query reads, and theirs in turn), and
+/// the rounds of SQL-defined functions it looks through, at most: one past this is taken to
+/// be volatile.
+const MAX_VIEW_LOOKUPS: usize = 32;
+const MAX_FUNCTION_ROUNDS: usize = 8;
+
+/// Whether reading the source runs a volatile function that its SQL doesn't show: one in
+/// a view it reads (the database runs a view's query each time; SQLite and MySQL merge it
+/// into the reading query, calling `random()` again for a filter), or one sqlglot doesn't
+/// know (`myrand()`) that the catalog says is volatile, or can't tell about (see
+/// [`catalog::volatile_functions`]). Each partition would read other rows, and a filter
+/// on such a column keep others than it returns.
+///
+/// `names`: the source's columns, in order: a view's columns are matched to its query's
+/// by position (MySQL's definition leaves out a column list). A view that can't be
+/// inspected (its definition hidden, or not parsed) counts as volatile; a dialect
+/// without a view lookup, or a failed one, as no view.
+fn source_volatility(
+    session: &mut dyn DatabaseSession,
+    dialect: DialectName,
+    relation: &DatabaseRelation,
+    facts: Option<&QueryFacts>,
+    names: &[PlSmallStr],
+) -> SourceVolatility {
+    let mut out = SourceVolatility::default();
+    let mut unknown: Vec<PlSmallStr> = facts
+        .map(|f| f.unknown_functions.clone())
+        .unwrap_or_default();
+    // (the relation, the qualifier of the view naming it, whether its columns are the
+    // source's)
+    let mut pending: Vec<(Vec<PlSmallStr>, Vec<PlSmallStr>, bool)> = match relation {
+        DatabaseRelation::Table { parts, .. } => vec![(parts.to_vec(), vec![], true)],
+        DatabaseRelation::Query { .. } => facts
+            .map(|f| {
+                f.tables
+                    .iter()
+                    .map(|t| (t.clone(), vec![], false))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    let mut seen: PlHashSet<Vec<PlSmallStr>> = PlHashSet::new();
+    let renderer = sql_renderer().ok();
+    while let Some((parts, context, own_columns)) = pending.pop() {
+        let key = context
+            .iter()
+            .chain(&parts)
+            .map(|p| p.to_lowercase().into())
+            .collect();
+        if !seen.insert(key) {
+            continue;
+        }
+        if seen.len() > MAX_VIEW_LOOKUPS {
+            out.volatile = Some("one of the many views it reads".into());
+            out.all_columns = true;
+            break;
+        }
+        let (sql, qualifier) = match catalog::view_definition(session, dialect, &parts, &context) {
+            catalog::ViewLookup::View { sql, qualifier } => (sql, qualifier),
+            catalog::ViewLookup::NotAView => {
+                out.plain_table |= own_columns;
+                continue;
+            },
+            catalog::ViewLookup::Unknown => continue,
+        };
+        let name = parts.join(".");
+        let view = renderer
+            .as_ref()
+            .and_then(|r| r.inspect_view(&sql, dialect).ok())
+            .filter(|v| v.parses);
+        let Some(view) = view else {
+            out.volatile = Some(format!("the view '{name}', which can't be inspected,").into());
+            out.all_columns = true;
+            continue;
+        };
+        if !view.repeatable {
+            // a volatile function, a `LIMIT`, rows picked in no set order
+            out.volatile = Some(format!("the view '{name}'").into());
+        }
+        let any_volatile = view.all_columns_volatile || !view.volatile_columns.is_empty();
+        match &view.output_columns {
+            Some(outputs)
+                if own_columns && !view.all_columns_volatile && outputs.len() == names.len() =>
+            {
+                for v in &view.volatile_columns {
+                    if let Some(i) = outputs.iter().position(|o| o.eq_ignore_ascii_case(v)) {
+                        out.columns.push(names[i].clone());
+                    }
+                }
+            },
+            // read through a query or another view: any of the source's columns may be one
+            _ if any_volatile => out.all_columns = true,
+            _ => {},
+        }
+        unknown.extend(view.unknown_functions);
+        // its own unqualified names resolve where it was found
+        pending.extend(
+            view.tables
+                .into_iter()
+                .map(|t| (t, qualifier.clone(), false)),
+        );
+    }
+    // Functions defined in SQL (DuckDB macros, ClickHouse functions) are as volatile as
+    // their bodies, which may call others.
+    let mut checked: PlHashSet<PlSmallStr> = PlHashSet::new();
+    for round in 0.. {
+        let mut functions: Vec<PlSmallStr> =
+            unknown.drain(..).filter(|n| !checked.contains(n)).collect();
+        functions.sort();
+        functions.dedup();
+        if functions.is_empty() {
+            break;
+        }
+        if round == MAX_FUNCTION_ROUNDS {
+            out.volatile = Some(UNKNOWN_FUNCTIONS.into());
+            break;
+        }
+        checked.extend(functions.iter().cloned());
+        let Some(found) = catalog::volatile_functions(session, dialect, &functions) else {
+            // the values of such a column aren't compared in the database on SQLite only,
+            // as without the lookup (`_volatile_columns`)
+            out.volatile = Some(UNKNOWN_FUNCTIONS.into());
+            break;
+        };
+        let mut volatile = found.volatile;
+        for body in &found.bodies {
+            match renderer
+                .as_ref()
+                .and_then(|r| r.inspect_query(&format!("SELECT {body}"), dialect).ok())
+                .filter(|f| f.parses)
+            {
+                Some(f) => {
+                    volatile |= !f.repeatable;
+                    unknown.extend(f.unknown_functions);
+                },
+                None => volatile = true,
+            }
+        }
+        if volatile {
+            out.volatile = Some(
+                format!(
+                    "one of the functions {} (volatile, by the catalog)",
+                    functions.join(", ")
+                )
+                .into(),
+            );
+            out.all_columns = true;
+            break;
+        }
+    }
+    if verbose()
+        && let Some(reason) = &out.volatile
+    {
+        eprintln!("[scan_database]: the source is volatile: {reason}");
+    }
+    out
+}
+
 /// Whether the source returns the same rows each time it runs. A query that can't be
 /// inspected is taken to be repeatable, as when it is partitioned.
 fn query_repeatable(config: &DatabaseScanConfig) -> bool {
+    if config.volatile_source {
+        return false;
+    }
     match &config.options.relation {
         DatabaseRelation::Table { .. } => true,
         DatabaseRelation::Query { sql } => sql_renderer()
