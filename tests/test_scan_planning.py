@@ -1223,7 +1223,10 @@ def test_like_under_an_unknown_collation(dialect: str, pushed: str) -> None:
         driver="sqlalchemy",
         partition_on=None,
     )
-    assert pushed in lf.filter(pl.col("s").str.starts_with("c")).explain()
+    assert pushed in lf.filter(pl.col("s").str.ends_with("c")).explain()
+    if dialect == "mysql":
+        # an index range for a prefix under PAD SPACE skips `'c\tx'` (#211)
+        assert "filters 0/1" in lf.filter(pl.col("s").str.starts_with("c")).explain()
 
 
 @pytest.mark.parametrize("dtype", [pl.Float64, pl.Float32, pl.Decimal(20, 4)])

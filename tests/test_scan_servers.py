@@ -30,7 +30,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlsplit
@@ -4025,7 +4025,7 @@ def test_factory_connection_of_the_mariadb_module_is_restored_or_discarded(
     import sys
     import types
 
-    import pymysql
+    import pymysql  # type: ignore[import-untyped]
 
     from polars_database import _bridge
 
@@ -4317,7 +4317,9 @@ def test_mysql_decimal_partition_cuts_near_zero(server: str) -> None:
         ],
     )
     for n in [600, 7]:
-        lf = _scan(server, "pymysql", "review_dec_cuts", partition_on="x", partition_num=n)
+        lf = _scan(
+            server, "pymysql", "review_dec_cuts", partition_on="x", partition_num=n
+        )
         out = lf.collect()["x"]
         assert out.len() == 601, n
         assert out.n_unique() == 601, n
@@ -4351,7 +4353,12 @@ def test_postgres_arrays_of_types_read_as_text(driver: str) -> None:
         out = _scan("postgres17", driver, source).collect().sort("id")
         assert out.schema["u"] == pl.List(pl.String), source
         assert out.drop("w").rows() == [
-            (1, ["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"], ['{"a": 1}'], ["happy", "sad"]),
+            (
+                1,
+                ["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"],
+                ['{"a": 1}'],
+                ["happy", "sad"],
+            ),
             (2, None, None, None),
         ], source
     out = _scan("postgres17", driver, table).collect().sort("id")
@@ -4398,3 +4405,356 @@ def test_clickhouse_connectorx_low_cardinality_array_is_refused() -> None:
             _scan("clickhouse", "connectorx", source).collect()
         out = _scan("clickhouse", "clickhouse_connect", source).collect()
         assert out["a"].to_list() == [["x", "y"]]
+
+
+# Round 11 review findings.
+
+
+@pytest.mark.parametrize("server", ["mysql", "mariadb"])
+def test_mysql_decimal_read_as_float_partition_cuts(server: str) -> None:
+    # a DECIMAL read as Float64 had float cuts again, which MySQL 8 misorders (#201)
+    _execute(
+        server,
+        [
+            "DROP TABLE IF EXISTS r11_dec_float_cuts",
+            "CREATE TABLE r11_dec_float_cuts (x DECIMAL(5,2))",
+            "INSERT INTO r11_dec_float_cuts "
+            "WITH RECURSIVE r(i) AS (SELECT -300 UNION ALL SELECT i + 1 FROM r "
+            "WHERE i < 300) SELECT i / 100 FROM r",
+        ],
+    )
+    for dtype in [pl.Float64, pl.Float32]:
+        for kwargs in [{"schema_overrides": {"x": dtype}}, {"schema": {"x": dtype}}]:
+            lf = _scan(
+                server,
+                "pymysql",
+                "r11_dec_float_cuts",
+                partition_on="x",
+                partition_num=600,
+                **kwargs,
+            )
+            out = lf.collect()["x"]
+            assert out.len() == 601, kwargs
+            assert out.n_unique() == 601, kwargs
+
+
+@pytest.mark.parametrize("server", ["mysql", "mariadb"])
+def test_mysql_indexed_columns_round_literals(server: str) -> None:
+    # an index lookup stores the literal into the column's type: a fractional datetime
+    # literal on DATETIME(0), a DOUBLE(7,2) equality (MariaDB) and a YEAR beyond 2155
+    # (MariaDB) matched other rows; `LIKE 'a%'` under a PAD SPACE binary collation
+    # skipped `'a\tb'`
+    _execute(
+        server,
+        [
+            "DROP TABLE IF EXISTS r11_indexed",
+            "CREATE TABLE r11_indexed (id int, d0 DATETIME(0), d3 DATETIME(3), "
+            "ts0 TIMESTAMP(0) NULL, f DOUBLE(7,2), y YEAR, "
+            "s VARCHAR(20) COLLATE utf8mb4_bin, "
+            "KEY(d0), KEY(d3), KEY(ts0), KEY(f), KEY(y), KEY(s))",
+            "INSERT INTO r11_indexed VALUES "
+            "(1, '2020-01-01 00:00:00', '2020-01-01 00:00:00.500', "
+            "'2020-01-01 00:00:00', 1.25, 2155, 'a'), "
+            "(2, '2020-01-01 00:00:01', '2020-01-01 00:00:01', "
+            "'2020-01-01 00:00:01', 1.5, 1901, 'a\\tb'), "
+            "(3, NULL, NULL, NULL, NULL, 2000, 'ab'), "
+            "(4, NULL, NULL, NULL, NULL, NULL, 'a\\nx'), "
+            "(5, NULL, NULL, NULL, NULL, NULL, 'b')",
+        ],
+    )
+    t = datetime(2020, 1, 1, 0, 0, 0)
+    utc = t.replace(tzinfo=UTC)
+    predicates = [
+        pl.col("d0") == t + timedelta(microseconds=400_000),
+        pl.col("d0") == t + timedelta(microseconds=500_000),
+        pl.col("d0").is_in([t + timedelta(microseconds=500_000)]),
+        pl.col("d0") == t + timedelta(seconds=1),
+        pl.col("d0") < t + timedelta(microseconds=500_000),
+        pl.col("d3") == t + timedelta(microseconds=500_400),
+        pl.col("d3") == t + timedelta(microseconds=500_000),
+        pl.col("ts0") == utc + timedelta(microseconds=500_000),
+        pl.col("f") == 1.2501,
+        pl.col("f") == 1.25,
+        pl.col("f") > 1.2501,
+        pl.col("y") < 2200,
+        pl.col("y") <= 3000,
+        pl.col("y") > 1800,
+        pl.col("y") == 2155,
+        pl.col("s").str.starts_with("a"),
+        pl.col("s").str.ends_with("b"),
+    ]
+    _check_filters(_scan(server, "pymysql", "r11_indexed"), predicates)
+
+
+@pytest.mark.parametrize("server", ["mysql", "mariadb"])
+def test_mysql_high_not_precedence(server: str) -> None:
+    # `NOT x IS NULL` is `(NOT x) IS NULL` under HIGH_NOT_PRECEDENCE
+    import pymysql  # type: ignore[import-untyped]
+
+    uri = SERVERS[server].uri
+    if uri is None:
+        pytest.skip(f"no {server} URI")
+    _execute(
+        server,
+        [
+            "DROP TABLE IF EXISTS r11_not_prec",
+            "CREATE TABLE r11_not_prec (id int, n int)",
+            "INSERT INTO r11_not_prec VALUES (1, 0), (2, NULL), (3, 5)",
+        ],
+    )
+
+    def connect() -> Any:
+        return pymysql.connect(
+            **_parts(uri),
+            init_command="SET SESSION sql_mode = "
+            "CONCAT(@@sql_mode, ',HIGH_NOT_PRECEDENCE')",
+        )
+
+    _check_filters(
+        pl.scan_database("r11_not_prec", connect),
+        [
+            pl.col("n").is_not_null(),
+            ~pl.col("n").is_null(),
+            pl.col("n").eq_missing(5),
+            ~pl.col("n").is_in([5]),
+            pl.col("n").is_in([5], nulls_equal=True),
+        ],
+    )
+
+
+@needs_postgres
+@pytest.mark.parametrize("driver", ["psycopg", "psycopg2", "pg8000"])
+def test_postgres_extra_float_digits(driver: str) -> None:
+    # with extra_float_digits = 0 a text-protocol driver read 0.1 + 0.2 as 0.3, while the
+    # pushed filter compared the exact double
+    pytest.importorskip(driver)
+    _execute(
+        "postgres17",
+        [
+            "DROP TABLE IF EXISTS r11_float_digits",
+            "CREATE TABLE r11_float_digits (id int, d float8)",
+            "INSERT INTO r11_float_digits VALUES (1, 0.1::float8 + 0.2::float8), (2, 0.3)",
+        ],
+    )
+    sep = "&" if "?" in POSTGRES else "?"
+    uri = f"{POSTGRES}{sep}options=-c%20extra_float_digits%3D0"
+    lf = pl.scan_database("r11_float_digits", uri, driver=driver)
+    out = lf.collect().sort("id")
+    assert out["d"].to_list() == [0.1 + 0.2, 0.3]
+    _check_filters(lf, [pl.col("d") == 0.1 + 0.2, pl.col("d") == 0.3])
+
+
+@needs_clickhouse
+def test_clickhouse_like_patterns_with_nul() -> None:
+    # `s LIKE '%\0'` matched every row
+    pytest.importorskip("clickhouse_connect")
+    table = "r11_ch_nul"
+    _execute(
+        "clickhouse",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id Int32, s String) ENGINE = MergeTree ORDER BY id",
+            f"INSERT INTO {table} VALUES (1, 'a'), (2, 'a\\0'), (3, 'a\\0b'), "
+            "(4, '\\0b'), (5, 'b'), (6, '')",
+        ],
+    )
+    try:
+        lf = _scan("clickhouse", "clickhouse_connect", table)
+        _check_filters(
+            lf,
+            [
+                pl.col("s").str.ends_with("\x00"),
+                pl.col("s").str.ends_with("a\x00"),
+                ~pl.col("s").str.ends_with("\x00b"),
+                pl.col("s").str.starts_with("\x00"),
+                pl.col("s").str.contains("\x00", literal=True),
+            ],
+        )
+    finally:
+        _execute("clickhouse", [f"DROP TABLE IF EXISTS {table}"])
+
+
+@needs_clickhouse
+def test_clickhouse_connectorx_question_marks() -> None:
+    # ConnectorX's ClickHouse client reads `?` as a placeholder: "unbound query argument"
+    pytest.importorskip("connectorx")
+    table = "r11_ch_question"
+    _execute(
+        "clickhouse",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f'CREATE TABLE {table} (id Int32, s String, "q?" Int32) '
+            "ENGINE = MergeTree ORDER BY id",
+            f"INSERT INTO {table} VALUES (1, 'a?', 1), (2, 'b', 2)",
+        ],
+    )
+    try:
+        lf = _scan("clickhouse", "connectorx", table)
+        out = lf.select("id", "s").filter(pl.col("s") == "a?").collect()
+        assert out["id"].to_list() == [1]
+        with pytest.raises(pl.exceptions.InvalidOperationError, match=r"column 'q\?'"):
+            lf.select("q?").collect()
+    finally:
+        _execute("clickhouse", [f"DROP TABLE IF EXISTS {table}"])
+
+
+@needs_postgres
+def test_adbc_connect_errors_scrub_query_passwords() -> None:
+    # libpq quoted a `?password=` it couldn't decode: `invalid percent-encoded token`
+    pytest.importorskip("adbc_driver_postgresql")
+    assert POSTGRES is not None
+    password = urlsplit(POSTGRES).password
+    base = POSTGRES.replace(f":{password}@", "@", 1)
+    sep = "&" if "?" in base else "?"
+    for key in ["password", "sslpassword"]:
+        with pytest.raises(Exception) as e:
+            pl.scan_database(
+                "SELECT 1 AS x", f"{base}{sep}{key}=Sekr3tPw%zz", driver="adbc"
+            ).collect()
+        assert "Sekr3tPw" not in str(e.value), key
+
+
+@needs_postgres
+def test_psycopg2_bytea_arrays() -> None:
+    # "not yet implemented: Nested object types"
+    pytest.importorskip("psycopg2")
+    _execute(
+        "postgres17",
+        [
+            "DROP TABLE IF EXISTS r11_bytea_arrays",
+            "CREATE TABLE r11_bytea_arrays (id int, b bytea[])",
+            "INSERT INTO r11_bytea_arrays VALUES (1, ARRAY['\\x01'::bytea, NULL]), "
+            "(2, NULL)",
+        ],
+    )
+    for driver in ["psycopg2", "factory"]:
+        connection: Any = POSTGRES
+        kwargs: dict[str, Any] = {"driver": driver}
+        if driver == "factory":
+            import psycopg2
+
+            connection, kwargs = (lambda: psycopg2.connect(POSTGRES)), {}
+        for source in ["r11_bytea_arrays", "SELECT id, b FROM r11_bytea_arrays"]:
+            out = pl.scan_database(source, connection, **kwargs).collect().sort("id")
+            assert out["b"].to_list() == [[b"\x01", None], None], (driver, source)
+
+
+@needs_postgres
+def test_sqlalchemy_url_with_a_space_in_the_password() -> None:
+    # SQLAlchemy renders a space unencoded, which libpq rejects
+    sqlalchemy = pytest.importorskip("sqlalchemy")
+    assert POSTGRES is not None
+    _execute(
+        "postgres17",
+        [
+            "DROP ROLE IF EXISTS r11_space",
+            "CREATE ROLE r11_space LOGIN PASSWORD 'two words'",
+        ],
+    )
+    url = sqlalchemy.engine.make_url(POSTGRES).set(
+        username="r11_space", password="two words"
+    )
+    for driver in ["adbc", "psycopg"]:
+        lf = pl.scan_database("SELECT 1 AS x", url, driver=driver)
+        assert lf.collect()["x"].to_list() == [1], driver
+
+
+@needs_postgres
+@pytest.mark.parametrize("server", ["postgres17", "mysql"])
+def test_sessionmaker_factory(server: str) -> None:
+    # the session setup called `exec_driver_sql` on the ORM Session
+    sqlalchemy = pytest.importorskip("sqlalchemy")
+    from sqlalchemy.orm import sessionmaker
+
+    uri = SERVERS[server].uri
+    if uri is None:
+        pytest.skip(f"no {server} URI")
+    if server == "mysql":
+        uri = uri.replace("mysql://", "mysql+pymysql://", 1)
+    engine = sqlalchemy.create_engine(uri)
+    try:
+        out = pl.scan_database("SELECT 1 AS x", sessionmaker(engine)).collect()
+        assert out["x"].to_list() == [1]
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.skipif(SERVERS["clickhouse"].uri is None, reason="no ClickHouse URI")
+def test_clickhouse_adbc_provider_credentials_win_over_the_query() -> None:
+    # "not allowed to use X-ClickHouse HTTP headers and authentication via parameters"
+    uri = SERVERS["clickhouse"].uri
+    assert uri is not None
+    parts = urlsplit(uri)
+    base = uri.replace(f"{parts.username}:{parts.password}@", "", 1)
+    for query, creds in [
+        ("?password=stale", {"user": parts.username, "password": parts.password}),
+        ("?user=nobody", {"user": parts.username, "password": parts.password}),
+    ]:
+        lf = pl.scan_database(
+            "SELECT 1 AS x",
+            base + query,
+            driver="adbc",
+            credential_provider=lambda creds=creds: creds,
+        )
+        assert lf.collect()["x"].to_list() == [1], query
+
+
+@pytest.mark.skipif(SERVERS["oracle"].uri is None, reason="no Oracle URI")
+@ORACLE_GROUP
+def test_oracledb_scheme_alias() -> None:
+    # "no dialect for 'oracledb'" (ConnectorX: "Source Unknown not supported")
+    pytest.importorskip("sqlalchemy")
+    uri = SERVERS["oracle"].uri
+    assert uri is not None
+    alias = uri.replace("oracle://", "oracledb://", 1)
+    query = "SELECT 1 AS x FROM dual"
+    out = pl.scan_database(query, alias, driver="sqlalchemy").collect()
+    assert out.item() == 1
+    if importlib.util.find_spec("connectorx") is not None:
+        # (its Oracle source needs the Oracle client libraries)
+        try:
+            out = pl.scan_database(query, alias, driver="connectorx").collect()
+        except Exception as e:  # noqa: BLE001
+            assert "Source Unknown" not in str(e)
+        else:
+            assert out.item() == 1
+
+
+@pytest.mark.skipif(SERVERS["oracle"].uri is None, reason="no Oracle URI")
+@ORACLE_GROUP
+def test_oracledb_pool_session_after_a_failed_read() -> None:
+    # the cancelled session went back to the pool with NLS_COMP = BINARY
+    oracledb = pytest.importorskip("oracledb")
+    p = _parts(SERVERS["oracle"].uri or "")
+
+    def linguistic(conn: Any, _tag: Any) -> None:
+        conn.cursor().execute(
+            "ALTER SESSION SET NLS_COMP = LINGUISTIC NLS_SORT = BINARY_CI"
+        )
+
+    pool = oracledb.create_pool(
+        user=p["user"],
+        password=p["password"],
+        dsn=f"{p['host']}:{p['port']}/FREEPDB1",
+        min=0,
+        max=1,
+        session_callback=linguistic,
+    )
+    query = (
+        "SELECT CASE WHEN level < 5000 THEN 1 ELSE 1 / (level - level) END AS x "
+        "FROM dual CONNECT BY level <= 6000"
+    )
+    try:
+        with pytest.raises(Exception, match="ORA-01476"):
+            pl.scan_database(
+                query, pool.acquire, max_connections=1, batch_size=1000
+            ).collect()
+        with pool.acquire() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT value FROM nls_session_parameters "
+                "WHERE parameter IN ('NLS_COMP', 'NLS_SORT') ORDER BY parameter"
+            )
+            assert [r[0] for r in cur.fetchall()] == ["LINGUISTIC", "BINARY_CI"]
+    finally:
+        pool.close(force=True)

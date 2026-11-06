@@ -373,6 +373,19 @@ fn check_numeric_exact(src: &Column, cast: &Column) -> PolarsResult<()> {
         }
         return Ok(());
     }
+    // a time of day drops the date
+    if matches!(from, DataType::Datetime(_, _)) && to == &DataType::Time {
+        let days = src.cast(&DataType::Date)?.cast(&DataType::Int32)?;
+        if let Some(i) = days.i32()?.iter().position(|d| d.is_some_and(|d| d != 0)) {
+            polars_bail!(
+                SchemaMismatch:
+                "database column '{}' has the value {}, whose date {to} would drop; read the \
+                column as {from}",
+                src.name(), src.get(i)?
+            )
+        }
+        return Ok(());
+    }
     let coarser_time = match (from, to) {
         (DataType::Datetime(f, _), DataType::Datetime(t, _))
         | (DataType::Duration(f), DataType::Duration(t)) => time_unit_ns(*t) > time_unit_ns(*f),

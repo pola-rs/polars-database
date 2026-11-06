@@ -322,6 +322,27 @@ pub fn resolve_scan(
         let read_only_session =
             read_only_session(dialect, &backend.kind, options.connection.is_live());
         check_read_only(&sql, facts.as_ref().ok(), read_only_session)?;
+        // SQLite and DuckDB rename one of two names that differ only in case inside a derived
+        // table (`x:1`, `x_1`), and a qualified name picks the first of them.
+        if matches!(dialect, DialectName::Sqlite | DialectName::Duckdb)
+            && let Ok(QueryFacts {
+                output_columns: Some(cols),
+                ..
+            }) = &facts
+        {
+            let mut seen = PlHashMap::with_capacity(cols.len());
+            for c in cols {
+                if let Some(other) = seen.insert(c.to_lowercase(), c)
+                    && other != c
+                {
+                    polars_bail!(
+                        InvalidOperation:
+                        "the query's columns '{other}' and '{c}' differ only in case, which \
+                        {dialect} can't tell apart outside the query; alias one of them"
+                    );
+                }
+            }
+        }
         // Each partition runs the query again: it must pick the same rows every time.
         if let Ok(facts) = &facts
             && facts.parses
@@ -742,6 +763,14 @@ fn check_connectorx_arrays(
         || config.dialect != DialectName::Clickhouse
     {
         return Ok(());
+    }
+    // its ClickHouse client reads every `?` in the SQL as a bind placeholder
+    if let Some(c) = columns.iter().find(|c| c.contains('?')) {
+        polars_bail!(
+            InvalidOperation:
+            "ConnectorX can't read the ClickHouse column '{c}': it reads '?' in the SQL as a \
+            parameter; pin another driver, e.g. driver=\"adbc\" or \"clickhouse_connect\""
+        );
     }
     for c in columns.iter().filter_map(|c| config.column(c)) {
         let wrong = match c.db_type.as_deref() {
@@ -1926,10 +1955,12 @@ fn compile_unwrapped(
                 .iter()
                 .any(|i| matches!(i, SqlSelectItem::Expr { .. }))
             {
+                // the alias the select items are qualified by (SQLite)
                 format!(
-                    "SELECT {} FROM {}",
+                    "SELECT {} FROM ({}) {}",
                     fixed_select_list(dialect, &items),
-                    quoted_relation(dialect, &config.options.relation)
+                    wrappable(sql),
+                    relation_qualifier(config)
                 )
             } else {
                 sql.to_string()
@@ -2124,7 +2155,17 @@ fn resolve_partitions(
     let Some(dtype) = config.schema.get(&column) else {
         polars_bail!(ColumnNotFound: "partition column '{column}' is not in the database source");
     };
-    let Some(mut kind) = partition::range_kind(dtype) else {
+    // The cuts compare against the column: a decimal read as a float (`schema_overrides`)
+    // keeps decimal cuts, which MySQL orders right (#201).
+    let declared = config
+        .column(&column)
+        .and_then(|m| m.db_type.as_deref())
+        .and_then(|t| declared_dtype(config.dialect, t));
+    let kind_dtype = match &declared {
+        Some(d @ DataType::Decimal(..)) if dtype.is_float() => d,
+        _ => dtype,
+    };
+    let Some(mut kind) = partition::range_kind(kind_dtype) else {
         if why == "auto" {
             return one();
         }
@@ -2170,6 +2211,20 @@ fn resolve_partitions(
         },
     };
 
+    // A float column whose database type is unknown (`schema=`) may be a MySQL DECIMAL,
+    // which MySQL 8 misorders against a float cut (#201): decimal cuts, which a DOUBLE
+    // compares as the same doubles, where they fit `DECIMAL(65, 30)`.
+    if matches!(kind, partition::RangeKind::Float)
+        && matches!(
+            config.dialect,
+            DialectName::Mysql | DialectName::Singlestore
+        )
+        && config.column(&column).is_none_or(|c| c.db_type.is_none())
+        && lo.abs() < 1e34
+        && hi.abs() < 1e34
+    {
+        kind = partition::RangeKind::Decimal(30);
+    }
     let nulls_first = partition::nulls_sort_first(config.dialect);
     let nans_first = partition::nans_sort_first(config.dialect);
     let parts = partition::range_partitions(&column, lo, hi, n, kind, nulls_first, nans_first);

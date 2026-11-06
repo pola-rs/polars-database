@@ -2095,3 +2095,47 @@ def test_scan_overrides_of_dtypes_the_plugin_was_built_without(
     # Polars panicked on Arrow types the plugin's own Polars had no dtype for
     lf = pl.scan_database("orders", shop_uri, schema_overrides={"status": dtype})
     assert lf.collect_schema()["status"] == dtype
+
+
+# Round 11 review findings.
+
+
+def test_sqlite_query_without_pushdown(shop_uri: str, expected: pl.DataFrame) -> None:
+    # the select items were qualified by `"_pl"`, the query aliased `pl_q`: "no such column"
+    for sql in [
+        "SELECT id, amount FROM orders",
+        "SELECT * FROM orders WHERE id > 0",
+    ]:
+        out = pl.scan_database(sql, shop_uri, pushdown=False).collect().sort("id")
+        assert_frame_equal(out, expected.select(out.columns), check_dtypes=False)
+
+
+def test_query_columns_differing_in_case(shop_uri: str, tmp_path: Path) -> None:
+    # SQLite renamed the second to `x:1` (DuckDB `x_1`), and `"_pl"."x"` read the first
+    sql = 'SELECT id AS "X", amount AS "x" FROM orders'
+    with pytest.raises(
+        pl.exceptions.InvalidOperationError, match="differ only in case"
+    ):
+        pl.scan_database(sql, shop_uri).collect()
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "case.duckdb"
+    with duckdb.connect(str(path)) as conn:
+        conn.execute("CREATE TABLE orders AS SELECT 1 AS id, 2.5 AS amount")
+    with pytest.raises(
+        pl.exceptions.InvalidOperationError, match="differ only in case"
+    ):
+        pl.scan_database(sql, f"duckdb:///{path}").collect()
+
+
+def test_datetime_read_as_time_is_refused(tmp_path: Path) -> None:
+    # `schema={"ts": pl.Time}` over a timestamp dropped the date
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "time.duckdb"
+    with duckdb.connect(str(path)) as conn:
+        conn.execute(
+            "CREATE TABLE t AS SELECT TIMESTAMP '2020-01-02 03:04:05' AS ts "
+            "UNION ALL SELECT TIMESTAMP '1970-01-01 01:00:00'"
+        )
+    lf = pl.scan_database("t", f"duckdb:///{path}", schema={"ts": pl.Time})
+    with pytest.raises(Exception, match="would drop"):
+        lf.collect()

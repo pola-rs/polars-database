@@ -189,13 +189,14 @@ def _expr(e: Any, d: str | None) -> Any:
     if kind == "IsNull":
         inner, negated = x
         is_null = exp.Is(this=_expr(inner, d), expression=exp.Null())
-        return exp.Not(this=is_null) if negated else is_null
+        # `NOT (…)`: MySQL's `HIGH_NOT_PRECEDENCE` reads `NOT x IS NULL` as `(NOT x) IS NULL`
+        return exp.Not(this=exp.Paren(this=is_null)) if negated else is_null
     if kind == "InList":
         inner, values, negated = x
         node = exp.In(
             this=_expr(inner, d), expressions=[_literal(v, d) for v in values]
         )
-        return exp.Not(this=node) if negated else node
+        return exp.Not(this=exp.Paren(this=node)) if negated else node
     if kind == "Between":
         inner, lo, hi = x
         return exp.Between(this=_expr(inner, d), low=_expr(lo, d), high=_expr(hi, d))

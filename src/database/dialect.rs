@@ -524,6 +524,9 @@ impl DialectName {
         const POSTGRES: &[SetupStatement] = &[
             optional("SET application_name = 'polars'"),
             optional("SET TIME ZONE 'UTC'"),
+            // text-protocol drivers read doubles as the server writes them: rounded below 1,
+            // while pushed float comparisons are exact
+            optional("SET extra_float_digits = 3"),
             optional("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"),
         ];
         const MYSQL: &[SetupStatement] = &[

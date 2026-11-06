@@ -107,8 +107,16 @@ impl AdbcBackend {
             .bridge
             .adbc_connect(&self.found, &options, dialect, &execute_options);
         // Some drivers quote the URI or rejected options, credentials included.
+        // The spec's: the URI's query (`?password=`, `?sslpassword=`) as written.
         session.map_err(|e| {
-            let secrets = secrets(&options);
+            let mut secrets = secrets(&options);
+            for s in spec.secrets() {
+                secrets.push(percent_decode(&s));
+                secrets.push(s);
+            }
+            secrets.retain(|s| !s.is_empty());
+            secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+            secrets.dedup();
             e.wrap_msg(|m| redact(m, &secrets))
         })
     }
@@ -179,8 +187,14 @@ pub fn connect_options(
         && let Some(http) = clickhouse_http_uri(u)
     {
         // The ClickHouse driver takes the HTTP endpoint, with credentials as options.
-        uri = Some(http.uri);
         let (user, password) = creds.take().unwrap_or_default();
+        // the provider's credentials win over the query's, which ClickHouse would refuse
+        // next to them ("authentication via parameters simultaneously")
+        uri = Some(without_credential_params(
+            &http.uri,
+            user.is_some(),
+            password.is_some(),
+        ));
         for (key, value) in [
             (ADBC_OPTION_USERNAME, user.or(http.user)),
             (ADBC_OPTION_PASSWORD, password.or(http.password)),

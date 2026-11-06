@@ -393,6 +393,7 @@ _CANONICAL_SCHEMES = {
     "postgresql": ("postgresql", "postgres"),
     "mysql": ("mysql",),
     "mssql": ("mssql",),
+    "oracle": ("oracle",),
 }
 
 
@@ -405,6 +406,9 @@ def _canonical_scheme(uri: str, dialect: str, head: str) -> str:
     if base.lower() in schemes or (head == "sqlalchemy" and base.lower() == "mariadb"):
         # SQLAlchemy has a `mariadb` dialect
         return uri
+    if head == "sqlalchemy" and base.lower() == "oracledb" and not plus:
+        # SQLAlchemy's `oracle://` is cx_Oracle
+        return f"oracle+oracledb{sep}{rest}"
     return f"{schemes[0]}{plus}{driver}{sep}{rest}"
 
 
@@ -1050,14 +1054,7 @@ def _connect_uri(module: str, uri: str, options: dict[str, Any]) -> Any:
         return mod.connect(_libpq_uri(uri), **options)
     if module == "psycopg2":
         conn = mod.connect(_libpq_uri(uri), **options)
-        # bytea as bytes, not memoryview (which would become an Object column)
-        ext = importlib.import_module("psycopg2.extensions")
-        as_bytes = ext.new_type(
-            mod.BINARY.values,
-            "POLARS_BYTES",
-            lambda v, cur: None if v is None else mod.BINARY(v, cur).tobytes(),
-        )
-        ext.register_type(as_bytes, conn)
+        _psycopg2_bytes(conn)
         return conn
 
     # the driver's keyword arguments: the URI's parts, its query, then `connect_options`
@@ -1251,6 +1248,24 @@ def _no_panics(frames: Iterator[DataFrame]) -> Iterator[DataFrame]:
             "in a query, e.g. CAST(<column> AS VARCHAR)"
         )
         raise ComputeError(msg) from None
+
+
+def _psycopg2_bytes(target: Any) -> None:
+    """
+    Reads psycopg2's bytea as bytes, not memoryview (which would become an Object column,
+    and fails in a list), on a connection or a cursor: `bytea[]` (OID 1001) as lists.
+    """
+    mod = importlib.import_module("psycopg2")
+    ext = importlib.import_module("psycopg2.extensions")
+    as_bytes = ext.new_type(
+        mod.BINARY.values,
+        "POLARS_BYTES",
+        lambda v, cur: None if v is None else mod.BINARY(v, cur).tobytes(),
+    )
+    ext.register_type(as_bytes, target)
+    ext.register_type(
+        ext.new_array_type((1001,), "POLARS_BYTES_ARRAY", as_bytes), target
+    )
 
 
 def _object_columns_as_text(frames: Iterator[DataFrame]) -> Iterator[DataFrame]:
@@ -1498,9 +1513,9 @@ def _session_settings(conn: Any) -> list[str] | None:
     """
 
     def rows(sql: str) -> list[Any]:
-        if callable(getattr(conn, "exec_driver_sql", None)):
+        if (run := _exec_driver_sql(conn)) is not None:
             options = {"no_parameters": True, "stream_results": False}
-            result = conn.exec_driver_sql(sql, execution_options=options)
+            result = run(sql, execution_options=options)
             try:
                 return list(result.fetchall())
             finally:
@@ -1516,12 +1531,22 @@ def _session_settings(conn: Any) -> list[str] | None:
     def row(sql: str) -> Any:
         return rows(sql)[0]
 
-    dialect = getattr(getattr(conn, "dialect", None), "name", "") or (
+    # an ORM Session's dialect is its bind's
+    bind = conn
+    if callable(get_bind := getattr(conn, "get_bind", None)):
+        with contextlib.suppress(Exception):
+            bind = get_bind()
+    dialect = getattr(getattr(bind, "dialect", None), "name", "") or (
         _DRIVER_DIALECTS.get(_module_of(conn), "")
     )
     try:
         if dialect == "postgresql":
-            names = ("application_name", "TimeZone", "default_transaction_read_only")
+            names = (
+                "application_name",
+                "TimeZone",
+                "extra_float_digits",
+                "default_transaction_read_only",
+            )
             values = row(
                 "SELECT " + ", ".join(f"current_setting('{n}')" for n in names)
             )
@@ -2032,6 +2057,9 @@ class _Session:
         if module in ("psycopg", "psycopg2"):
             cursor = self.conn.cursor(name=f"polars_scan_{next(_CURSOR_IDS)}")
             cursor.itersize = batch_size
+            if module == "psycopg2":
+                # also for a connection the plugin didn't open (factory, live)
+                _psycopg2_bytes(cursor)
             return cursor
         if module == "pymysql":
             import pymysql.cursors  # type: ignore[import-untyped]
@@ -2055,7 +2083,12 @@ class _Session:
                 # an Engine's pooled connection: its settings are restored on `close`
                 self._restore = _session_settings(conn)
             self._setup_ran = True
-            conn.exec_driver_sql(sql)
+            # a Connection's, or an ORM Session's (a `sessionmaker` factory)
+            run = _exec_driver_sql(conn)
+            if run is None:
+                msg = f"can't run SQL on a SQLAlchemy {type(conn).__name__}"
+                raise TypeError(msg)
+            run(sql)
             conn.commit()
             return
         if self.factory and not self._setup_ran:
@@ -2131,9 +2164,21 @@ class _Session:
 def _close_for_real(conn: Any) -> None:
     """
     Closes the connection itself, also where `close()` would return it to a pool:
-    mysql.connector's pooled connections hold it as `_cnx`.
+    mysql.connector's pooled connections hold it as `_cnx`, oracledb's are dropped from
+    their pool.
     """
     inner = getattr(conn, "_cnx", None)
+    # an oracledb pooled connection: `close()` releases it to the pool, `drop` closes it
+    pool = getattr(conn, "_pool", None)
+    if (
+        inner is None
+        and pool is not None
+        and type(conn).__module__.startswith("oracledb")
+        and callable(drop := getattr(pool, "drop", None))
+    ):
+        with contextlib.suppress(Exception):
+            drop(conn)
+            return
     with contextlib.suppress(Exception):
         (inner if inner is not None else conn).close()
 

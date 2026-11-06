@@ -387,7 +387,11 @@ impl Translator<'_> {
             )
             && !(self.dialect() == DialectName::Duckdb
                 && matches!(&self.config.backend.kind, BackendKind::Python { module } if module == "duckdb"));
-        !(placeholder || escape || nul)
+        // ConnectorX's ClickHouse client reads every `?` as a bind placeholder
+        let question = s.contains('?')
+            && self.dialect() == DialectName::Clickhouse
+            && matches!(self.config.backend.kind, BackendKind::ConnectorX);
+        !(placeholder || escape || nul || question)
     }
 
     /// Whether a literal compared with the column means the same value to the database.
@@ -402,9 +406,50 @@ impl Translator<'_> {
             return false;
         }
         if self.config.maybe_mysql_year(name) {
-            return !av.extract::<i64>().is_some_and(|y| (1..=99).contains(&y));
+            let y = av.extract::<i64>();
+            // A declared `YEAR` holds 1901-2155 (and 0): an indexed MariaDB column compared
+            // with 2200 matched nothing.
+            let declared = self
+                .config
+                .column(name)
+                .is_some_and(|c| c.db_type.is_some());
+            return !y.is_some_and(|y| {
+                (1..=99).contains(&y) || (declared && y != 0 && !(1901..=2155).contains(&y))
+            });
+        }
+        // An indexed MySQL `DATETIME(fsp)` / `TIMESTAMP(fsp)` compared for equality rounds a
+        // finer literal to `fsp` digits: `= '…00.5'` matched `…01`.
+        if let AnyValue::Datetime(v, tu, _) | AnyValue::DatetimeOwned(v, tu, _) = av
+            && let Some(fsp) = self.mysql_fsp(name)
+        {
+            let per_second: i64 = match tu {
+                TimeUnit::Nanoseconds => 1_000_000_000,
+                TimeUnit::Microseconds => 1_000_000,
+                TimeUnit::Milliseconds => 1_000,
+            };
+            let step = per_second / 10i64.pow(fsp.min(9)).min(per_second);
+            return v.rem_euclid(step.max(1)) == 0;
         }
         true
+    }
+
+    /// The fractional-second digits of a MySQL `DATETIME` / `TIMESTAMP` column, if declared.
+    fn mysql_fsp(&self, name: &str) -> Option<u32> {
+        if !matches!(
+            self.dialect(),
+            DialectName::Mysql | DialectName::Singlestore
+        ) {
+            return None;
+        }
+        let t = self.config.column(name)?.db_type.as_deref()?;
+        let t = t.trim().to_ascii_lowercase();
+        let rest = t
+            .strip_prefix("datetime")
+            .or_else(|| t.strip_prefix("timestamp"))?;
+        match rest.trim() {
+            "" => Some(0),
+            r => r.strip_prefix('(')?.strip_suffix(')')?.trim().parse().ok(),
+        }
     }
 
     /// `b` is `value`. MySQL and SQLite hold booleans as integers, any of which but 0 Polars
@@ -507,6 +552,11 @@ impl Translator<'_> {
         if !self.writable(&SqlLiteral::String(pat.into())) {
             return None;
         }
+        // ClickHouse's `LIKE` misreads a pattern that holds a NUL: `s LIKE '%\0'` matches
+        // every row.
+        if self.dialect() == DialectName::Clickhouse && pat.contains('\0') {
+            return None;
+        }
         let (prefix, suffix) = match op {
             StrOp::StartsWith => ("", "%"),
             StrOp::EndsWith => ("%", ""),
@@ -529,7 +579,12 @@ impl Translator<'_> {
         let pattern = format!("{prefix}{}{suffix}", self.escape_like(pat));
         let class = if strings.equality_exact && !self.dialect().like_case_insensitive() {
             Class::Exact
-        } else if self.dialect().like_matches_per_character() {
+        } else if self.dialect().like_matches_per_character()
+            // A MySQL index range for `LIKE 'a%'` under a PAD SPACE collation starts at
+            // `'a'` padded with blanks, past `'a\tb'`: the match is no superset.
+            && !(matches!(op, StrOp::StartsWith)
+                && matches!(self.dialect(), DialectName::Mysql | DialectName::Singlestore))
+        {
             Class::Superset
         } else {
             // A collation may match `LIKE` by its collation elements: under Czech `ch`
@@ -747,6 +802,21 @@ impl Translator<'_> {
                     .config
                     .column(name)
                     .is_some_and(|c| c.db_type.is_none()) =>
+            {
+                None
+            },
+            // An indexed MariaDB `DOUBLE(M, D)` rounds an equality literal to `D` digits.
+            dt if dt.is_float()
+                && !op.is_ordering()
+                && matches!(
+                    self.dialect(),
+                    DialectName::Mysql | DialectName::Singlestore
+                )
+                && self
+                    .config
+                    .column(name)
+                    .and_then(|c| c.db_type.as_deref())
+                    .is_some_and(|t| t.contains('(')) =>
             {
                 None
             },
