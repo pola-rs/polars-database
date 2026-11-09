@@ -828,10 +828,10 @@ def test_scan_hugeint_literals(tmp_path: Path) -> None:
     path = str(tmp_path / "t.duckdb")
     big = 99_999_999_999_999_999_999_999_999_999_999_999_999
     with duckdb.connect(path) as conn:
-        # HUGEINT is read as Decimal(38, 0), though its maximum has 39 digits
+        # HUGEINT is read as Decimal(38, 0): a value of 39 digits fails the read
         conn.execute(
             "CREATE TABLE t AS SELECT * FROM (VALUES (1, 5::HUGEINT), "
-            f"(2, {big}::HUGEINT), (3, NULL::HUGEINT), (4, {2**127 - 1}::HUGEINT)) "
+            f"(2, {big}::HUGEINT), (3, NULL::HUGEINT), (4, {-big}::HUGEINT)) "
             "v(id, h)"
         )
     lf = pl.scan_database("t", f"duckdb:///{path}")
@@ -844,6 +844,10 @@ def test_scan_hugeint_literals(tmp_path: Path) -> None:
         pl.col("h").is_in(values),
     ]:
         assert_frame_equal(lf.filter(p).collect().sort("id"), table.filter(p))
+    with duckdb.connect(path) as conn:
+        conn.execute(f"INSERT INTO t VALUES (5, {2**127 - 1}::HUGEINT)")
+    with pytest.raises(pl.exceptions.ComputeError, match="can't represent"):
+        lf.collect()
 
 
 def _assert_filters_match(lf: pl.LazyFrame, predicates: list[pl.Expr]) -> None:
@@ -1226,8 +1230,10 @@ def test_scan_sqlite_filter_on_a_volatile_column(tmp_path: Path, driver: str) ->
     df = lf.filter(pl.col("r") > 0, pl.col("id") < 100).collect()
     assert (df["r"] > 0).all()
     assert (df["id"] < 100).all()
-    # the filter on `id` is still pushed
-    assert '"id" < 100' in _sql(lf.filter(pl.col("r") > 0, pl.col("id") < 100))
+    # the filter on `id` is still pushed (through the conversion of a number's text)
+    assert 'ELSE "id" END) < 100' in _sql(
+        lf.filter(pl.col("r") > 0, pl.col("id") < 100)
+    )
     assert "WHERE" not in _sql(lf.filter(pl.col("r") > 0))
 
 
@@ -1266,8 +1272,10 @@ def test_scan_sqlite_volatile_views(tmp_path: Path, driver: str, source: str) ->
     assert (df["r"] > 0).all()
     assert (df["id"] < 200).all()
     if source == "v":
-        # the filter on `id` is still pushed
-        assert '"id" < 200' in _sql(lf.filter(pl.col("r") > 0, pl.col("id") < 200))
+        # the filter on `id` is still pushed (through the conversion of a number's
+        # text: a view's column may hold one)
+        sql = _sql(lf.filter(pl.col("r") > 0, pl.col("id") < 200))
+        assert 'ELSE "id" END) < 200' in sql
     with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
         pl.scan_database(
             source, uri, driver=driver, partition_on="id", partition_num=4
@@ -1293,7 +1301,7 @@ def test_scan_sqlite_views_without_volatile_functions() -> None:
             "v", f"sqlite:///{path}", partition_on="a", partition_num=4
         )
         assert sorted(lf.collect()["a"].to_list()) == list(range(50))
-        assert '"a" < 5' in _sql(lf.filter(pl.col("a") < 5))
+        assert 'ELSE "a" END) < 5' in _sql(lf.filter(pl.col("a") < 5))
 
 
 def test_scan_sqlite_partition_over_a_user_function(tmp_path: Path) -> None:
@@ -1618,7 +1626,8 @@ def test_scan_duckdb_string_literal_with_nul(tmp_path: Path, driver: str) -> Non
 
 @pytest.mark.parametrize("driver", ["duckdb", "adbc"])
 def test_scan_duckdb_values_arrow_cant_carry(tmp_path: Path, driver: str) -> None:
-    # TIME '24:00:00' read as NULL, ±infinity as i64::MAX, the UHUGEINT maximum as -1
+    # TIME '24:00:00' read as NULL, ±infinity as i64::MAX, the UHUGEINT maximum as -1;
+    # a UHUGEINT of 39 digits broke its Decimal(38, 0)
     duckdb = pytest.importorskip("duckdb")
     if driver == "adbc":
         _skip_without_duckdb_adbc()
@@ -1630,18 +1639,18 @@ def test_scan_duckdb_values_arrow_cant_carry(tmp_path: Path, driver: str) -> Non
         )
         conn.execute(
             "INSERT INTO t VALUES (1, '12:00:00', '2024-01-01', '2024-01-01', "
-            f"'2024-01-01 00:00:00+00', '2024-01-01', {2**127 - 1})"
+            f"'2024-01-01 00:00:00+00', '2024-01-01', {10**38 - 1})"
         )
     for source in ["t", "SELECT * FROM t"]:
         lf = pl.scan_database(source, f"duckdb:///{path}", driver=driver)
-        assert lf.collect()["uh"].cast(pl.String).item() == str(2**127 - 1)
+        assert lf.collect()["uh"].cast(pl.String).item() == str(10**38 - 1)
     values = {
         "tm": "'24:00:00'",
         "ts": "'infinity'",
         "tns": "'-infinity'",
         "tz": "'infinity'",
         "d": "'-infinity'",
-        "uh": str(2**128 - 1),
+        "uh": str(10**38),
     }
     with duckdb.connect(path) as conn:
         for i, (column, value) in enumerate(values.items(), start=2):
@@ -2093,7 +2102,8 @@ def test_scan_sqlite_declared_types_through_connectorx(tmp_path: Path) -> None:
 
 def test_scan_duckdb_nested_values_arrow_cant_carry(tmp_path: Path) -> None:
     # lists, structs and maps of infinities, 24:00:00 and UHUGEINT values
-    # beyond i128 read i64::MAX, NULL or -1; a TIMETZ of 24:00:00 read NULL
+    # beyond i128 read i64::MAX, NULL or -1; a TIMETZ of 24:00:00 read NULL; (U)HUGEINT
+    # values of 39 digits broke their Decimal(38, 0)
     duckdb = pytest.importorskip("duckdb")
     path = str(tmp_path / "t.duckdb")
     values = {
@@ -2111,6 +2121,9 @@ def test_scan_duckdb_nested_values_arrow_cant_carry(tmp_path: Path) -> None:
             "MAP {'k': 'infinity'::DATE}",
         ),
         "luh": ("UHUGEINT[]", "[1]", f"[{2**128 - 1}]"),
+        # more than Decimal(38, 0)'s digits, within i128
+        "uh": ("UHUGEINT", "1", str(10**38 + 1)),
+        "hi": ("HUGEINT", str(-(10**38) + 1), str(-(10**38))),
         "ttz": ("TIMETZ", "'12:00:00+00'", "'24:00:00+00'"),
     }
     with duckdb.connect(path) as conn:
@@ -2247,6 +2260,88 @@ def test_scan_duckdb_negative_wide_decimal_literals(tmp_path: Path) -> None:
         ],
     )
     assert "(1 exact)" in lf.filter(pl.col("d") == neg).explain()
+
+
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
+def test_scan_sqlite_numbers_text_in_a_query_or_under_schema(
+    tmp_path: Path, driver: str
+) -> None:
+    # a column without affinity holding a number's text (`'2'`) reads as that number, but
+    # a query's column (or one under `schema=`), and any two compared columns, were
+    # compared as stored: text, which SQLite orders above every number
+    _importorskip_sqlite_driver(driver)
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a, b)")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?, ?)", [(i, i, i) for i in range(1, 1001)]
+        )
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?, ?)", [(1001, 2, "2"), (1002, 5, "7")]
+        )
+        conn.commit()
+    uri = f"sqlite:///{path}"
+    schema = {"id": pl.Int64, "a": pl.Int64, "b": pl.Int64}
+    for lf in [
+        pl.scan_database("t", uri, driver=driver),
+        pl.scan_database("t", uri, driver=driver, schema=schema),
+        pl.scan_database("SELECT id, a, b FROM t", uri, driver=driver),
+    ]:
+        _check_ids(
+            lf,
+            [
+                pl.col("a") == pl.col("b"),
+                pl.col("a") != pl.col("b"),
+                pl.col("b") == 2,
+                pl.col("b").is_in([2, 7]),
+                pl.col("b") > 6,
+            ],
+        )
+
+
+@pytest.mark.parametrize("driver", ["sqlite3", "sqlalchemy"])
+def test_scan_sqlite_temporary_table_hiding_a_table(
+    tmp_path: Path, driver: str
+) -> None:
+    # an unqualified name resolves in `temp` first, but `main`'s table was described:
+    # its binary collation, where the temporary table's column is NOCASE
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, s TEXT)")
+        conn.execute("INSERT INTO t VALUES (1, 'zzz')")
+        conn.commit()
+    if driver == "sqlalchemy":
+        sqlalchemy = pytest.importorskip("sqlalchemy")
+        engine = sqlalchemy.create_engine(f"sqlite:///{path}")
+        live: Any = engine.connect()
+        live.exec_driver_sql("CREATE TEMP TABLE t (id INTEGER, s TEXT COLLATE NOCASE)")
+        live.exec_driver_sql("INSERT INTO t VALUES (1, 'abc'), (2, 'ABC')")
+    else:
+        live = sqlite3.connect(path, check_same_thread=False)
+        live.execute("CREATE TEMP TABLE t (id INTEGER, s TEXT COLLATE NOCASE)")
+        live.execute("INSERT INTO t VALUES (1, 'abc'), (2, 'ABC')")
+    try:
+        lf = pl.scan_database("t", live)
+        assert lf.filter(pl.col("s") == "abc").collect()["id"].to_list() == [1]
+        assert lf.filter(pl.col("s") != "abc").collect()["id"].to_list() == [2]
+    finally:
+        live.close()
+        if driver == "sqlalchemy":
+            engine.dispose()
+
+
+def test_scan_decimal_override_rounds_as_asked(tmp_path: Path) -> None:
+    # a decimal retyped to fewer places by `schema_overrides` failed "would round",
+    # though Polars' own cast rounds it; a planned decimal still may not round
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE TABLE t AS SELECT 1.234::DECIMAL(10, 3) AS x")
+    uri = f"duckdb:///{path}"
+    for source in ["t", "SELECT x FROM t"]:
+        lf = pl.scan_database(source, uri, schema_overrides={"x": pl.Decimal(10, 2)})
+        expected = pl.Series([Decimal("1.234")]).cast(pl.Decimal(10, 2))
+        assert lf.collect()["x"].to_list() == expected.to_list(), source
 
 
 @pytest.mark.parametrize("driver", ["sqlite3"])

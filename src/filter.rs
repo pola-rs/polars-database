@@ -958,8 +958,9 @@ impl Translator<'_> {
             CmpOp::GtEq => SqlBinOp::GtEq,
             CmpOp::EqMissing | CmpOp::NotEqMissing => return None,
         };
+        // each as Polars reads it (a SQLite number's text is read as that number)
         Some((
-            SqlExpr::binary(SqlExpr::col(a.clone()), bin_op, SqlExpr::col(b.clone())),
+            SqlExpr::binary(self.compared(a), bin_op, self.compared(b)),
             Class::Exact,
         ))
     }

@@ -628,6 +628,21 @@ _ARBITRARY_FUNCTIONS = frozenset(
 )
 
 
+# ClickHouse functions of the rows read before (their number, or values): a filter the
+# database runs before them, also on another column, changes their values
+_ROWS_READ_FUNCTIONS = frozenset(
+    {
+        "rownumberinallblocks",
+        "rownumberinblock",
+        "blocknumber",
+        "runningdifference",
+        "runningdifferencestartingwithfirstvalue",
+        "runningaccumulate",
+        "neighbor",
+    }
+)
+
+
 # Window functions whose value depends on the order of rows that tie (`row_number() OVER
 # ()`; an order is taken as not unique); rank(), and aggregates over the default frame,
 # treat ties alike
@@ -887,7 +902,9 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
     # volatile one)
     unknown = list(stmt.find_all(exp.Anonymous)) if dialect == "sqlite" else []
     columns = _volatile_columns(stmt, volatile_calls + unknown)
-    if columns is None:
+    if columns is None or any(
+        _function_name(f) in _ROWS_READ_FUNCTIONS for f in stmt.find_all(exp.Func)
+    ):
         facts["all_columns_volatile"] = True
     else:
         facts["volatile_columns"] = columns

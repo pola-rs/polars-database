@@ -257,9 +257,15 @@ pub fn table_info(
         && let Some(df) = run("collations", sql)
     {
         info.collations_listed = true;
+        // MySQL's `SHOW FULL COLUMNS` has it third
+        let collation = df
+            .get_column_index("Collation")
+            .or_else(|| df.get_column_index("COLLATION"))
+            .unwrap_or(1);
         for row in 0..df.height() {
             if let Some(name) = cell_str(&df, 0, row) {
-                info.collations.insert(name.into(), cell_str(&df, 1, row));
+                info.collations
+                    .insert(name.into(), cell_str(&df, collation, row));
             }
         }
     }
@@ -657,19 +663,28 @@ impl CatalogQueries {
             DialectName::Mysql | DialectName::Singlestore => {
                 let schema = schema.map_or_else(|| "DATABASE()".to_string(), s);
                 let filter = format!("TABLE_SCHEMA = {schema} AND TABLE_NAME = {}", s(name));
+                // `information_schema` doesn't list a session's temporary tables, which
+                // hide a table of their name; `SHOW FULL COLUMNS` describes the table the
+                // name resolves to (`Field`, `Type`, `Collation`, ...)
+                let show = (dialect == DialectName::Mysql)
+                    .then(|| format!("SHOW FULL COLUMNS FROM {qualified}"));
                 Self {
                     key: Some(format!(
                         "SELECT COLUMN_NAME FROM information_schema.key_column_usage \
                         WHERE {filter} AND CONSTRAINT_NAME = 'PRIMARY'"
                     )),
-                    collations: Some(format!(
-                        "SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.columns \
-                        WHERE {filter}"
-                    )),
-                    types: Some(format!(
-                        "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.columns \
-                        WHERE {filter} ORDER BY ORDINAL_POSITION"
-                    )),
+                    collations: Some(show.clone().unwrap_or_else(|| {
+                        format!(
+                            "SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.columns \
+                            WHERE {filter}"
+                        )
+                    })),
+                    types: Some(show.unwrap_or_else(|| {
+                        format!(
+                            "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.columns \
+                            WHERE {filter} ORDER BY ORDINAL_POSITION"
+                        )
+                    })),
                     compare_types: None,
                     declared_sql: None,
                     stats: Some(format!(
@@ -752,30 +767,53 @@ impl CatalogQueries {
                 }
             },
             DialectName::Sqlite => {
-                let schema = schema.unwrap_or("main");
+                // An unqualified name resolves in `temp`, `main`, then the attached
+                // databases: a temporary table hides a `main` one of its name.
+                let (schema, master) = match schema {
+                    Some(sc) => (
+                        s(sc),
+                        format!(
+                            "SELECT sql, type, name FROM {}.sqlite_master",
+                            dialect.quote_ident(sc)
+                        ),
+                    ),
+                    None => (
+                        format!(
+                            "(SELECT d.name FROM pragma_database_list d \
+                            WHERE EXISTS (SELECT 1 FROM pragma_table_info({}, d.name)) \
+                            ORDER BY CASE d.name WHEN 'temp' THEN 0 WHEN 'main' THEN 1 ELSE 2 END, \
+                            d.seq LIMIT 1)",
+                            s(name)
+                        ),
+                        // an attached database's table has no definition here: its
+                        // collations are unknown
+                        "SELECT sql, type, name FROM temp.sqlite_master WHERE 'temp' = {schema} \
+                        UNION ALL SELECT sql, type, name FROM main.sqlite_master \
+                        WHERE 'main' = {schema}"
+                            .to_string(),
+                    ),
+                };
+                let master = master.replace("{schema}", &schema);
                 Self {
                     // `pk` is the 1-based position in the key; a second key column means a
                     // composite key, which the single-row check rejects.
                     key: Some(format!(
-                        "SELECT name FROM pragma_table_info({}, {}) WHERE pk > 0",
+                        "SELECT name FROM pragma_table_info({}, {schema}) WHERE pk > 0",
                         s(name),
-                        s(schema)
                     )),
                     collations: None,
                     types: None,
                     // Only the affinity matters: SQLite reads values as stored.
                     compare_types: Some(format!(
-                        "SELECT name, type FROM pragma_table_info({}, {})",
+                        "SELECT name, type FROM pragma_table_info({}, {schema})",
                         s(name),
-                        s(schema)
                     )),
                     // `BINARY` compares the bytes of the database's encoding: code point
                     // order only in UTF-8, so a UTF-16 database reads as collated.
                     declared_sql: Some(format!(
                         "SELECT sql || CASE WHEN (SELECT encoding FROM pragma_encoding) \
                         <> 'UTF-8' THEN ' COLLATE' ELSE '' END \
-                        FROM {}.sqlite_master WHERE type = 'table' AND name = {}",
-                        dialect.quote_ident(schema),
+                        FROM ({master}) WHERE type = 'table' AND name = {}",
                         s(name)
                     )),
                     stats: None,

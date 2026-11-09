@@ -848,9 +848,11 @@ pub fn resolve_scan(
                 {
                     c.db_type = Some(SQLITE_UNTYPED_INTEGER.into())
                 },
-                ref dt if dt.is_integer() && (connectorx || !affinity.contains_key(&c.name)) => {
-                    c.db_type = Some(SQLITE_INTEGER.into())
+                // a query's column, or one under `schema=`, may hold any value
+                ref dt if dt.is_integer() && !affinity.contains_key(&c.name) => {
+                    c.db_type = Some(SQLITE_UNTYPED_INTEGER.into())
                 },
+                ref dt if dt.is_integer() && connectorx => c.db_type = Some(SQLITE_INTEGER.into()),
                 DataType::Binary if connectorx => c.db_type = Some(CONNECTORX_SQLITE_VALUE.into()),
                 _ => {},
             }
@@ -914,7 +916,8 @@ fn check_connectorx_arrays(
     Ok(())
 }
 
-/// A ClickHouse array element type (lower-cased) ConnectorX reads right.
+/// A ClickHouse array element type (lower-cased) ConnectorX reads right. (`Array(Date)`
+/// reads as garbage text, and may lose every row.)
 fn connectorx_clickhouse_array_element(t: &str) -> bool {
     matches!(
         t,
@@ -929,7 +932,6 @@ fn connectorx_clickhouse_array_element(t: &str) -> bool {
             | "float32"
             | "float64"
             | "string"
-            | "date"
             | "bool"
     )
 }
@@ -1036,11 +1038,12 @@ const CONNECTORX_DECIMAL: &str = "<connectorx decimal>";
 const SQLITE_TEXT: &str = "<sqlite text>";
 const SQLITE_REAL: &str = "<sqlite real>";
 /// The `db_type` of a SQLite integer column: an integral real (or an integer's text) read
-/// as an integer. A query's column, or an INTEGER one read through ConnectorX, is compared
+/// as an integer. An INTEGER one read through ConnectorX, which holds neither, is compared
 /// as it is (an index on it serves).
 const SQLITE_INTEGER: &str = "<sqlite integer>";
-/// The `db_type` of a SQLite table's integer column of another affinity (none, NUMERIC):
-/// as [`SQLITE_INTEGER`], compared through the conversion.
+/// The `db_type` of a SQLite integer column of another affinity (none, NUMERIC), or of
+/// unknown affinity (a query's, or under `schema=`): as [`SQLITE_INTEGER`], compared
+/// through the conversion.
 const SQLITE_UNTYPED_INTEGER: &str = "<sqlite untyped integer>";
 /// The `db_type` of a SQLite column retyped to an integer by `schema_overrides`: a real cut
 /// to an integer, as the cast to the override cuts it.
@@ -1472,9 +1475,9 @@ fn oracle_number_text(column: &str) -> String {
 
 /// DuckDB values that Arrow can't carry fail the read, naming the column: `TIME
 /// '24:00:00'` and `TIMETZ '24:00:00+00'` (read as NULL), `±infinity` dates and
-/// timestamps (read as their raw `i64::MAX`), and `UHUGEINT` values beyond the `i128` of
-/// the `Decimal(38, 0)` they are read as (they wrap; `HUGEINT` always fits). Also inside
-/// lists, arrays, structs, maps and unions.
+/// timestamps (read as their raw `i64::MAX`), and `HUGEINT` / `UHUGEINT` values of more
+/// than the 38 digits of the `Decimal(38, 0)` they are read as (they don't round-trip, or
+/// wrap past `i128`). Also inside lists, arrays, structs, maps and unions.
 fn duckdb_value_check(db_type: &str, column: &str) -> Option<String> {
     let bad = duckdb_bad_value(db_type, column, 0)?;
     let msg = DialectName::Duckdb.quote_str(&format!(
@@ -1545,10 +1548,14 @@ fn duckdb_bad_value(t: &str, x: &str, depth: usize) -> Option<String> {
         | "TIMESTAMP_MS"
         | "TIMESTAMP_NS"
         | "TIMESTAMP WITH TIME ZONE" => format!("isinf({x})"),
-        "UHUGEINT" => format!("{x} > {}", i128::MAX),
+        "HUGEINT" => format!("({x} > {MAX_DECIMAL_38} OR {x} < -{MAX_DECIMAL_38})"),
+        "UHUGEINT" => format!("{x} > {MAX_DECIMAL_38}"),
         _ => return None,
     })
 }
+
+/// The largest value of a `Decimal(38, 0)`.
+const MAX_DECIMAL_38: &str = "99999999999999999999999999999999999999";
 
 /// The parts of a type's argument list, split at its top-level commas.
 fn split_top_level(s: &str) -> Vec<&str> {
@@ -2861,11 +2868,11 @@ mod tests {
             format!(
                 "(struct_extract(\"c\", 'a \"b,') = TIME '24:00:00') OR \
                 ((len([1 FOR pl_x0 IN map_values(struct_extract(\"c\", 'm')) \
-                IF pl_x0 > {}]) > 0))",
-                i128::MAX
+                IF pl_x0 > {MAX_DECIMAL_38}]) > 0))"
             )
         );
         assert!(bad("TIME WITH TIME ZONE").is_some());
+        assert!(bad("HUGEINT").is_some());
         assert!(bad("STRUCT(t TIMESTAMP_NS)[2]").is_some());
     }
 

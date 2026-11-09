@@ -199,7 +199,7 @@ pub fn oracle_timestamp_precision(t: &str) -> Option<u32> {
 
 /// Casts a batch to the planned schema: selects the planned columns in order and casts each.
 /// The columns in `overrides` (`schema_overrides`) are cast as the user asked, also when
-/// a float becomes an integer.
+/// a float becomes an integer or a decimal loses places (as Polars' cast rounds it).
 pub fn cast_to_schema(
     df: &DataFrame,
     schema: &Schema,
@@ -251,8 +251,8 @@ pub fn cast_to_schema(
                         col.dtype()
                     )
                 })?;
-            check_decimal_exact(col, &cast)?;
             if overrides.is_none_or(|o| !o.contains(name)) {
+                check_decimal_exact(col, &cast)?;
                 check_numeric_exact(col, &cast)?;
             }
             cast

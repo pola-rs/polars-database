@@ -4986,3 +4986,88 @@ def test_partition_over_a_volatile_user_function(name: str) -> None:
             partition_num=4,
         )
         assert sorted(lf.collect()["d"].to_list()) == [2 * i for i in range(300)]
+
+
+@pytest.mark.parametrize("name", ["mysql", "mariadb"])
+def test_mysql_temporary_table_hiding_a_table(name: str) -> None:
+    # `information_schema` doesn't list temporary tables: the hidden table's binary
+    # collation was taken, and `s == "abc"` compared exactly matched 'ABC' too
+    server = SERVERS[name]
+    if server.uri is None:
+        pytest.skip(f"no {name} URI")
+    pytest.importorskip("pymysql")
+    table = f"review_r14_temp_{name}"
+    _execute(
+        name,
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id int, s varchar(10) COLLATE utf8mb4_bin)",
+            f"INSERT INTO {table} VALUES (1, 'zzz')",
+        ],
+    )
+    assert server.factory is not None
+    conn = server.factory(server.uri)()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"CREATE TEMPORARY TABLE {table} "
+                "(id int, s varchar(10) COLLATE utf8mb4_general_ci)"
+            )
+            cur.execute(f"INSERT INTO {table} VALUES (1, 'abc'), (2, 'ABC')")
+        conn.commit()
+        lf = pl.scan_database(table, conn)
+        assert lf.filter(pl.col("s") == "abc").collect()["id"].to_list() == [1]
+        assert lf.filter(pl.col("s") != "abc").collect()["id"].to_list() == [2]
+        # code point order: 'ABC' < 'abd'
+        assert lf.filter(pl.col("s") < "abd").collect()["id"].sort().to_list() == [1, 2]
+    finally:
+        conn.close()
+
+
+@needs_clickhouse
+def test_clickhouse_row_numbers_arent_filtered_in_the_database() -> None:
+    # a filter on another column, pushed into the query, ran before the numbering:
+    # `rowNumberInAllBlocks()` numbered the rows it kept
+    _execute(
+        "clickhouse",
+        [
+            "DROP TABLE IF EXISTS review_r14_rownum",
+            "CREATE TABLE review_r14_rownum (id Int64, x Int64) ENGINE = MergeTree "
+            "ORDER BY id",
+            "INSERT INTO review_r14_rownum VALUES (1, 10), (2, 15), (3, 30), (4, 31)",
+        ],
+    )
+    query = (
+        "SELECT id, x, rowNumberInAllBlocks() AS r, blockNumber() AS b "
+        "FROM review_r14_rownum"
+    )
+    for driver in _runnable_drivers(
+        "clickhouse", ["adbc", "clickhouse_connect", "connectorx"]
+    ):
+        lf = _scan("clickhouse", driver, query)
+        full = lf.collect().sort("id")
+        assert full["r"].to_list() == [0, 1, 2, 3], driver
+        for predicate in [pl.col("id") >= 2, pl.col("x") > 12, pl.col("r") > 0]:
+            got = lf.filter(predicate).collect().sort("id")
+            assert got.equals(full.filter(predicate)), (driver, predicate)
+
+
+@needs_clickhouse
+def test_clickhouse_connectorx_date_arrays_are_refused() -> None:
+    # ConnectorX reads `Array(Date)` as garbage text, and may lose every row: an empty
+    # frame, no error
+    pytest.importorskip("connectorx")
+    table = "review_r14_ch_date_array"
+    _execute(
+        "clickhouse",
+        [
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id UInt32, ad Array(Date)) "
+            "ENGINE = MergeTree ORDER BY id",
+            f"INSERT INTO {table} VALUES (1, ['2149-06-06']), (2, [])",
+        ],
+    )
+    for source in [table, f"SELECT id, ad FROM {table}"]:
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="column 'ad'"):
+            _scan("clickhouse", "connectorx", source).collect()
+    assert _scan("clickhouse", "adbc", table).collect().height == 2
