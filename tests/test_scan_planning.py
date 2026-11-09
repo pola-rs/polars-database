@@ -1018,6 +1018,12 @@ def test_mysql_tls_check_rejects_a_plain_connection() -> None:
         ("duckdb", "SELECT any_value(a), first(b) FROM t GROUP BY c", False),
         ("clickhouse", "SELECT any(a), anyLast(b) FROM t", False),
         ("clickhouse", "SELECT rowNumberInAllBlocks(), id FROM t", False),
+        # the size of the block read; the query's or the session's identity
+        ("clickhouse", "SELECT id, blockSize() AS bs FROM t", False),
+        ("clickhouse", "SELECT id, queryID() AS q FROM t", False),
+        ("clickhouse", "SELECT id, nowInBlock() AS n FROM t", False),
+        ("postgres", "SELECT id, pg_backend_pid() AS p FROM t", False),
+        ("mysql", "SELECT id, CONNECTION_ID() AS c FROM t", False),
     ],
 )
 def test_volatile_functions_make_a_query_not_repeatable(
@@ -1047,6 +1053,51 @@ def test_volatile_output_columns(
     facts = inspect_query(query, "sqlite")
     assert facts["volatile_columns"] == columns
     assert facts["all_columns_volatile"] is all_columns
+
+
+def test_duckdb_view_lambdas_are_inspected() -> None:
+    # DuckDB writes a view's lambdas (and list comprehensions) parenthesised, which
+    # sqlglot didn't parse: the view couldn't be inspected, so no filter was pushed on
+    # it and partitions were refused
+    from polars_database._sqlglot import inspect_query, inspect_view
+
+    view = (
+        "CREATE VIEW v AS SELECT id, list_apply(list_filter(list_apply(l, (lambda x: "
+        'struct_pack("filter" := (x > 0), result := (x + 1)))), (lambda elem: '
+        "struct_extract(elem, 'filter'))), (lambda elem: struct_extract(elem, 'result'))) "
+        "AS g, list_reduce(l, (lambda a, b: (a + b))) AS s FROM base;"
+    )
+    facts = inspect_view(view, "duckdb")
+    assert facts["parses"]
+    assert facts["repeatable"]
+    assert facts["output_columns"] == ["id", "g", "s"]
+    assert facts["tables"] == [["base"]]
+    # a query's text is kept as written; a call's parentheses and text are left alone
+    query = "SELECT f((lambda x: x)) AS a, '(lambda' AS b FROM t"
+    assert inspect_query(query, "duckdb")["body"] == query
+
+
+@pytest.mark.parametrize(
+    ("dialect", "query"),
+    [
+        ("mysql", "SELECT * FROM v WHERE id > %s"),
+        ("mysql", "SELECT * FROM v WHERE id > %(low)s AND s LIKE '%s'"),
+        ("oracle", "SELECT * FROM v WHERE id > :1"),
+    ],
+)
+def test_queries_with_driver_placeholders_are_inspected(
+    dialect: str, query: str
+) -> None:
+    # sqlglot doesn't parse MySQL's `%s` or Oracle's `:1`: a query with `params=` wasn't
+    # inspected, so the volatile views it reads went unchecked (partitions accepted)
+    from polars_database._sqlglot import inspect_query
+
+    facts = inspect_query(query, dialect)
+    assert facts["parses"]
+    assert [t[-1].lower() for t in facts["tables"]] == ["v"]
+    assert facts["body"] == query
+    # a modulo is no placeholder
+    assert inspect_query("SELECT a % s FROM t", "mysql")["parses"]
 
 
 def test_unknown_functions_and_tables() -> None:

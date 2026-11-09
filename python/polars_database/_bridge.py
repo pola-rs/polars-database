@@ -1423,6 +1423,27 @@ def _cancel_target(conn: Any) -> Any:
     return conn
 
 
+def _duckdb_temp_objects(conn: Any) -> bool:
+    """
+    Whether a DuckDB connection has temporary tables, views, macros or sequences, which
+    its cursors (connections of their own) don't see.
+    """
+    temp = "database_name = 'temp'"
+    sql = (
+        f"SELECT EXISTS (SELECT 1 FROM duckdb_tables() WHERE {temp}) "
+        f"OR EXISTS (SELECT 1 FROM duckdb_views() WHERE {temp} AND NOT internal) "
+        f"OR EXISTS (SELECT 1 FROM duckdb_sequences() WHERE {temp}) "
+        f"OR EXISTS (SELECT 1 FROM duckdb_functions() WHERE {temp} "
+        "AND function_type IN ('macro', 'table_macro'))"
+    )
+    try:
+        # whole: DuckDB 2 refuses other work on a connection with a result left unread
+        rows = conn.execute(sql).fetchall()
+    except Exception:
+        return False
+    return bool(rows and rows[0][0])
+
+
 def _postgres_family(conn: Any) -> bool:
     """Whether a connection is a Postgres one, where a failed statement aborts the
     transaction it runs in."""
@@ -1842,10 +1863,21 @@ class _Session:
             and "params" not in execute_options
         )
 
-    def execute(self, sql: str, batch_size: int | None) -> Iterator[DataFrame]:
+    def execute(
+        self, sql: str, batch_size: int | None, bind: bool = True
+    ) -> Iterator[DataFrame]:
+        """
+        Run a statement. `bind`: the user's parameters (`params=`, or the execute
+        options' `parameters`) are bound to it; the plugin's own statements (catalog
+        lookups) hold none of the user's placeholders.
+        """
         from polars.io.database._executor import ConnectionExecutor
 
         batch_size = batch_size or DEFAULT_BATCH_SIZE
+        params = self.params if bind else None
+        raw_sqlalchemy = self._raw_sqlalchemy or (
+            not bind and _module_of(self.conn) == "sqlalchemy"
+        )
         state = self._state
         entered = False
         cursor = None
@@ -1876,8 +1908,26 @@ class _Session:
                     savepoint = name
                 cursor = self._server_cursor(batch_size)
                 cx = ConnectionExecutor(cursor if cursor is not None else self.conn)
+                # A DuckDB cursor is a connection of its own, without the user's
+                # connection's temporary tables, views and macros: where it has any,
+                # the statement runs on that connection, and its result is read whole
+                # here (another statement on it, another scan's, would end it).
+                on_connection = (
+                    not self.owned
+                    and cx.driver_name == "duckdb"
+                    and _module_of(self.conn) == "duckdb"
+                    and _duckdb_temp_objects(self.conn)
+                )
+                if on_connection:
+                    with contextlib.suppress(Exception):
+                        cx.cursor.close()
+                    cx.cursor = self.conn
+                    cx.can_close_cursor = False
                 cx_cursor = cx.cursor if cx.cursor is not cursor else None
                 options = dict(self.execute_options)
+                if not bind:
+                    for key in {"parameters", "params", _params_keyword(cx)}:
+                        options.pop(key, None)
                 oracle_arrow = (
                     cx.driver_name == "oracledb_proxy"
                     or cx._oracle_arrow_proxy() is not None
@@ -1896,17 +1946,17 @@ class _Session:
                 if (
                     _module_of(self.conn) == "clickhouse_connect"
                     and "parameters" not in options
-                    and self.params is None
+                    and params is None
                 ):
                     # it %-formats the SQL even without parameters, which would turn
                     # LIKE's '%%' into '%'; with parameters, '%' is the user's to write
                     sql = sql.replace("%", "%%")
-                if self.params is not None:
+                if params is not None:
                     # each driver names the parameters argument of `execute()` itself
-                    options[_params_keyword(cx)] = self.params
+                    options[_params_keyword(cx)] = params
                 exec_driver_sql = (
                     _exec_driver_sql(cx.cursor)
-                    if self._raw_sqlalchemy
+                    if raw_sqlalchemy
                     and not oracle_arrow
                     and cx.driver_name in ("sqlalchemy", "duckdb")
                     else None
@@ -1944,6 +1994,8 @@ class _Session:
                 # some drivers yield no batch for an empty result, and close the
                 # cursor when done: take the column names first
                 empty_frame = _empty_frame(cx.result, utc=self.owned)
+                if on_connection:
+                    frames = iter(list(frames))
                 if idle and _transaction_idle(self.conn) is False:
                     frames = iter(list(frames))
                     if _module_of(cx.result) == "sqlalchemy":
@@ -2235,7 +2287,9 @@ class _ConnectorXSession:
         with _CONNECTORX_CHECKED_LOCK:
             _CONNECTORX_CHECKED.add(key)
 
-    def execute(self, sql: str, batch_size: int | None) -> Iterator[DataFrame]:
+    def execute(
+        self, sql: str, batch_size: int | None, bind: bool = True
+    ) -> Iterator[DataFrame]:
         # ConnectorX returns whole results; there is no batch size to apply
         from polars.io.database._utils import _read_sql_connectorx
 
@@ -2282,7 +2336,9 @@ class _ArrowOdbcSession:
         self.connection_string = connection_string
         self.options = options
 
-    def execute(self, sql: str, batch_size: int | None) -> Iterator[DataFrame]:
+    def execute(
+        self, sql: str, batch_size: int | None, bind: bool = True
+    ) -> Iterator[DataFrame]:
         import arrow_odbc
 
         import polars as pl
@@ -2501,7 +2557,7 @@ def connect(
         connect_opts, execute_opts = dict(python_options[0]), dict(python_options[1])
     else:
         connect_opts, execute_opts = dict(connect_options), dict(execute_options)
-    # every statement of a query source has the user query and its placeholders
+    # bound to the statements that hold the user's query (`_Session.execute`)
     session = {"execute_options": execute_opts, "params": params}
     head, _, tail = kind.partition(":")
 

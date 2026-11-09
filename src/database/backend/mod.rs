@@ -138,26 +138,38 @@ pub trait DatabaseSession: Send {
 
     /// Runs a query and collects its result.
     fn query(&mut self, sql: &str) -> PolarsResult<DataFrame> {
-        let mut out: Option<DataFrame> = None;
-        for batch in self.execute(sql, None)? {
-            let batch = batch?;
-            match &mut out {
-                None => out = Some(batch),
-                Some(acc) => {
-                    // Python drivers type each batch on its own: a column that is all NULL in
-                    // one batch has the Null dtype there.
-                    let (acc_df, batch) = align_null_columns(std::mem::take(acc), batch)?;
-                    *acc = acc_df;
-                    acc.vstack_mut_owned(batch)?;
-                },
-            }
-        }
-        out.ok_or_else(|| polars_err!(ComputeError: "database query returned no result: {sql}"))
+        collect_batches(self.execute(sql, None)?, sql)
+    }
+
+    /// Runs a query of the plugin's own (a catalog lookup) and collects its result. It
+    /// holds none of the placeholders of the user's query: its parameters (`params=`) aren't
+    /// bound to it.
+    fn catalog_query(&mut self, sql: &str) -> PolarsResult<DataFrame> {
+        self.query(sql)
     }
 
     fn cancel_handle(&self) -> Option<CancelHandle> {
         None
     }
+}
+
+/// The batches of a query's result as one frame.
+pub fn collect_batches(batches: BatchIter, sql: &str) -> PolarsResult<DataFrame> {
+    let mut out: Option<DataFrame> = None;
+    for batch in batches {
+        let batch = batch?;
+        match &mut out {
+            None => out = Some(batch),
+            Some(acc) => {
+                // Python drivers type each batch on its own: a column that is all NULL in
+                // one batch has the Null dtype there.
+                let (acc_df, batch) = align_null_columns(std::mem::take(acc), batch)?;
+                *acc = acc_df;
+                acc.vstack_mut_owned(batch)?;
+            },
+        }
+    }
+    out.ok_or_else(|| polars_err!(ComputeError: "database query returned no result: {sql}"))
 }
 
 /// Availability of a Python-side backend.

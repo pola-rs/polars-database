@@ -260,7 +260,7 @@ fn mysql_query_probe(
 
 /// Whether the MySQL-dialect server is a MariaDB.
 fn is_mariadb(session: &mut dyn DatabaseSession) -> bool {
-    match session.query("SELECT VERSION()") {
+    match session.catalog_query("SELECT VERSION()") {
         Ok(df) => df.columns().first().is_some_and(|c| {
             c.cast(&DataType::String)
                 .ok()
@@ -549,6 +549,7 @@ pub fn resolve_scan(
             &options.relation,
             query_facts.as_ref(),
             &names,
+            true,
         );
         // a view's columns hold what its query gives, whatever `pragma_table_info` says
         // (the first branch's type, of a `UNION`)
@@ -754,6 +755,16 @@ pub fn resolve_scan(
         .map(|c| c.dtype == DataType::String || c.dtype.is_primitive_numeric())
         .collect();
 
+    // A MySQL date column whose type is unknown may hold zero dates: it is read, ordered and
+    // filtered on with them as NULL, as a declared `DATE` column is.
+    if matches!(dialect, DialectName::Mysql | DialectName::Singlestore) {
+        for c in columns.iter_mut().filter(|c| {
+            c.db_type.is_none() && matches!(c.dtype, DataType::Date | DataType::Datetime(_, _))
+        }) {
+            c.db_type = Some(MYSQL_DATE.into());
+        }
+    }
+
     // Each partition reads the source again: a volatile function in a view it reads, or one
     // sqlglot doesn't know (a user's), would give other rows each time.
     if let Some(reason) = &volatility.volatile
@@ -775,13 +786,16 @@ pub fn resolve_scan(
 
     // A filter on a volatile function's column (`random() AS r`) isn't pushed: SQLite merges
     // the wrapped query into the filter's and calls the function again for it, returning
-    // rows whose value fails the filter.
+    // rows whose value fails the filter. Postgres and DuckDB push no filter below a
+    // volatile function: it sees the values the query returns.
+    let refilters = !matches!(dialect, DialectName::Postgresql | DialectName::Duckdb);
     for c in columns.iter_mut().filter(|c| {
-        query.all_columns_volatile
-            || query
-                .volatile_columns
-                .iter()
-                .any(|v| v.eq_ignore_ascii_case(&c.name))
+        refilters
+            && (query.all_columns_volatile
+                || query
+                    .volatile_columns
+                    .iter()
+                    .any(|v| v.eq_ignore_ascii_case(&c.name)))
     }) {
         c.comparable = false;
     }
@@ -810,6 +824,26 @@ pub fn resolve_scan(
         },
         _ => schema,
     };
+
+    // DuckDB `HUGEINT` / `UHUGEINT` values of 39 digits fail the `Decimal(38, 0)` they are
+    // read as, but fit an `Int128` / `UInt128`, text or a float: a column retyped to one
+    // (`schema_overrides`, or `schema=` naming a 128-bit integer) is read as text, which the
+    // cast to its dtype parses.
+    if dialect == DialectName::Duckdb {
+        for c in columns.iter_mut() {
+            let hugeint = c.db_type.as_deref().is_some_and(|t| {
+                matches!(
+                    t.trim().to_ascii_uppercase().as_str(),
+                    "HUGEINT" | "UHUGEINT" | "INT128" | "UINT128"
+                )
+            });
+            if (hugeint && !c.dtype.is_decimal())
+                || (c.db_type.is_none() && matches!(c.dtype, DataType::Int128 | DataType::UInt128))
+            {
+                c.db_type = Some(DUCKDB_TEXT.into());
+            }
+        }
+    }
 
     // A SQLite column has no type: one typed from a sample may hold values of several
     // storage classes (`'abc'` and `1`, `1` and `1.5`). Drivers type a batch by its own
@@ -895,21 +929,7 @@ pub fn check_unplanned_volatility(
     if !config.volatility_unchecked {
         return Ok(false);
     }
-    let facts = match &config.options.relation {
-        DatabaseRelation::Query { sql } => sql_renderer()
-            .and_then(|r| r.inspect_query(sql, config.dialect))
-            .ok()
-            .filter(|f| f.parses),
-        DatabaseRelation::Table { .. } => None,
-    };
-    let names = config.schema.iter_names().cloned().collect::<Vec<_>>();
-    let volatility = source_volatility(
-        session,
-        config.dialect,
-        &config.options.relation,
-        facts.as_ref(),
-        &names,
-    );
+    let volatility = unplanned_volatility(session, config);
     let Some(reason) = volatility.volatile else {
         return Ok(false);
     };
@@ -937,6 +957,30 @@ pub fn check_unplanned_volatility(
         );
     }
     Ok(true)
+}
+
+/// [`source_volatility`] of a `schema=` source, whose planning didn't look it up, on
+/// `session`: its columns are the user's.
+fn unplanned_volatility(
+    session: &mut dyn DatabaseSession,
+    config: &DatabaseScanConfig,
+) -> SourceVolatility {
+    let facts = match &config.options.relation {
+        DatabaseRelation::Query { sql } => sql_renderer()
+            .and_then(|r| r.inspect_query(sql, config.dialect))
+            .ok()
+            .filter(|f| f.parses),
+        DatabaseRelation::Table { .. } => None,
+    };
+    let names = config.schema.iter_names().cloned().collect::<Vec<_>>();
+    source_volatility(
+        session,
+        config.dialect,
+        &config.options.relation,
+        facts.as_ref(),
+        &names,
+        false,
+    )
 }
 
 /// ConnectorX reads other row counts than there are from a ClickHouse array of `Nullable(…)`,
@@ -1110,8 +1154,17 @@ const SQLITE_INTEGER: &str = "<sqlite integer>";
 /// through the conversion.
 const SQLITE_UNTYPED_INTEGER: &str = "<sqlite untyped integer>";
 /// The `db_type` of a SQLite column retyped to an integer by `schema_overrides`: a real cut
-/// to an integer, as the cast to the override cuts it.
+/// to an integer, as the cast to the override cuts it; an integer's text read as that
+/// integer, as [`SQLITE_INTEGER`] reads it.
 const SQLITE_INTEGER_CUT: &str = "<sqlite integer cut>";
+/// The `db_type` of a DuckDB `HUGEINT` / `UHUGEINT` column read as text: retyped to a type
+/// that holds its values of 39 digits, which the `Decimal(38, 0)` it is read as otherwise
+/// doesn't (`duckdb_value_check`).
+const DUCKDB_TEXT: &str = "<duckdb text>";
+/// The `db_type` of a MySQL `Date` / `Datetime` column of an unknown type (a query's on a
+/// driver without the type lookup, or under `schema=`): it may be a `DATE` / `DATETIME` /
+/// `TIMESTAMP` holding zero dates (`mysql_zero_date_type`).
+const MYSQL_DATE: &str = "<mysql date>";
 /// The `db_type` of a SQLite Int64 / Binary column read through ConnectorX: its values as
 /// they are, without the column's declared type.
 const CONNECTORX_SQLITE_VALUE: &str = "<connectorx sqlite value>";
@@ -1241,6 +1294,9 @@ fn column_conversion(
     if db_type == CONNECTORX_DECIMAL {
         return Some(dialect.cast_to_text(column));
     }
+    if db_type == DUCKDB_TEXT {
+        return Some(format!("CAST({column} AS VARCHAR)"));
+    }
     if db_type == SQLITE_TEXT {
         // a real exactly, which the reader writes as Polars writes a Float64 (as the
         // column read as reals, then cast, would be); a text starting with the marker
@@ -1281,11 +1337,13 @@ fn column_conversion(
         ));
     }
     if db_type == SQLITE_INTEGER_CUT {
-        // as the cast to an override cuts it (a real out of range stays one, and fails)
+        // a real as the cast to an override cuts it (one out of range stays one, and
+        // fails); text as in [`SQLITE_INTEGER`]
         return Some(format!(
             "CASE WHEN typeof({column}) = 'real' AND {column} >= -9223372036854775808.0 \
             AND {column} < 9223372036854775808.0 THEN CAST({column} AS INTEGER) \
-            ELSE {column} END"
+            WHEN typeof({column}) = 'text' AND {integer_text} THEN CAST({column} AS INTEGER) \
+            {other_text} ELSE {column} END"
         ));
     }
     if let Some(sql) = dialect.text_conversion(db_type, column) {
@@ -1663,12 +1721,13 @@ fn duckdb_field(field: &str) -> Option<(String, &str)> {
     Some((name.to_string(), t))
 }
 
-/// A MySQL `DATE` / `DATETIME` / `TIMESTAMP`, which may hold zero dates.
+/// A MySQL `DATE` / `DATETIME` / `TIMESTAMP`, which may hold zero dates; or a date column
+/// that may be one ([`MYSQL_DATE`]).
 fn mysql_zero_date_type(dialect: DialectName, db_type: &str) -> bool {
     let t = db_type.trim().to_ascii_lowercase();
     let base = t.split('(').next().unwrap_or(&t);
     matches!(dialect, DialectName::Mysql | DialectName::Singlestore)
-        && matches!(base, "date" | "datetime" | "timestamp")
+        && (matches!(base, "date" | "datetime" | "timestamp") || db_type == MYSQL_DATE)
 }
 
 /// Whether a MySQL date column (quoted) holds a zero date; NULL for NULL.
@@ -2472,16 +2531,20 @@ const MAX_FUNCTION_ROUNDS: usize = 8;
 /// [`catalog::volatile_functions`]). Each partition would read other rows, and a filter
 /// on such a column keep others than it returns.
 ///
-/// `names`: the source's columns, in order: a view's columns are matched to its query's
-/// by position (MySQL's definition leaves out a column list). A view that can't be
-/// inspected (its definition hidden, or not parsed) counts as volatile; a dialect
-/// without a view lookup, or a failed one, as no view.
+/// `names`: the source's columns. `names_in_order`: they are all of the source's, in its
+/// order (found by discovery), and a view's columns are matched to its query's by
+/// position (MySQL's definition leaves out a column list); otherwise (`schema=`, the
+/// user's names, in any order, maybe some) by name, and a name its query doesn't have
+/// may be any of them. A view that can't be inspected (its definition hidden, or not
+/// parsed, or its lookup failed) counts as volatile; a dialect without a view lookup,
+/// as no view.
 fn source_volatility(
     session: &mut dyn DatabaseSession,
     dialect: DialectName,
     relation: &DatabaseRelation,
     facts: Option<&QueryFacts>,
     names: &[PlSmallStr],
+    names_in_order: bool,
 ) -> SourceVolatility {
     let mut out = SourceVolatility::default();
     let mut unknown: Vec<PlSmallStr> = facts
@@ -2529,6 +2592,13 @@ fn source_volatility(
                         continue;
                     },
                     catalog::ViewLookup::Unknown => continue,
+                    catalog::ViewLookup::Failed => {
+                        let name = parts.join(".");
+                        out.volatile =
+                            Some(format!("'{name}', which couldn't be looked up,").into());
+                        out.all_columns = true;
+                        continue;
+                    },
                 };
             let name = parts.join(".");
             let view = renderer
@@ -2549,11 +2619,27 @@ fn source_volatility(
                 Some(outputs)
                     if own_columns
                         && !view.all_columns_volatile
+                        && names_in_order
                         && outputs.len() == names.len() =>
                 {
                     for v in &view.volatile_columns {
                         if let Some(i) = outputs.iter().position(|o| o.eq_ignore_ascii_case(v)) {
                             out.columns.push(names[i].clone());
+                        }
+                    }
+                },
+                Some(outputs) if own_columns && !view.all_columns_volatile && !names_in_order => {
+                    for n in names {
+                        let volatile = match outputs.iter().find(|o| o.eq_ignore_ascii_case(n)) {
+                            Some(o) => view
+                                .volatile_columns
+                                .iter()
+                                .any(|v| v.eq_ignore_ascii_case(o)),
+                            // not among the query's names (a MySQL view's column list)
+                            None => any_volatile,
+                        };
+                        if volatile {
+                            out.columns.push(n.clone());
                         }
                     }
                 },
@@ -2623,6 +2709,17 @@ fn source_volatility(
             );
             out.all_columns = true;
             break;
+        }
+        // the same values within a statement (a filter sees them), not across partitions
+        if found.stable && out.volatile.is_none() {
+            out.volatile = Some(
+                format!(
+                    "one of the functions {} (STABLE, by the catalog: the same within one \
+                    statement only)",
+                    functions.join(", ")
+                )
+                .into(),
+            );
         }
     }
     if verbose()
@@ -2799,6 +2896,26 @@ fn resolve_partitions(
     if n <= 1 {
         return one();
     }
+    // Under `schema=` the planning looked nothing up: automatic partitions of a volatile
+    // source (a view of `random()`) are one, as they would be otherwise, not a read that
+    // fails (`check_unplanned_volatility`). The bounds query opens a session anyway.
+    if why == "auto" && config.volatility_unchecked {
+        let backend = open_backend(&config.backend, None)?;
+        let mut session = open_session_with_retries(
+            backend.as_ref(),
+            &config.options.connection,
+            config.dialect,
+        )?;
+        if unplanned_volatility(session.as_mut(), config)
+            .volatile
+            .is_some()
+        {
+            if verbose() {
+                eprintln!("[scan_database]: one partition: the source is volatile");
+            }
+            return one();
+        }
+    }
 
     let (lo, hi, bounds_from) = match range {
         Some((lo, hi)) => (lo, hi, "partition_range"),
@@ -2887,6 +3004,7 @@ fn query_bounds(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::backend::BatchIter;
 
     #[test]
     fn keyword_guard() {
@@ -2972,5 +3090,85 @@ mod tests {
         assert_eq!(wrappable("SELECT 1 -- x"), "SELECT 1 -- x\n");
         assert_eq!(wrappable("SELECT 1 # x"), "SELECT 1 # x\n");
         assert_eq!(wrappable("SELECT 1;"), "SELECT 1");
+    }
+
+    fn conversion(dialect: DialectName, db_type: &str) -> Option<String> {
+        column_conversion(dialect, &BackendKind::ConnectorX, true, db_type, "\"c\"")
+    }
+
+    #[test]
+    fn sqlite_override_cut_reads_integer_text() {
+        // a same-dtype integer override cut reals, but left `'7'` as text, which SQLite
+        // compares above every number
+        let cut = conversion(DialectName::Sqlite, SQLITE_INTEGER_CUT).unwrap();
+        assert!(cut.contains("typeof(\"c\") = 'real'"), "{cut}");
+        assert!(
+            cut.contains(
+                "WHEN typeof(\"c\") = 'text' AND CAST(CAST(\"c\" AS INTEGER) AS TEXT) = \"c\" \
+                THEN CAST(\"c\" AS INTEGER)"
+            ),
+            "{cut}"
+        );
+        // other text fails the read, as in a column of no override
+        assert!(cut.contains("THEN char(1) || \"c\""), "{cut}");
+    }
+
+    #[test]
+    fn mysql_dates_of_unknown_type_may_be_zero() {
+        // a query's date column (on a driver without the type lookup), or one under
+        // `schema=`, was read and compared as stored
+        let zero = "IF(MONTH(\"c\") = 0 OR DAYOFMONTH(\"c\") = 0, NULL, \"c\")";
+        assert_eq!(
+            conversion(DialectName::Mysql, MYSQL_DATE).as_deref(),
+            Some(zero)
+        );
+        assert!(mysql_zero_date_type(DialectName::Mysql, MYSQL_DATE));
+        assert!(!mysql_zero_date_type(DialectName::Postgresql, MYSQL_DATE));
+    }
+
+    #[test]
+    fn duckdb_hugeint_retyped_is_read_as_text() {
+        assert_eq!(
+            conversion(DialectName::Duckdb, DUCKDB_TEXT).as_deref(),
+            Some("CAST(\"c\" AS VARCHAR)")
+        );
+    }
+
+    /// Fails every statement, as a catalog lookup given the user's `params=` did.
+    struct Failing;
+
+    impl DatabaseSession for Failing {
+        fn execute(&mut self, _: &str, _: Option<usize>) -> PolarsResult<BatchIter> {
+            polars_bail!(ComputeError: "the query has 0 placeholders but 1 parameters were passed")
+        }
+    }
+
+    #[test]
+    fn failed_view_lookup_is_volatile() {
+        // a failed lookup counted as no view: the view of `random()` went unchecked
+        let relation = DatabaseRelation::Table {
+            parts: vec!["v".into()],
+            quoted: vec![false],
+        };
+        let names = ["id".into(), "r".into()];
+        let found = source_volatility(
+            &mut Failing,
+            DialectName::Postgresql,
+            &relation,
+            None,
+            &names,
+            true,
+        );
+        assert!(found.volatile.is_some() && found.all_columns);
+        // a dialect without a view lookup still counts as no view
+        let found = source_volatility(
+            &mut Failing,
+            DialectName::Trino,
+            &relation,
+            None,
+            &names,
+            true,
+        );
+        assert!(found.volatile.is_none());
     }
 }

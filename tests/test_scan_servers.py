@@ -5071,3 +5071,191 @@ def test_clickhouse_connectorx_date_arrays_are_refused() -> None:
         with pytest.raises(pl.exceptions.InvalidOperationError, match="column 'ad'"):
             _scan("clickhouse", "connectorx", source).collect()
     assert _scan("clickhouse", "adbc", table).collect().height == 2
+
+
+@pytest.mark.parametrize("name", ["mysql", "mariadb"])
+def test_mysql_zero_dates_in_queries_and_under_schema(name: str) -> None:
+    # Zero dates were read and compared as NULL only from a table, whose types the
+    # catalog gives: a query's columns (on a driver without the type lookup) and those
+    # under `schema=` were compared as stored, `dn < 2000-01-01` keeping '0000-00-00'
+    # read as NULL; PyMySQL failed reading a query's
+    table = "review_r15_zero_dates"
+    _execute(
+        name,
+        [
+            "SET SESSION sql_mode = ''",
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id int PRIMARY KEY, d date NOT NULL, "
+            "dn date NULL, ts datetime NULL)",
+            f"INSERT INTO {table} VALUES "
+            "(1, '0000-00-00', '0000-00-00', '0000-00-00 00:00:00'), "
+            "(2, '2020-01-05', '2020-01-05', '2020-01-05 10:00:00'), "
+            "(3, '1999-01-01', NULL, NULL), "
+            "(4, '2020-00-00', '2020-00-00', '2020-00-00 00:00:00')",
+        ],
+    )
+    schema = {"id": pl.Int32, "d": pl.Date, "dn": pl.Date, "ts": pl.Datetime("us")}
+    expected = {
+        "all": [1, 2, 3, 4],
+        "dn_before_2000": [],
+        "dn_null": [1, 3, 4],
+        "d_not_null": [2, 3],
+        "ts_before_2000": [],
+    }
+    predicates = {
+        "all": pl.lit(True),
+        "dn_before_2000": pl.col("dn") < date(2000, 1, 1),
+        "dn_null": pl.col("dn").is_null(),
+        "d_not_null": pl.col("d").is_not_null(),
+        "ts_before_2000": pl.col("ts") < datetime(2000, 1, 1),
+    }
+    query = f"SELECT * FROM {table}"
+    for driver in _runnable_drivers(name, ["pymysql", "mysql.connector"]):
+        for source, kwargs in [
+            (query, {}),
+            (table, {"schema": schema}),
+            (query, {"schema": schema}),
+        ]:
+            lf = _scan(name, driver, source, **kwargs)
+            for what, predicate in predicates.items():
+                ids = lf.filter(predicate).collect()["id"].sort().to_list()
+                assert ids == expected[what], (driver, source, kwargs, what)
+        # bounds leave zero dates out
+        lf = _scan(
+            name, driver, table, schema=schema, partition_on="d", partition_num=3
+        )
+        assert lf.collect()["id"].sort().to_list() == [1, 2, 3, 4], driver
+
+
+@pytest.mark.parametrize(
+    ("name", "driver"),
+    [
+        pytest.param("postgres17", "psycopg"),
+        pytest.param("mysql", "pymysql"),
+        pytest.param("mysql", "mysql.connector"),
+        pytest.param("mariadb", "pymysql"),
+    ],
+)
+def test_params_dont_hide_volatile_views(name: str, driver: str) -> None:
+    # With params=, every catalog lookup was given the parameters too, and failed; on
+    # MySQL sqlglot didn't parse the `%s` placeholder either: the volatile view a query
+    # reads went unchecked, and partitions were accepted, each reading other values
+    if driver not in _runnable_drivers(name, [driver]):
+        pytest.skip(f"{driver} isn't installed")
+    ids, view = "review_r15_params_ids", "review_r15_params_v"
+    if name == "postgres17":
+        statements = [
+            f"DROP VIEW IF EXISTS {view}",
+            f"DROP TABLE IF EXISTS {ids}",
+            f"CREATE TABLE {ids} AS SELECT g AS id FROM generate_series(1, 300) g",
+            f"CREATE VIEW {view} AS SELECT id, random() AS r FROM {ids}",
+        ]
+    else:
+        statements = [
+            f"DROP VIEW IF EXISTS {view}",
+            f"DROP TABLE IF EXISTS {ids}",
+            f"CREATE TABLE {ids} (id int PRIMARY KEY)",
+            f"INSERT INTO {ids} WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL "
+            "SELECT n + 1 FROM s WHERE n < 300) SELECT n FROM s",
+            f"CREATE VIEW {view} AS SELECT id, RAND() AS r FROM {ids}",
+        ]
+    _execute(name, statements)
+    query = f"SELECT * FROM {view} WHERE id > %s"
+    lf = _scan(name, driver, query, params=[0], partition_on="id", partition_num=4)
+    with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+        lf.collect()
+    df = _scan(name, driver, query, params=[0]).filter(pl.col("r") < 0.5).collect()
+    assert df.height > 0
+    assert (df["r"] < 0.5).all()
+
+
+@needs_postgres
+def test_postgres_partitions_over_stable_functions() -> None:
+    # A STABLE function returns the same values within a statement only, but each
+    # partition is a statement (and a session) of its own: a user's over `now()`, and
+    # `pg_backend_pid()`, were taken as repeatable (8 partitions read 8 values)
+    ids = "review_r15_stable_ids"
+    _execute(
+        "postgres17",
+        [
+            "DROP VIEW IF EXISTS review_r15_stable_now",
+            "DROP VIEW IF EXISTS review_r15_stable_pid",
+            f"DROP TABLE IF EXISTS {ids}",
+            f"CREATE TABLE {ids} AS SELECT g AS id FROM generate_series(1, 300) g",
+            "CREATE OR REPLACE FUNCTION review_r15_now() RETURNS timestamptz "
+            "LANGUAGE sql STABLE AS 'SELECT now()'",
+            "CREATE VIEW review_r15_stable_now AS "
+            f"SELECT id, review_r15_now() AS t FROM {ids}",
+            "CREATE VIEW review_r15_stable_pid AS "
+            f"SELECT id, pg_backend_pid() AS p FROM {ids}",
+        ],
+    )
+    for source in [
+        "review_r15_stable_now",
+        f"SELECT id, review_r15_now() AS t FROM {ids}",
+        "review_r15_stable_pid",
+    ]:
+        lf = _scan("postgres17", "psycopg", source, partition_on="id", partition_num=4)
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+            lf.collect()
+    # one statement reads one value, and a filter is still run in the database
+    lf = _scan("postgres17", "psycopg", "review_r15_stable_now")
+    assert lf.collect()["t"].n_unique() == 1
+    assert lf.filter(pl.col("id") <= 10).collect().height == 10
+
+
+@pytest.mark.parametrize("name", ["mysql", "mariadb"])
+def test_mysql_partitions_over_the_connection_id(name: str) -> None:
+    # `CONNECTION_ID()` is the session's: each partition read another
+    view = "review_r15_connection_v"
+    _execute(
+        name,
+        [
+            f"DROP VIEW IF EXISTS {view}",
+            f"CREATE VIEW {view} AS SELECT 1 AS id, CONNECTION_ID() AS c",
+        ],
+    )
+    for source in [view, "SELECT 1 AS id, CONNECTION_ID() AS c"]:
+        lf = _scan(
+            name, _default_driver(name), source, partition_on="id", partition_num=4
+        )
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+            lf.collect()
+
+
+@needs_clickhouse
+def test_clickhouse_block_and_query_functions() -> None:
+    # `blockSize()` and `blockSerializedSize()` are the block read's: a filter pushed into
+    # the query (or a partition) read smaller blocks (5 for 300). `queryID()` and
+    # `nowInBlock()` weren't volatile: each partition read another query's ID.
+    table = "review_r15_ch_blocks"
+    _execute(
+        "clickhouse",
+        [
+            f"DROP VIEW IF EXISTS {table}_qid",
+            f"DROP VIEW IF EXISTS {table}_nib",
+            f"DROP TABLE IF EXISTS {table}",
+            f"CREATE TABLE {table} (id Int64) ENGINE = MergeTree ORDER BY id",
+            f"INSERT INTO {table} SELECT number FROM numbers(300)",
+            f"CREATE VIEW {table}_qid AS SELECT id, queryID() AS q FROM {table}",
+            f"CREATE VIEW {table}_nib AS SELECT id, nowInBlock() AS n FROM {table}",
+        ],
+    )
+    query = f"SELECT id, blockSize() AS bs, blockSerializedSize(id) AS bss FROM {table}"
+    for driver in _runnable_drivers(
+        "clickhouse", ["adbc", "clickhouse_connect", "connectorx"]
+    ):
+        lf = _scan("clickhouse", driver, query)
+        full = lf.collect().sort("id")
+        got = lf.filter(pl.col("id") >= 295).collect().sort("id")
+        assert got.equals(full.filter(pl.col("id") >= 295)), driver
+    for source in [query, f"{table}_qid", f"{table}_nib"]:
+        lf = _scan(
+            "clickhouse",
+            _default_driver("clickhouse"),
+            source,
+            partition_on="id",
+            partition_num=4,
+        )
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+            lf.collect()

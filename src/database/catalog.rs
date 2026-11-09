@@ -233,7 +233,7 @@ pub fn table_info(
     // A lookup may fail on its own (a missing view, permissions): the others still run.
     let mut failed: Vec<&'static str> = vec![];
     let mut run = |what: &'static str, sql: &str| -> Option<DataFrame> {
-        match session.query(sql) {
+        match session.catalog_query(sql) {
             Ok(df) => Some(df),
             Err(e) => {
                 if verbose {
@@ -840,21 +840,18 @@ impl CatalogQueries {
                 }
             },
             DialectName::Duckdb => {
-                // DuckDB resolves names case-insensitively, in the current database and
-                // schema unless they are given.
-                let database = (parts.len() >= 3).then(|| parts[parts.len() - 3].as_str());
+                // DuckDB resolves names case-insensitively, where `duckdb_places` says.
+                let rank = duckdb_rank(&duckdb_places(parts, &[]));
+                let n = s(name);
                 let duck_filter = format!(
-                    "lower(table_name) = lower({}) AND lower(schema_name) = {} \
-                    AND lower(database_name) = {}",
-                    s(name),
-                    schema.map_or_else(
-                        || "lower(current_schema())".to_string(),
-                        |sc| format!("lower({})", s(sc))
-                    ),
-                    database.map_or_else(
-                        || "lower(current_database())".to_string(),
-                        |db| format!("lower({})", s(db))
-                    ),
+                    "lower(table_name) = lower({n}) \
+                    AND [lower(database_name), lower(schema_name)] = (\
+                    SELECT [lower(database_name), lower(schema_name)] FROM (\
+                    SELECT database_name, schema_name, {rank} AS r FROM duckdb_tables() \
+                    WHERE lower(table_name) = lower({n}) \
+                    UNION ALL SELECT database_name, schema_name, {rank} FROM duckdb_views() \
+                    WHERE NOT internal AND lower(view_name) = lower({n})) \
+                    WHERE r IS NOT NULL ORDER BY r LIMIT 1)"
                 );
                 Self {
                     key: Some(format!(
@@ -883,6 +880,50 @@ impl CatalogQueries {
     }
 }
 
+/// The places (lower-cased database and schema, as SQL) where DuckDB looks for the
+/// relation `parts` (`[database.][schema.]name`), in order: an unqualified name in `temp`
+/// (a temporary table or view hides one of its name), then in the current database and
+/// schema; `a.b` in the schema `a` of the current database, else in the database `a`
+/// (an attached one) and its schema `main`, as DuckDB resolves it. `context`: the
+/// database and schema of the view naming it, where its own names resolve instead of the
+/// current ones.
+fn duckdb_places(parts: &[PlSmallStr], context: &[PlSmallStr]) -> Vec<(String, String)> {
+    let s = |v: &str| format!("lower({})", DialectName::Duckdb.quote_str(v));
+    let (current_db, current_schema) = match context {
+        [db, sc] => (s(db), s(sc)),
+        _ => (
+            "lower(current_database())".to_string(),
+            "lower(current_schema())".to_string(),
+        ),
+    };
+    match parts {
+        [_] if context.len() == 2 => vec![(current_db, current_schema)],
+        [_] => vec![
+            ("'temp'".to_string(), "'main'".to_string()),
+            (current_db, current_schema),
+        ],
+        [a, _] => vec![(current_db, s(a)), (s(a), "'main'".to_string())],
+        [.., db, sc, _] => vec![(s(db), s(sc))],
+        [] => vec![],
+    }
+}
+
+/// The position of a row's `database_name`, `schema_name` among `places` (NULL if none).
+fn duckdb_rank(places: &[(String, String)]) -> String {
+    let whens = places
+        .iter()
+        .enumerate()
+        .map(|(i, (db, sc))| {
+            format!("WHEN lower(database_name) = {db} AND lower(schema_name) = {sc} THEN {i}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if whens.is_empty() {
+        return "NULL".into();
+    }
+    format!("CASE {whens} END")
+}
+
 /// What the catalog says a relation is, for [`view_definition`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ViewLookup {
@@ -896,8 +937,10 @@ pub enum ViewLookup {
         sql: String,
         qualifier: Vec<PlSmallStr>,
     },
-    /// The dialect has no lookup, or it failed.
+    /// The dialect has no lookup.
     Unknown,
+    /// The lookup failed: it may be a view.
+    Failed,
 }
 
 /// The definition of the view `parts` (`[catalog.][schema.]name`, unquoted, as the
@@ -912,7 +955,7 @@ pub fn view_definition(
     context: &[PlSmallStr],
 ) -> ViewLookup {
     let verbose = polars_core::config::verbose();
-    let mut run = |sql: &str| match session.query(sql) {
+    let mut run = |sql: &str| match session.catalog_query(sql) {
         Ok(df) => Some(df),
         Err(e) => {
             if verbose {
@@ -943,7 +986,7 @@ pub fn view_definition(
                     let Some(df) = run("SELECT name FROM pragma_database_list ORDER BY \
                         CASE name WHEN 'temp' THEN 0 WHEN 'main' THEN 1 ELSE 2 END, seq")
                     else {
-                        return ViewLookup::Unknown;
+                        return ViewLookup::Failed;
                     };
                     let mut schemas: Vec<String> = context.iter().map(|c| c.to_string()).collect();
                     for row in 0..df.height() {
@@ -984,35 +1027,17 @@ pub fn view_definition(
             schema.map_or_else(|| "DATABASE()".to_string(), s),
             s(name)
         ),
-        // A view's own names resolve in its database and schema.
+        // The first place the name resolves in (`duckdb_places`): a temporary view hides
+        // a table of its name.
         DialectName::Duckdb => {
-            let (database, schema) = match (parts.len(), context) {
-                (1, [db, sc]) => (Some(db.as_str()), Some(sc.as_str())),
-                _ => (
-                    (parts.len() >= 3).then(|| parts[parts.len() - 3].as_str()),
-                    schema,
-                ),
-            };
-            let schema = schema.map_or_else(
-                || "lower(current_schema())".to_string(),
-                |sc| format!("lower({})", s(sc)),
-            );
-            let database = database.map_or_else(
-                || "(lower(current_database()), 'temp')".to_string(),
-                |db| format!("(lower({}))", s(db)),
-            );
-            // a temporary view hides a table of the same name
+            let rank = duckdb_rank(&duckdb_places(parts, context));
             format!(
                 "SELECT is_view, sql, database_name, schema_name FROM (\
-                SELECT 0 AS o, true AS is_view, sql, temporary, database_name, schema_name \
-                FROM duckdb_views() \
-                WHERE NOT internal AND lower(view_name) = lower({n}) \
-                AND lower(schema_name) = {schema} AND lower(database_name) IN {database} \
-                UNION ALL SELECT 1, false, NULL, temporary, database_name, schema_name \
-                FROM duckdb_tables() \
-                WHERE lower(table_name) = lower({n}) AND lower(schema_name) = {schema} \
-                AND lower(database_name) IN {database}) \
-                ORDER BY temporary DESC, o LIMIT 1",
+                SELECT {rank} AS r, 0 AS o, true AS is_view, sql, database_name, schema_name \
+                FROM duckdb_views() WHERE NOT internal AND lower(view_name) = lower({n}) \
+                UNION ALL SELECT {rank}, 1, false, NULL, database_name, schema_name \
+                FROM duckdb_tables() WHERE lower(table_name) = lower({n})) \
+                WHERE r IS NOT NULL ORDER BY r, o LIMIT 1",
                 n = s(name)
             )
         },
@@ -1037,7 +1062,7 @@ pub fn view_definition(
                 "SELECT 1, CASE WHEN v.text_length <= 4000 THEN v.text_vc END, \
                 v.owner, v.view_name FROM all_views v WHERE {found}"
             )) else {
-                return ViewLookup::Unknown;
+                return ViewLookup::Failed;
             };
             if df.height() == 0 {
                 return ViewLookup::NotAView;
@@ -1065,7 +1090,7 @@ pub fn view_definition(
         _ => return ViewLookup::Unknown,
     };
     let Some(df) = run(&sql) else {
-        return ViewLookup::Unknown;
+        return ViewLookup::Failed;
     };
     if df.height() == 0 {
         return ViewLookup::NotAView;
@@ -1091,6 +1116,10 @@ pub fn view_definition(
 pub struct FunctionLookup {
     /// One of them is volatile.
     pub volatile: bool,
+    /// One of them returns the same values within a statement only (a Postgres user's
+    /// `STABLE` function over `now()`): each partition, a statement of its own, may read
+    /// other values, but a filter sees the values the statement reads.
+    pub stable: bool,
     /// The SQL expressions of those defined in SQL (DuckDB macros, ClickHouse SQL
     /// functions), which the catalog doesn't classify: volatile if their bodies are.
     pub bodies: Vec<String>,
@@ -1118,12 +1147,16 @@ pub fn volatile_functions(
         .map(|n| dialect.quote_str(&n.to_uppercase()))
         .collect::<Vec<_>>()
         .join(", ");
-    // `(volatile count[, body])` rows
+    // `(volatile count[, body[, stable count]])` rows
     let sql = match dialect {
-        // `STABLE` functions return the same within a statement; `now()`-like ones are
-        // known
+        // `STABLE` functions return the same within a statement; the built-in ones of the
+        // time (`now()`) or the session (`pg_backend_pid()`) are known by name, a user's
+        // may call them
         DialectName::Postgresql | DialectName::Redshift => format!(
-            "SELECT COUNT(*) FROM pg_proc WHERE lower(proname) IN ({list}) AND provolatile = 'v'"
+            "SELECT SUM(CASE WHEN provolatile = 'v' THEN 1 ELSE 0 END) AS v, NULL AS body, \
+            SUM(CASE WHEN provolatile = 's' AND pronamespace NOT IN (SELECT oid FROM \
+            pg_namespace WHERE nspname IN ('pg_catalog', 'information_schema')) \
+            THEN 1 ELSE 0 END) AS s FROM pg_proc WHERE lower(proname) IN ({list})"
         ),
         DialectName::Mysql | DialectName::Singlestore => format!(
             "SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_TYPE = 'FUNCTION' \
@@ -1163,7 +1196,7 @@ pub fn volatile_functions(
         ),
         _ => return None,
     };
-    let df = match session.query(&sql) {
+    let df = match session.catalog_query(&sql) {
         Ok(df) => df,
         Err(e) => {
             if polars_core::config::verbose() {
@@ -1183,6 +1216,7 @@ pub fn volatile_functions(
         {
             out.bodies.push(body);
         }
+        out.stable |= df.width() > 2 && cell_u64(&df, 2, row).is_some_and(|n| n > 0);
     }
     Some(out)
 }
@@ -1246,6 +1280,59 @@ mod tests {
             )?;
             Ok(Box::new(std::iter::once(Ok(df))))
         }
+    }
+
+    #[test]
+    fn failed_view_lookup_may_be_a_view() {
+        // (`source_volatility` takes it for a volatile view)
+        let parts = ["v".into()];
+        let pg = DialectName::Postgresql;
+        let lookup = view_definition(&mut Fake { fail: "pg_class" }, pg, &parts, &[]);
+        assert_eq!(lookup, ViewLookup::Failed);
+        let lookup = view_definition(&mut Fake { fail: "\0" }, pg, &parts, &[]);
+        assert_eq!(lookup, ViewLookup::NotAView);
+    }
+
+    #[test]
+    fn duckdb_places_follow_its_name_resolution() {
+        let places = |parts: &[&str], context: &[&str]| {
+            let parts = parts.iter().map(|p| (*p).into()).collect::<Vec<_>>();
+            let context = context.iter().map(|p| (*p).into()).collect::<Vec<_>>();
+            duckdb_places(&parts, &context)
+        };
+        let current = (
+            "lower(current_database())".to_string(),
+            "lower(current_schema())".to_string(),
+        );
+        let main = "'main'".to_string();
+        // a temporary relation first
+        assert_eq!(
+            places(&["t"], &[]),
+            [("'temp'".to_string(), main.clone()), current.clone()]
+        );
+        // `a.t`: the schema `a`, else the (attached) database `a`
+        assert_eq!(
+            places(&["a", "t"], &[]),
+            [
+                (current.0.clone(), "lower('a')".to_string()),
+                ("lower('a')".to_string(), main.clone())
+            ]
+        );
+        assert_eq!(
+            places(&["d", "s", "t"], &[]),
+            [("lower('d')".to_string(), "lower('s')".to_string())]
+        );
+        // a view's own names, where it is
+        assert_eq!(
+            places(&["t"], &["d", "s"]),
+            [("lower('d')".to_string(), "lower('s')".to_string())]
+        );
+        let rank = duckdb_rank(&places(&["a", "t"], &[]));
+        assert!(
+            rank.starts_with("CASE WHEN lower(database_name) = "),
+            "{rank}"
+        );
+        assert!(rank.ends_with("THEN 1 END"), "{rank}");
     }
 
     #[test]

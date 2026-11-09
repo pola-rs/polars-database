@@ -24,6 +24,7 @@ use pyo3::types::PyCapsule;
 use crate::database::backend::adbc::{self, FoundDriver, StreamOwner};
 use crate::database::backend::{
     BackendKind, BatchIter, CancelHandle, DatabaseSession, ProbeResult, PythonDriverBridge,
+    collect_batches,
 };
 use crate::database::connection::{ConnectionSpec, ConnectionTarget, scrub_secrets};
 use crate::database::dialect::DialectName;
@@ -322,20 +323,36 @@ struct PySession {
     secrets: Arc<[String]>,
 }
 
-impl DatabaseSession for PySession {
-    fn execute(&mut self, sql: &str, batch_size: Option<usize>) -> PolarsResult<BatchIter> {
+impl PySession {
+    /// `bind`: the query parameters (`params=`) are bound to the statement.
+    fn execute_bound(
+        &mut self,
+        sql: &str,
+        batch_size: Option<usize>,
+        bind: bool,
+    ) -> PolarsResult<BatchIter> {
         if exiting() {
             return Err(exiting_err());
         }
         let iter = Python::attach(|py| {
             self.session
-                .call_method1(py, "execute", (sql, batch_size.or(self.batch_size)))
+                .call_method1(py, "execute", (sql, batch_size.or(self.batch_size), bind))
         })
         .map_err(|e| scrubbed_err(e, &self.secrets))?;
         Ok(Box::new(PyBatches {
             iter: Some(Released::new(iter)),
             secrets: self.secrets.clone(),
         }))
+    }
+}
+
+impl DatabaseSession for PySession {
+    fn execute(&mut self, sql: &str, batch_size: Option<usize>) -> PolarsResult<BatchIter> {
+        self.execute_bound(sql, batch_size, true)
+    }
+
+    fn catalog_query(&mut self, sql: &str) -> PolarsResult<DataFrame> {
+        collect_batches(self.execute_bound(sql, None, false)?, sql)
     }
 
     fn execute_update(&mut self, sql: &str) -> PolarsResult<()> {

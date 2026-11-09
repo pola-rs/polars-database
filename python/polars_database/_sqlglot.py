@@ -408,6 +408,12 @@ _VOLATILE_FUNCTIONS = frozenset(
         "uuidv4",
         "uuidv7",
         "nextval",
+        # the session's (STABLE, but each partition reads on a session of its own)
+        "pg_backend_pid",
+        "inet_client_port",
+        "inet_client_addr",
+        "txid_current",
+        "pg_current_xact_id",
         # the time of the call, statement or transaction: partitions, and a count and
         # its read, run in transactions of their own (typed nodes: `_VOLATILE_NODES`)
         "clock_timestamp",
@@ -433,6 +439,9 @@ _VOLATILE_FUNCTIONS = frozenset(
         "uuid_v4",
         "uuid_v7",
         "random_bytes",
+        # the session's: each partition reads on a session of its own
+        "connection_id",
+        "last_insert_id",
         "sysdate",
         "curdate",
         "curtime",
@@ -454,6 +463,18 @@ _VOLATILE_FUNCTIONS = frozenset(
         "fuzzbits",
         "now64",
         "yesterday",
+        "nowinblock",
+        "nowinblock64",
+        "uptime",
+        "queryid",
+        "currentqueryid",
+        "initialqueryid",
+        "initialquerystarttime",
+        "transactionid",
+        "generaterandomstructure",
+        "filesystemavailable",
+        "filesystemfree",
+        "filesystemcapacity",
         # Snowflake
         "uuid_string",
         "seq1",
@@ -639,6 +660,9 @@ _ROWS_READ_FUNCTIONS = frozenset(
         "runningdifferencestartingwithfirstvalue",
         "runningaccumulate",
         "neighbor",
+        # the size of the block read
+        "blocksize",
+        "blockserializedsize",
     }
 )
 
@@ -685,7 +709,8 @@ def _picks_arbitrary_rows(stmt: Any, dialect: str | None) -> bool:
         return True
     for node in stmt.find_all(exp.Func):
         name = _function_name(node)
-        if name in _ARBITRARY_FUNCTIONS:
+        # each partition reads other blocks, and other rows before each
+        if name in _ARBITRARY_FUNCTIONS or name in _ROWS_READ_FUNCTIONS:
             return True
         if name == "age" and len(node.expressions) == 1:
             return True
@@ -878,19 +903,105 @@ def _no_facts() -> dict[str, Any]:
     }
 
 
+def _without_lambda_parentheses(sql: str, dialect: str | None) -> str:
+    """
+    DuckDB writes the lambdas of a view (and of a list comprehension) parenthesised,
+    `list_transform(l, (lambda x: (x + 1)))`, which sqlglot doesn't parse: the same SQL
+    with blanks for those parentheses, which it does. Only a parenthesis that opens an
+    argument (after `(` or `,`), not a call's.
+    """
+    if dialect != "duckdb" or "lambda" not in sql.lower():
+        return sql
+    try:
+        tokens = sqlglot.Dialect.get_or_raise(dialect).tokenize(sql)
+    except sqlglot.errors.SqlglotError:
+        return sql
+    tt = sqlglot.TokenType
+    blanks: list[int] = []
+    opened: list[int] = []
+    for i, t in enumerate(tokens):
+        if t.token_type == tt.L_PAREN:
+            opened.append(i)
+        elif t.token_type == tt.R_PAREN and opened:
+            j = opened.pop()
+            if (
+                j >= 1
+                and j + 1 < i
+                and tokens[j - 1].token_type in (tt.L_PAREN, tt.COMMA)
+                and tokens[j + 1].token_type == tt.VAR
+                and tokens[j + 1].text.lower() == "lambda"
+            ):
+                blanks += [tokens[j].start, t.start]
+    chars = list(sql)
+    for at in blanks:
+        chars[at] = " "
+    return "".join(chars)
+
+
+def _plain_placeholders(sql: str, dialect: str | None) -> str:
+    """
+    A query's parameter placeholders that sqlglot doesn't parse in its dialect (`%s` and
+    `%(name)s` on MySQL, `:1` on Oracle) as `?`, after blanks: the same length.
+    """
+    try:
+        tokens = sqlglot.Dialect.get_or_raise(dialect).tokenize(sql)
+    except sqlglot.errors.SqlglotError:
+        return sql
+    tt = sqlglot.TokenType
+    chars = list(sql)
+    for i, t in enumerate(tokens):
+        after = tokens[i + 1 : i + 5]
+        # (adjacent tokens: `% s` is a modulo)
+        kinds = [a.token_type for a in after]
+        adjacent = all(
+            b.start == a.end + 1 for a, b in zip([t, *after], after, strict=False)
+        )
+        end = None
+        if t.token_type == tt.MOD and kinds[:1] == [tt.VAR] and after[0].text == "s":
+            end = after[0].end if after[0].start == t.end + 1 else None
+        elif (
+            t.token_type == tt.MOD
+            and kinds == [tt.L_PAREN, tt.VAR, tt.R_PAREN, tt.VAR]
+            and after[3].text == "s"
+            and adjacent
+        ):
+            end = after[3].end
+        elif t.token_type == tt.COLON and kinds[:1] == [tt.NUMBER]:
+            end = after[0].end if after[0].start == t.end + 1 else None
+        if end is not None:
+            # (ending where the placeholder ends, as the query's last token may)
+            chars[t.start : end + 1] = " " * (end - t.start) + "?"
+    return "".join(chars)
+
+
+def _parse_query(sql: str, dialect: str | None) -> tuple[list[Any], list[Any]]:
+    """A query's statements and tokens: a comment after its last `;` is none."""
+    statements = [
+        s
+        for s in sqlglot.parse(sql, read=dialect)
+        if s is not None and not isinstance(s, exp.Semicolon)
+    ]
+    return statements, sqlglot.Dialect.get_or_raise(dialect).tokenize(sql)
+
+
 def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
     """Facts about a user query that decide whether it can be wrapped."""
     facts = _no_facts()
+    # (the same length: its tokens are where the query's are)
+    original, sql = sql, _without_lambda_parentheses(sql, dialect)
     try:
-        # a comment after the last `;` parses as a statement of its own
-        statements = [
-            s
-            for s in sqlglot.parse(sql, read=dialect)
-            if s is not None and not isinstance(s, exp.Semicolon)
-        ]
-        tokens = sqlglot.Dialect.get_or_raise(dialect).tokenize(sql)
+        statements, tokens = _parse_query(sql, dialect)
     except sqlglot.errors.SqlglotError:
-        return facts
+        # a query's placeholders for `params=` (or the views it reads, and the functions
+        # it calls, would go unchecked)
+        plain = _plain_placeholders(sql, dialect)
+        if plain == sql:
+            return facts
+        try:
+            statements, tokens = _parse_query(plain, dialect)
+        except sqlglot.errors.SqlglotError:
+            return facts
+        sql = plain
     facts["parses"] = True
     # the query without the semicolons and comments after its last token, which can't
     # go inside `(...)` (MySQL's `#` comment would comment out the parenthesis)
@@ -902,7 +1013,7 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
         with contextlib.suppress(sqlglot.errors.SqlglotError):
             # only what the tokens say is the same query
             if sqlglot.parse(body, read=dialect) == statements:
-                facts["body"] = body
+                facts["body"] = original[: tokens[-1].end + 1]
     facts["read_only"] = len(statements) == 1 and _is_read_only(statements[0])
     if len(statements) != 1 or not isinstance(statements[0], exp.Query):
         return facts
@@ -974,6 +1085,7 @@ def inspect_view(sql: str, dialect: str | None) -> dict[str, Any]:
     VIEW` statement or only its query. Its output columns (and volatile ones) are the
     view's, named by its column list if it has one.
     """
+    sql = _without_lambda_parentheses(sql, dialect)
     try:
         statements = [
             s

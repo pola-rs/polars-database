@@ -2475,6 +2475,279 @@ def test_scan_decimal_override_rounds_as_asked(tmp_path: Path) -> None:
         assert lf.collect()["x"].to_list() == expected.to_list(), source
 
 
+def _sql_of(lf: pl.LazyFrame) -> str:
+    return "\n".join(line for line in lf.explain().splitlines() if "sql[" in line)
+
+
+def test_scan_sqlite_schema_columns_matched_to_the_views_by_name(
+    tmp_path: Path,
+) -> None:
+    # Under `schema=`, a view's volatile columns were matched to the user's by position:
+    # `{"r": ..., "id": ...}` took `id` for the view's `random()`, and a filter on `r` was
+    # run in the database, which calls `random()` again for it (rows with r <= 0 for
+    # `r > 0`); a schema of `id` alone took every column for volatile, failing `id < 10`
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE ids (id INTEGER PRIMARY KEY)")
+        conn.executemany("INSERT INTO ids VALUES (?)", [(i,) for i in range(300)])
+        conn.execute("CREATE VIEW v AS SELECT id, random() AS r FROM ids")
+        conn.commit()
+    uri = f"sqlite:///{path}"
+    lf = pl.scan_database("v", uri, schema={"r": pl.Int64, "id": pl.Int64})
+    with pytest.raises(pl.exceptions.InvalidOperationError, match="a filter on 'r'"):
+        lf.filter(pl.col("r") > 0).collect()
+    assert lf.filter(pl.col("id") < 10).collect().height == 10
+    lf = pl.scan_database("v", uri, schema={"id": pl.Int64})
+    assert lf.filter(pl.col("id") < 10).collect().height == 10
+
+
+@pytest.mark.parametrize("database", ["sqlite", "duckdb"])
+def test_scan_automatic_partitions_of_a_volatile_view_under_schema(
+    tmp_path: Path, database: str
+) -> None:
+    # `schema=` plans without I/O: automatic partitions (`order_by` and `partition_num`)
+    # split a view of `random()`, and the read then failed "pass partition_on=None",
+    # which the user never passed. They are one, as without `schema=`.
+    if database == "sqlite":
+        path = tmp_path / "t.db"
+        with closing(sqlite3.connect(path)) as conn:
+            conn.execute("CREATE TABLE ids (id INTEGER PRIMARY KEY)")
+            conn.executemany("INSERT INTO ids VALUES (?)", [(i,) for i in range(300)])
+            conn.execute("CREATE VIEW v AS SELECT id, random() AS r FROM ids")
+            conn.commit()
+        uri = f"sqlite:///{path}"
+    else:
+        duckdb = pytest.importorskip("duckdb")
+        path = tmp_path / "t.duckdb"
+        with duckdb.connect(str(path)) as conn:
+            conn.execute("CREATE TABLE ids AS SELECT range AS id FROM range(300)")
+            conn.execute("CREATE VIEW v AS SELECT id, random() AS r FROM ids")
+        uri = f"duckdb:///{path}"
+    schema = {"id": pl.Int64, "r": pl.Float64}
+    lf = pl.scan_database("v", uri, schema=schema, order_by=["id"], partition_num=4)
+    assert "partitions: 1" in lf.explain()
+    assert lf.collect()["id"].to_list() == list(range(300))
+    # a table still splits
+    lf = pl.scan_database(
+        "ids", uri, schema={"id": pl.Int64}, order_by=["id"], partition_num=4
+    )
+    assert "partitions: 4" in lf.explain()
+    assert lf.collect()["id"].to_list() == list(range(300))
+
+
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
+@pytest.mark.parametrize("source", ["t", "SELECT id, i FROM t"])
+def test_scan_sqlite_override_reads_integer_text(
+    tmp_path: Path, driver: str, source: str
+) -> None:
+    # A same-dtype integer override cut reals to integers, but left an integer's text
+    # ('7') as text: `i == 7` missed it (sqlite3, SQLAlchemy), ADBC and ConnectorX failed
+    # the read. It is read, and compared, as 7.
+    _importorskip_sqlite_driver(driver)
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, i)")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?)", [(k, k) for k in range(10, 3001)]
+        )
+        conn.execute("INSERT INTO t VALUES (3001, '7')")
+        conn.execute("INSERT INTO t VALUES (3002, 7.0)")
+        conn.commit()
+    lf = pl.scan_database(
+        source, f"sqlite:///{path}", driver=driver, schema_overrides={"i": pl.Int64}
+    )
+    assert sorted(lf.filter(pl.col("i") == 7).collect()["id"].to_list()) == [
+        3001,
+        3002,
+    ]
+    _check_ids(
+        lf,
+        [
+            pl.col("i") < 8,
+            pl.col("i").is_in([7, 11]),
+            pl.col("i").is_between(5, 9),
+        ],
+    )
+
+
+def test_scan_duckdb_hugeint_of_39_digits_retyped(tmp_path: Path) -> None:
+    # A HUGEINT of 39 digits fails the `Decimal(38, 0)` it is read as, but failed the
+    # read also when retyped to a type that holds it (and the error advised one of them)
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    big = 10**38 + 7
+    with duckdb.connect(path) as conn:
+        conn.execute(
+            f"CREATE TABLE t AS SELECT * FROM (VALUES (1, 5::HUGEINT), "
+            f"(2, {big}::HUGEINT), (3, -{big}::HUGEINT)) v(id, h)"
+        )
+    uri = f"duckdb:///{path}"
+    with pytest.raises(Exception, match="can't represent"):
+        pl.scan_database("t", uri).collect()
+    for source in ["t", "SELECT id, h FROM t"]:
+        for dtype, values in [
+            (pl.String, ["5", str(big), str(-big)]),
+            (pl.Int128, [5, big, -big]),
+            (pl.Float64, [5.0, float(big), -float(big)]),
+        ]:
+            lf = pl.scan_database(source, uri, schema_overrides={"h": dtype})
+            assert lf.collect().sort("id")["h"].to_list() == values, (source, dtype)
+            assert lf.filter(pl.col("id") == 1).collect()["h"].to_list() == values[:1]
+    lf = pl.scan_database("t", uri, schema={"id": pl.Int64, "h": pl.Int128})
+    assert lf.collect().sort("id")["h"].to_list() == [5, big, -big]
+    assert lf.filter(pl.col("h") > 5).collect()["id"].to_list() == [2]
+
+
+def test_scan_sqlite_params_dont_hide_volatile_views(tmp_path: Path) -> None:
+    # With params=, every catalog lookup was given the parameters too, and failed: the
+    # view of `random()` went unchecked, and a filter on it was run in the database,
+    # which calls `random()` again for it (half the rows had `r >= 0` for `r < 0`)
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        conn.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(1, 1001)])
+        conn.execute("CREATE VIEW vr AS SELECT id, random() AS r FROM t")
+        conn.commit()
+    uri = f"sqlite:///{path}"
+    query = "SELECT * FROM vr WHERE id > ?"
+    with closing(sqlite3.connect(path, check_same_thread=False)) as live:
+        for connection, kwargs in [
+            (uri, {"driver": "sqlite3", "params": [0]}),
+            (uri, {"driver": "sqlite3", "execute_options": {"parameters": [0]}}),
+            (live, {"params": [0]}),
+        ]:
+            lf = pl.scan_database(query, connection, **kwargs)  # type: ignore[arg-type]
+            df = lf.filter(pl.col("r") < 0).collect()
+            assert df.height > 0
+            assert (df["r"] < 0).all(), kwargs
+            lf = pl.scan_database(
+                query,
+                connection,  # type: ignore[arg-type]
+                partition_on="id",
+                partition_num=4,
+                **kwargs,
+            )
+            with pytest.raises(
+                pl.exceptions.InvalidOperationError, match="partitioned"
+            ):
+                lf.collect()
+
+
+def test_scan_duckdb_live_connection_sees_its_temporary_objects() -> None:
+    # The read ran on a cursor, a connection of its own without the connection's
+    # temporary tables and views: a temporary table hiding a table read the hidden one,
+    # a temporary view of `random()` hiding a table read the table, and a temporary
+    # table alone failed "does not exist"
+    duckdb = pytest.importorskip("duckdb")
+    conn = duckdb.connect()
+    try:
+        conn.execute("CREATE TABLE tt AS SELECT 1 AS id")
+        conn.execute(
+            "CREATE TEMP TABLE tt AS SELECT range AS id, 'abc' AS s FROM range(5)"
+        )
+        conn.execute("CREATE TEMP TABLE only_temp AS SELECT range AS id FROM range(3)")
+        conn.execute("CREATE TABLE vt AS SELECT range AS id FROM range(100)")
+        conn.execute("CREATE TABLE src AS SELECT range AS id FROM range(100)")
+        conn.execute(
+            "CREATE TEMP VIEW vt AS SELECT id, random() AS r FROM src WHERE id < 10"
+        )
+        df = pl.scan_database("tt", conn).collect()
+        assert df.columns == ["id", "s"]
+        assert df["id"].to_list() == list(range(5))
+        assert (
+            pl.scan_database("tt", conn).filter(pl.col("s") == "abc").collect().height
+            == 5
+        )
+        lf = pl.scan_database("SELECT * FROM only_temp WHERE id > 0", conn)
+        assert lf.collect()["id"].to_list() == [1, 2]
+        assert pl.scan_database("vt", conn).collect().height == 10
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+            pl.scan_database("vt", conn, partition_on="id", partition_num=2).collect()
+        # two scans of the connection read in one query
+        joined = (
+            pl.scan_database("tt", conn)
+            .join(pl.scan_database("only_temp", conn), on="id")
+            .collect()
+        )
+        assert sorted(joined["id"].to_list()) == [0, 1, 2]
+        # the connection is the user's to go on with
+        assert conn.execute("SELECT count(*) FROM tt").fetchall() == [(5,)]
+    finally:
+        conn.close()
+
+
+def test_scan_duckdb_two_part_names_of_an_attached_database(tmp_path: Path) -> None:
+    # `db.v` names the schema `db` of the current database, or else the attached
+    # database `db` (its schema `main`), as DuckDB resolves it; it was only taken for a
+    # schema: a view of `nextval` there wasn't found (partitions accepted, each read
+    # other values), nor a table's types (a string filter wasn't pushed)
+    duckdb = pytest.importorskip("duckdb")
+    other = str(tmp_path / "other.duckdb")
+    with duckdb.connect(other) as conn:
+        conn.execute(
+            "CREATE TABLE base AS SELECT range AS id, 'a' AS s FROM range(1000)"
+        )
+        conn.execute("CREATE SEQUENCE seq")
+        conn.execute("CREATE VIEW vseq AS SELECT id, nextval('seq') AS n FROM base")
+        conn.execute("CREATE VIEW vr AS SELECT id, random() AS r FROM base")
+    conn = duckdb.connect()
+    try:
+        conn.execute(f"ATTACH '{other}' AS otherdb")
+        for source in [
+            "otherdb.vseq",
+            "otherdb.vr",
+            "SELECT * FROM otherdb.vr",
+            "otherdb.main.vr",
+        ]:
+            lf = pl.scan_database(source, conn, partition_on="id", partition_num=4)
+            with pytest.raises(
+                pl.exceptions.InvalidOperationError, match="partitioned"
+            ):
+                lf.collect()
+        lf = pl.scan_database("otherdb.base", conn).filter(pl.col("s") == "a")
+        assert "WHERE" in _sql_of(lf)
+        assert lf.collect().height == 1000
+        # a schema of the current database by another name is still found
+        conn.execute("CREATE SCHEMA s2")
+        conn.execute("CREATE TABLE s2.base AS SELECT 1 AS id, 2 AS x")
+        lf = pl.scan_database("s2.base", conn).filter(pl.col("x") == 2)
+        assert lf.collect().columns == ["id", "x"]
+        assert "WHERE" in _sql_of(lf)
+    finally:
+        conn.close()
+
+
+def test_scan_duckdb_views_with_lambdas(tmp_path: Path) -> None:
+    # DuckDB writes a view's lambdas (and list comprehensions) parenthesised, which
+    # sqlglot didn't parse: the view couldn't be inspected, so no filter was pushed on it
+    # and partitions were refused
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE base AS SELECT range AS id, [range, range + 1] AS l "
+            "FROM range(1000)"
+        )
+        conn.execute(
+            "CREATE VIEW v AS SELECT id, list_transform(l, lambda x: x + 1) AS g, "
+            "[x * 2 FOR x IN l IF x > 0] AS c FROM base"
+        )
+        conn.execute("CREATE VIEW vr AS SELECT id, random() AS r FROM base")
+    uri = f"duckdb:///{path}"
+    lf = pl.scan_database("v", uri).filter(pl.col("id") < 10)
+    assert "WHERE" in _sql_of(lf)
+    assert lf.collect().height == 10
+    lf = pl.scan_database("v", uri, partition_on="id", partition_num=4)
+    assert sorted(lf.collect()["id"].to_list()) == list(range(1000))
+    # a filter on a column of `random()` is run in the database too: DuckDB filters the
+    # values the view returns, as Postgres does (SQLite and MySQL call it again)
+    lf = pl.scan_database("vr", uri).filter(pl.col("r") < 0.5)
+    assert "WHERE" in _sql_of(lf)
+    df = lf.collect()
+    assert df.height > 0
+    assert (df["r"] < 0.5).all()
+
+
 @pytest.mark.parametrize("driver", ["sqlite3"])
 def test_scan_query_that_isnt_repeatable_counts_batches_of_other_dtypes(
     tmp_path: Path, driver: str
