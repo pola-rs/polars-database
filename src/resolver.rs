@@ -126,12 +126,19 @@ impl Resolver {
         if config.pushdown_disabled.is_none() {
             let translator = Translator { config: &config };
             for (i, doc) in args.filters.iter().enumerate() {
-                if let Some((expr, class)) = translator.translate(&Node::parse(doc)) {
+                let node = Node::parse(doc);
+                if let Some((expr, class)) = translator.translate(&node) {
                     let exact = class == Class::Exact;
                     if exact {
                         applied.push(i as u64);
                     }
-                    pushdown.filters.push(PushedFilter { expr, exact });
+                    let mut columns = vec![];
+                    node.columns(&mut columns);
+                    pushdown.filters.push(PushedFilter {
+                        expr,
+                        exact,
+                        columns,
+                    });
                 }
             }
         }

@@ -744,18 +744,37 @@ def _relations(stmt: Any) -> set[str]:
     return names
 
 
-def _cte_in_scope(table: Any) -> bool:
-    """Whether a CTE of the query (or of an enclosing one) has the table's name."""
+# Where a CTE that names itself is recursive without `RECURSIVE`
+_IMPLICITLY_RECURSIVE = frozenset({"sqlite", "oracle", "tsql"})
+
+
+def _cte_in_scope(table: Any, dialect: str | None) -> bool:
+    """
+    Whether a CTE of the query (or of an enclosing one) visible where the table is named
+    has its name. A CTE is visible in the query's body and in the CTEs after it, not in its
+    own definition (`WITH v AS (SELECT * FROM v)` reads the table `v`), unless `RECURSIVE`
+    (or where a CTE naming itself is recursive anyway: SQLite, Oracle, SQL Server).
+    """
     if table.args.get("db"):
         return False
     name = table.name.lower()
+    path: list[Any] = [table]
     node = table.parent
     while node is not None:
         with_ = node.args.get("with_") or node.args.get("with")
-        if with_ is not None and any(
-            c.alias_or_name.lower() == name for c in with_.expressions
-        ):
-            return True
+        if with_ is not None:
+            ctes = list(with_.expressions)
+            visible = ctes
+            if len(path) >= 2 and path[-1] is with_ and not with_.args.get("recursive"):
+                # named inside the definition of one of them
+                inside = path[-2]
+                own = 1 if dialect in _IMPLICITLY_RECURSIVE else 0
+                visible = next(
+                    (ctes[: i + own] for i, c in enumerate(ctes) if c is inside), ctes
+                )
+            if any(c.alias_or_name.lower() == name for c in visible):
+                return True
+        path.append(node)
         node = node.parent
     return False
 
@@ -778,7 +797,7 @@ def _tables(stmt: Any, dialect: str | None) -> list[list[str]]:
             name = str(t.this.name)
         else:
             continue
-        if not name or _cte_in_scope(t):
+        if not name or _cte_in_scope(t, dialect):
             continue
         parts = [p for p in (t.catalog, t.db, name) if p]
         if parts not in tables:
@@ -786,13 +805,22 @@ def _tables(stmt: Any, dialect: str | None) -> list[list[str]]:
     return tables
 
 
-def _unknown_functions(stmt: Any) -> list[str]:
-    """Lower-cased names of the functions sqlglot doesn't know, but table functions."""
+# Where the catalog tells a user's table function (a DuckDB table macro running
+# `random()`, a volatile Postgres set-returning function) from the stable built-ins
+_TABLE_FUNCTION_CATALOGS = frozenset({"duckdb", "postgres", "clickhouse"})
+
+
+def _unknown_functions(stmt: Any, dialect: str | None) -> list[str]:
+    """
+    Lower-cased names of the functions sqlglot doesn't know; table functions only where
+    the catalog tells user ones from built-ins (`_TABLE_FUNCTION_CATALOGS`).
+    """
+    tables = dialect in _TABLE_FUNCTION_CATALOGS
     return sorted(
         {
             str(n.name).lower()
             for n in stmt.find_all(exp.Anonymous)
-            if n.name and not isinstance(n.parent, exp.Table)
+            if n.name and (tables or not isinstance(n.parent, exp.Table))
         }
     )
 
@@ -910,7 +938,7 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
         facts["volatile_columns"] = columns
     # The database says whether these are volatile (`catalog::volatile_functions`): a
     # user's function may be (`random()` inside), and each partition would run it again.
-    facts["unknown_functions"] = _unknown_functions(stmt)
+    facts["unknown_functions"] = _unknown_functions(stmt, dialect)
     # A view among them may call a volatile function (`catalog::view_definition`).
     facts["tables"] = _tables(stmt, dialect)
     # anywhere in the query: a nested LIMIT without a unique ORDER BY picks rows too

@@ -2330,6 +2330,137 @@ def test_scan_sqlite_temporary_table_hiding_a_table(
             engine.dispose()
 
 
+def test_scan_sqlite_volatility_under_an_explicit_schema(tmp_path: Path) -> None:
+    # `schema=` plans without I/O, so views and user functions weren't inspected: a filter
+    # on a view's `random()` returned rows Polars would drop, and partitions over a user
+    # function read other rows; the read checks it now
+    import random
+
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE ids (id INTEGER PRIMARY KEY)")
+        conn.executemany("INSERT INTO ids VALUES (?)", [(i,) for i in range(300)])
+        conn.execute("CREATE VIEW v AS SELECT id, random() AS r FROM ids")
+        conn.commit()
+    uri = f"sqlite:///{path}"
+    schema = {"id": pl.Int64, "r": pl.Int64}
+    lf = pl.scan_database("v", uri, schema=schema)
+    with pytest.raises(pl.exceptions.InvalidOperationError, match="schema="):
+        lf.filter(pl.col("r") > 0).collect()
+    with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+        pl.scan_database(
+            "v", uri, schema=schema, partition_on="id", partition_num=4
+        ).collect()
+    # nothing relies on it: read as planned; a filter on a column of no volatile
+    # function is still pushed
+    assert lf.collect().height == 300
+    assert lf.filter(pl.col("id") < 10).collect().height == 10
+    # a view that isn't repeatable is counted from the rows it reads: its tail is the
+    # read's, not cut by a count that saw other rows
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE more (id INTEGER PRIMARY KEY)")
+        conn.executemany("INSERT INTO more VALUES (?)", [(i,) for i in range(1000)])
+        conn.execute("CREATE VIEW half AS SELECT id FROM more WHERE random() < 0")
+        conn.commit()
+    for _ in range(3):
+        # (a count of other rows cut the read ~30 ids early, or failed "table changed";
+        # no id in 980-999 kept: 2**-20)
+        tail = pl.scan_database("half", uri, schema={"id": pl.Int64}).tail(5).collect()
+        ids = tail["id"].to_list()
+        assert len(ids) == 5 and ids == sorted(ids) and ids[-1] >= 980, ids
+    # automatic partitions of a volatile view (without schema=) read it once
+    lf = pl.scan_database("v", uri, order_by=["id"], partition_num=4)
+    assert lf.collect()["id"].n_unique() == 300
+    assert (
+        pl.scan_database("ids", uri, schema={"id": pl.Int64})
+        .filter(pl.col("id") < 10)
+        .collect()
+        .height
+        == 10
+    )
+    with closing(sqlite3.connect(path, check_same_thread=False)) as live:
+        live.create_function("myrand", 0, random.Random(1).random)
+        lf = pl.scan_database(
+            "SELECT id, myrand() AS r FROM ids",
+            live,
+            schema={"id": pl.Int64, "r": pl.Float64},
+            partition_on="id",
+            partition_num=4,
+        )
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="myrand"):
+            lf.collect()
+
+
+@pytest.mark.parametrize("driver", _SQLITE_DRIVERS)
+def test_scan_sqlite_override_cuts_reals_as_compared(
+    tmp_path: Path, driver: str
+) -> None:
+    # an Int64 override of an Int64 column reads 1.5 as 1, but `i == 1` compared 1.5
+    _importorskip_sqlite_driver(driver)
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, i)")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?)", [(k, k) for k in range(2, 1001)]
+        )
+        conn.execute("INSERT INTO t VALUES (1001, 1.5)")
+        conn.commit()
+    lf = pl.scan_database(
+        "t", f"sqlite:///{path}", driver=driver, schema_overrides={"i": pl.Int64}
+    )
+    _check_ids(lf, [pl.col("i") == 1, pl.col("i") < 2, pl.col("i").is_in([1, 3])])
+
+
+def test_scan_duckdb_volatility_through_ctes_and_macros(tmp_path: Path) -> None:
+    # a CTE named as the view it reads hid the view; table macros weren't inspected, nor
+    # the views a macro's body reads: partitions read other rows each
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE TABLE ids AS SELECT range AS id FROM range(1000)")
+        conn.execute("CREATE VIEW v AS SELECT id, random() AS r FROM ids")
+        conn.execute("CREATE MACRO tm() AS TABLE SELECT id, random() AS r FROM ids")
+        conn.execute("CREATE MACRO dm() AS TABLE SELECT id, id * 2 AS r FROM ids")
+        conn.execute("CREATE MACRO vr(x) AS (SELECT r FROM v WHERE id = x)")
+    uri = f"duckdb:///{path}"
+    for query in [
+        "WITH v AS (SELECT * FROM v) SELECT * FROM v",
+        "SELECT * FROM tm()",
+        "SELECT id, vr(id) AS r FROM ids",
+    ]:
+        lf = pl.scan_database(query, uri, partition_on="r", partition_num=4)
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+            lf.collect()
+    lf = pl.scan_database("SELECT * FROM dm()", uri, partition_on="r", partition_num=4)
+    assert sorted(lf.collect()["id"].to_list()) == list(range(1000))
+    # a scalar macro whose body starts like a query's keyword is still an expression
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE MACRO h(x) AS from_base64(x)")
+    lf = pl.scan_database(
+        "SELECT id, h('AA==') AS p FROM ids", uri, partition_on="id", partition_num=4
+    )
+    assert lf.collect().height == 1000
+    # a built-in table function is stable
+    lf = pl.scan_database(
+        "SELECT * FROM range(100) t(id)", uri, partition_on="id", partition_num=2
+    )
+    assert sorted(lf.collect()["id"].to_list()) == list(range(100))
+
+
+def test_scan_sqlite_cte_naming_itself_is_recursive(tmp_path: Path) -> None:
+    # SQLite takes a CTE that names itself as recursive, without RECURSIVE: it doesn't
+    # read the volatile view of its name
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE VIEW v AS SELECT random() AS x")
+    query = (
+        "WITH v AS (SELECT 1 AS x UNION ALL SELECT x + 1 FROM v WHERE x < 1000) "
+        "SELECT x FROM v"
+    )
+    lf = pl.scan_database(query, f"sqlite:///{path}", partition_on="x", partition_num=4)
+    assert sorted(lf.collect()["x"].to_list()) == list(range(1, 1001))
+
+
 def test_scan_decimal_override_rounds_as_asked(tmp_path: Path) -> None:
     # a decimal retyped to fewer places by `schema_overrides` failed "would round",
     # though Polars' own cast rounds it; a planned decimal still may not round

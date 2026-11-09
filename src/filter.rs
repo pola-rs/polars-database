@@ -98,6 +98,26 @@ pub enum Node {
 }
 
 impl Node {
+    /// The columns it names.
+    pub fn columns(&self, out: &mut Vec<PlSmallStr>) {
+        match self {
+            Self::Column(c) => out.push(c.clone()),
+            Self::Literal(_) | Self::Unknown => {},
+            Self::And(a, b) | Self::Or(a, b) | Self::Compare(a, _, b) | Self::Str(_, a, b) => {
+                a.columns(out);
+                b.columns(out);
+            },
+            Self::Not(a) | Self::IsNull(a, _) | Self::Cast(a, _) | Self::IsIn { expr: a, .. } => {
+                a.columns(out)
+            },
+            Self::IsBetween(a, b, c, _) => {
+                a.columns(out);
+                b.columns(out);
+                c.columns(out);
+            },
+        }
+    }
+
     /// Parses a document. Parts that don't parse become [`Node::Unknown`], which is never pushed.
     pub fn parse(doc: &str) -> Self {
         match serde_json::from_str::<Value>(doc) {

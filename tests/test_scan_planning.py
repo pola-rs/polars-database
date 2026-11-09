@@ -1070,7 +1070,8 @@ def test_unknown_functions_and_tables() -> None:
     assert inspect_query("SELECT * FROM v", "oracle")["tables"] == [["V"]]
     facts = inspect_query("SELECT * FROM pv(p = 0.5)", "clickhouse")
     assert facts["tables"] == [["pv"]]
-    assert facts["unknown_functions"] == []
+    # and a table function, which the catalog may know to be volatile (a table macro)
+    assert facts["unknown_functions"] == ["pv"]
 
 
 @pytest.mark.parametrize(

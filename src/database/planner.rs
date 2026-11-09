@@ -452,6 +452,7 @@ pub fn resolve_scan(
     let mut affinity: PlHashMap<PlSmallStr, DataType> = PlHashMap::new();
     let mut stats = TableStats::default();
     let schema: SchemaRef;
+    let volatility_unchecked = user_schema.is_some();
 
     if let Some(schema_) = user_schema {
         // No I/O: a user schema is authoritative, and column semantics stay conservative:
@@ -871,8 +872,71 @@ pub fn resolve_scan(
         connection_share: None,
         pushdown_disabled,
         volatile_source: volatility.volatile.is_some(),
+        volatility_unchecked,
         bounds_cache: Default::default(),
     })
+}
+
+/// Under `schema=` the planning does no I/O, so what [`source_volatility`] finds wasn't
+/// known when filters were pushed and partitions planned: the read checks it on its first
+/// session, and returns whether the source is volatile (then its count reads its rows, as
+/// for a query that isn't repeatable). A volatile source fails the read where its plan
+/// relies on it not being so: several partitions (each reads it again), or a filter
+/// pushed into the database on a column of a volatile function, where the database merges
+/// a view or query into the filter's and calls `random()` again for it (SQLite, MySQL;
+/// others don't push a filter into a query that calls a volatile function).
+pub fn check_unplanned_volatility(
+    session: &mut dyn DatabaseSession,
+    config: &DatabaseScanConfig,
+) -> PolarsResult<bool> {
+    let Some(compiled) = config.compiled.as_deref() else {
+        return Ok(false);
+    };
+    if !config.volatility_unchecked {
+        return Ok(false);
+    }
+    let facts = match &config.options.relation {
+        DatabaseRelation::Query { sql } => sql_renderer()
+            .and_then(|r| r.inspect_query(sql, config.dialect))
+            .ok()
+            .filter(|f| f.parses),
+        DatabaseRelation::Table { .. } => None,
+    };
+    let names = config.schema.iter_names().cloned().collect::<Vec<_>>();
+    let volatility = source_volatility(
+        session,
+        config.dialect,
+        &config.options.relation,
+        facts.as_ref(),
+        &names,
+    );
+    let Some(reason) = volatility.volatile else {
+        return Ok(false);
+    };
+    polars_ensure!(
+        compiled.partitions.len() <= 1,
+        InvalidOperation:
+        "this source can't be partitioned: each partition reads it again, and {reason} may \
+        return other rows or values each time (found when reading: schema= skips the check \
+        when planning); pass partition_on=None"
+    );
+    let merges = matches!(
+        config.dialect,
+        DialectName::Sqlite | DialectName::Mysql | DialectName::Singlestore
+    );
+    let volatile_column = compiled.filter_columns.iter().find(|c| {
+        volatility.all_columns || volatility.columns.iter().any(|v| v.eq_ignore_ascii_case(c))
+    });
+    if merges && let Some(column) = volatile_column {
+        polars_bail!(
+            InvalidOperation:
+            "a filter on '{column}' was planned to run in the database, but {reason} may \
+            return other values each time it runs, and the database may call it again for \
+            the filter (found when reading: schema= skips the check when planning); filter \
+            after collecting, or leave out schema="
+        );
+    }
+    Ok(true)
 }
 
 /// ConnectorX reads other row counts than there are from a ClickHouse array of `Nullable(…)`,
@@ -1755,7 +1819,8 @@ fn converted_select_list(
 /// The SQL a filter compares a column through, where not the column itself: a SQLite column
 /// read converted, whose values the database would compare as other values than Polars
 /// reads. One read as reals or integers without that affinity may hold integers (`2**53 +
-/// 1`, read as `9007199254740992.0`), integral reals or numbers' text (`'1'`, read as 1); a
+/// 1`, read as `9007199254740992.0`), integral reals or numbers' text (`'1'`, read as 1),
+/// or reals cut to integers (`schema_overrides`: 1.5 read as 1); a
 /// text one blobs (`X'7631'`, read as `'v1'`). The converted value is compared, as read (an
 /// index on the column isn't used then); a text one as `CAST(x AS TEXT)`, which keeps its
 /// collation (it holds no numbers: TEXT affinity, see `catalog::compares_as_text`).
@@ -1769,7 +1834,7 @@ pub(crate) fn compared_column_sql(config: &DatabaseScanConfig, column: &str) -> 
     if db_type == SQLITE_TEXT && c.dtype == DataType::String {
         return Some(format!("CAST({quoted} AS TEXT)"));
     }
-    if db_type != SQLITE_REAL && db_type != SQLITE_UNTYPED_INTEGER {
+    if ![SQLITE_REAL, SQLITE_UNTYPED_INTEGER, SQLITE_INTEGER_CUT].contains(&db_type) {
         return None;
     }
     column_conversion(
@@ -1998,6 +2063,8 @@ pub struct PushedFilter {
     pub expr: SqlExpr,
     /// The database returns exactly the rows Polars keeps. Otherwise a superset.
     pub exact: bool,
+    /// The columns it compares.
+    pub columns: Vec<PlSmallStr>,
 }
 
 /// What Polars pushed into a scan (the resolver's projection, filters and limit).
@@ -2134,6 +2201,11 @@ pub fn compile_scan(
         columns,
         partitioning,
         pushed_filters: pushdown.filters.len(),
+        filter_columns: pushdown
+            .filters
+            .iter()
+            .flat_map(|f| f.columns.iter().cloned())
+            .collect(),
         exact_filters,
         total_filters: pushdown.total_filters,
         limit,
@@ -2349,6 +2421,7 @@ fn compile_unwrapped(
         columns: config.schema.iter_names().cloned().collect(),
         partitioning: "1".into(),
         pushed_filters: 0,
+        filter_columns: vec![],
         exact_filters: 0,
         total_filters,
         limit: None,
@@ -2429,69 +2502,73 @@ fn source_volatility(
     };
     let mut seen: PlHashSet<Vec<PlSmallStr>> = PlHashSet::new();
     let renderer = sql_renderer().ok();
-    while let Some((parts, context, own_columns)) = pending.pop() {
-        let key = context
-            .iter()
-            .chain(&parts)
-            .map(|p| p.to_lowercase().into())
-            .collect();
-        if !seen.insert(key) {
-            continue;
-        }
-        if seen.len() > MAX_VIEW_LOOKUPS {
-            out.volatile = Some("one of the many views it reads".into());
-            out.all_columns = true;
-            break;
-        }
-        let (sql, qualifier) = match catalog::view_definition(session, dialect, &parts, &context) {
-            catalog::ViewLookup::View { sql, qualifier } => (sql, qualifier),
-            catalog::ViewLookup::NotAView => {
-                out.plain_table |= own_columns;
-                continue;
-            },
-            catalog::ViewLookup::Unknown => continue,
-        };
-        let name = parts.join(".");
-        let view = renderer
-            .as_ref()
-            .and_then(|r| r.inspect_view(&sql, dialect).ok())
-            .filter(|v| v.parses);
-        let Some(view) = view else {
-            out.volatile = Some(format!("the view '{name}', which can't be inspected,").into());
-            out.all_columns = true;
-            continue;
-        };
-        if !view.repeatable {
-            // a volatile function, a `LIMIT`, rows picked in no set order
-            out.volatile = Some(format!("the view '{name}'").into());
-        }
-        let any_volatile = view.all_columns_volatile || !view.volatile_columns.is_empty();
-        match &view.output_columns {
-            Some(outputs)
-                if own_columns && !view.all_columns_volatile && outputs.len() == names.len() =>
-            {
-                for v in &view.volatile_columns {
-                    if let Some(i) = outputs.iter().position(|o| o.eq_ignore_ascii_case(v)) {
-                        out.columns.push(names[i].clone());
-                    }
-                }
-            },
-            // read through a query or another view: any of the source's columns may be one
-            _ if any_volatile => out.all_columns = true,
-            _ => {},
-        }
-        unknown.extend(view.unknown_functions);
-        // its own unqualified names resolve where it was found
-        pending.extend(
-            view.tables
-                .into_iter()
-                .map(|t| (t, qualifier.clone(), false)),
-        );
-    }
     // Functions defined in SQL (DuckDB macros, ClickHouse functions) are as volatile as
-    // their bodies, which may call others.
+    // their bodies, which may call others, and read views.
     let mut checked: PlHashSet<PlSmallStr> = PlHashSet::new();
-    for round in 0.. {
+    let mut round = 0;
+    'inspect: loop {
+        while let Some((parts, context, own_columns)) = pending.pop() {
+            let key = context
+                .iter()
+                .chain(&parts)
+                .map(|p| p.to_lowercase().into())
+                .collect();
+            if !seen.insert(key) {
+                continue;
+            }
+            if seen.len() > MAX_VIEW_LOOKUPS {
+                out.volatile = Some("one of the many views it reads".into());
+                out.all_columns = true;
+                break 'inspect;
+            }
+            let (sql, qualifier) =
+                match catalog::view_definition(session, dialect, &parts, &context) {
+                    catalog::ViewLookup::View { sql, qualifier } => (sql, qualifier),
+                    catalog::ViewLookup::NotAView => {
+                        out.plain_table |= own_columns;
+                        continue;
+                    },
+                    catalog::ViewLookup::Unknown => continue,
+                };
+            let name = parts.join(".");
+            let view = renderer
+                .as_ref()
+                .and_then(|r| r.inspect_view(&sql, dialect).ok())
+                .filter(|v| v.parses);
+            let Some(view) = view else {
+                out.volatile = Some(format!("the view '{name}', which can't be inspected,").into());
+                out.all_columns = true;
+                continue;
+            };
+            if !view.repeatable {
+                // a volatile function, a `LIMIT`, rows picked in no set order
+                out.volatile = Some(format!("the view '{name}'").into());
+            }
+            let any_volatile = view.all_columns_volatile || !view.volatile_columns.is_empty();
+            match &view.output_columns {
+                Some(outputs)
+                    if own_columns
+                        && !view.all_columns_volatile
+                        && outputs.len() == names.len() =>
+                {
+                    for v in &view.volatile_columns {
+                        if let Some(i) = outputs.iter().position(|o| o.eq_ignore_ascii_case(v)) {
+                            out.columns.push(names[i].clone());
+                        }
+                    }
+                },
+                // read through a query or another view: any of the source's columns may be one
+                _ if any_volatile => out.all_columns = true,
+                _ => {},
+            }
+            unknown.extend(view.unknown_functions);
+            // its own unqualified names resolve where it was found
+            pending.extend(
+                view.tables
+                    .into_iter()
+                    .map(|t| (t, qualifier.clone(), false)),
+            );
+        }
         let mut functions: Vec<PlSmallStr> =
             unknown.drain(..).filter(|n| !checked.contains(n)).collect();
         functions.sort();
@@ -2503,6 +2580,7 @@ fn source_volatility(
             out.volatile = Some(UNKNOWN_FUNCTIONS.into());
             break;
         }
+        round += 1;
         checked.extend(functions.iter().cloned());
         let Some(found) = catalog::volatile_functions(session, dialect, &functions) else {
             // the values of such a column aren't compared in the database on SQLite only,
@@ -2512,14 +2590,25 @@ fn source_volatility(
         };
         let mut volatile = found.volatile;
         for body in &found.bodies {
+            // a table macro's body is a query, a scalar one's an expression
+            let first = body
+                .trim_start()
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next();
+            let sql = match first.map(str::to_ascii_lowercase).as_deref() {
+                Some("select" | "with" | "from") => body.clone(),
+                _ => format!("SELECT {body}"),
+            };
             match renderer
                 .as_ref()
-                .and_then(|r| r.inspect_query(&format!("SELECT {body}"), dialect).ok())
+                .and_then(|r| r.inspect_query(&sql, dialect).ok())
                 .filter(|f| f.parses)
             {
                 Some(f) => {
                     volatile |= !f.repeatable;
                     unknown.extend(f.unknown_functions);
+                    // the views it reads (a view's columns aren't the source's then)
+                    pending.extend(f.tables.into_iter().map(|t| (t, vec![], false)));
                 },
                 None => volatile = true,
             }
@@ -2624,9 +2713,11 @@ fn resolve_partitions(
         },
         PartitionSpec::Auto { num_partitions } => {
             // A snapshot is one query until partitions can share one: never split
-            // automatically, so it doesn't start failing once the table grows.
+            // automatically, so it doesn't start failing once the table grows. Nor a
+            // volatile source (a view of `random()`): each partition would read other rows.
             if matches!(options.relation, DatabaseRelation::Query { .. })
                 || options.consistency == Consistency::Snapshot
+                || config.volatile_source
             {
                 return one();
             }

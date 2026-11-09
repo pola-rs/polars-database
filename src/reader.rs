@@ -26,6 +26,7 @@ use crate::database::backend::{
     open_backend, open_session_with_retries, retry_wait,
 };
 use crate::database::config::CompiledPartition;
+use crate::database::planner::check_unplanned_volatility;
 use crate::database::schema::cast_to_schema;
 use crate::database::{DatabaseScanConfig, catalog};
 use crate::ffi::{
@@ -206,6 +207,9 @@ pub struct Shared {
     config: Arc<DatabaseScanConfig>,
     /// Instantiated once per execution: re-checks that the planned backend exists here.
     backend: OnceLock<Arc<dyn DatabaseBackend>>,
+    /// The outcome of [`check_unplanned_volatility`], run on the first session opened:
+    /// whether the source turned out volatile.
+    volatility: OnceLock<Result<bool, String>>,
     pool: Mutex<Pool>,
     pool_changed: std::sync::Condvar,
     /// Set when the scan is torn down: threads still waiting for a session give up instead
@@ -219,6 +223,7 @@ impl Shared {
         Self {
             config,
             backend: OnceLock::new(),
+            volatility: OnceLock::new(),
             pool: Mutex::new(Pool::default()),
             pool_changed: std::sync::Condvar::new(),
             aborted: AtomicBool::new(false),
@@ -227,11 +232,26 @@ impl Shared {
 
     fn open_new(&self) -> PolarsResult<Box<dyn DatabaseSession>> {
         let backend = self.backend()?;
-        open_session_with_retries(
+        let mut session = open_session_with_retries(
             backend.as_ref(),
             &self.config.options.connection,
             self.config.dialect,
-        )
+        )?;
+        let checked = self.volatility.get_or_init(|| {
+            check_unplanned_volatility(session.as_mut(), &self.config).map_err(|e| match e {
+                PolarsError::InvalidOperation(msg) => msg.to_string(),
+                e => e.to_string(),
+            })
+        });
+        if let Err(e) = checked {
+            polars_bail!(InvalidOperation: "{e}");
+        }
+        Ok(session)
+    }
+
+    /// The source turned out volatile when read (`schema=`): it isn't repeatable.
+    fn found_volatile(&self) -> bool {
+        matches!(self.volatility.get(), Some(Ok(true)))
     }
 
     fn free_slot(&self) {
@@ -361,6 +381,7 @@ impl PartitionReader {
             .as_ref()
             .is_none_or(|c| c.repeatable);
         let mut session = self.shared.acquire(&self.cancelled)?;
+        let repeatable = repeatable && !self.shared.found_volatile();
         {
             // cancellable as the read is (see `PartitionStream::start`)
             let mut cancel = self.cancel.lock().unwrap();
@@ -470,7 +491,8 @@ impl PartitionReader {
             limited: config
                 .compiled
                 .as_ref()
-                .is_some_and(|c| c.limit.is_some() || !c.repeatable),
+                .is_some_and(|c| c.limit.is_some() || !c.repeatable)
+                || self.shared.found_volatile(),
             expected_rows: *self.n_rows.lock().unwrap(),
             counted_rows: self.counted_rows.lock().unwrap().take(),
             context: self.context(),

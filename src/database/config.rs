@@ -58,6 +58,9 @@ pub struct CompiledScan {
     /// For explain: e.g. `"16 (range on \"id\", bounds from MIN/MAX)"`.
     pub partitioning: PlSmallStr,
     pub pushed_filters: usize,
+    /// The columns the pushed filters compare.
+    #[serde(default)]
+    pub filter_columns: Vec<PlSmallStr>,
     pub exact_filters: usize,
     pub total_filters: usize,
     pub limit: Option<u64>,
@@ -91,6 +94,11 @@ pub struct DatabaseScanConfig {
     /// function sqlglot doesn't know): it may return other rows each time it runs.
     #[serde(default)]
     pub volatile_source: bool,
+    /// Planned under `schema=`, without I/O: the views the source reads and the functions
+    /// sqlglot doesn't know weren't inspected. The read does that on its first session
+    /// ([`check_unplanned_volatility`](super::planner::check_unplanned_volatility)).
+    #[serde(default)]
+    pub volatility_unchecked: bool,
     /// Partition bounds already queried, by the bounds SQL: optimizing the plan again
     /// (another `collect`, `explain`) doesn't query them again. The outer partitions are
     /// open-ended, so stale bounds only skew partition sizes, never lose rows.
