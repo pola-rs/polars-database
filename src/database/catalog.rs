@@ -840,8 +840,8 @@ impl CatalogQueries {
                 }
             },
             DialectName::Duckdb => {
-                // DuckDB resolves names case-insensitively, where `duckdb_places` says.
-                let rank = duckdb_rank(&duckdb_places(parts, &[]));
+                // DuckDB resolves names case-insensitively, where `duckdb_name_rank` says.
+                let rank = duckdb_name_rank(parts, &[]);
                 let n = s(name);
                 let duck_filter = format!(
                     "lower(table_name) = lower({n}) \
@@ -881,9 +881,9 @@ impl CatalogQueries {
 }
 
 /// The places (lower-cased database and schema, as SQL) where DuckDB looks for the
-/// relation `parts` (`[database.][schema.]name`), in order: an unqualified name in `temp`
-/// (a temporary table or view hides one of its name), then in the current database and
-/// schema; `a.b` in the schema `a` of the current database, else in the database `a`
+/// relation `parts` (`[database.][schema.]name`), in order: an unqualified name in the
+/// current database and schema (see [`duckdb_name_rank`] for the rest of its search);
+/// `a.b` in the schema `a` of the current database, else in the database `a`
 /// (an attached one) and its schema `main`, as DuckDB resolves it. `context`: the
 /// database and schema of the view naming it, where its own names resolve instead of the
 /// current ones.
@@ -897,15 +897,36 @@ fn duckdb_places(parts: &[PlSmallStr], context: &[PlSmallStr]) -> Vec<(String, S
         ),
     };
     match parts {
-        [_] if context.len() == 2 => vec![(current_db, current_schema)],
-        [_] => vec![
-            ("'temp'".to_string(), "'main'".to_string()),
-            (current_db, current_schema),
-        ],
+        [_] => vec![(current_db, current_schema)],
         [a, _] => vec![(current_db, s(a)), (s(a), "'main'".to_string())],
         [.., db, sc, _] => vec![(s(db), s(sc))],
         [] => vec![],
     }
+}
+
+/// The position of a row's `database_name`, `schema_name` where DuckDB resolves `parts`
+/// (NULL if nowhere), as SQL. An unqualified name, outside a view's own context, follows
+/// the whole `search_path` (`SET search_path = 's1,s2'`; an entry is a schema of the
+/// current database, an attached database's `main`, or `database.schema`) after `temp`,
+/// then the current schema and `main`; the rest is [`duckdb_places`].
+fn duckdb_name_rank(parts: &[PlSmallStr], context: &[PlSmallStr]) -> String {
+    if parts.len() != 1 || !context.is_empty() {
+        return duckdb_rank(&duckdb_places(parts, context));
+    }
+    // (`system.main.lower`: a user's macro named `lower` doesn't hijack the lookup; list
+    // comprehensions, as the lambda syntax differs before DuckDB 1.3)
+    let lower = "system.main.lower";
+    let paths = format!(
+        "list_append(list_append([{lower}(trim(e, ' \"')) FOR e IN \
+        string_split(current_setting('search_path'), ',')], \
+        {lower}(current_database() || '.' || current_schema())), 'main')"
+    );
+    format!(
+        "CASE WHEN {lower}(database_name) = 'temp' AND {lower}(schema_name) = 'main' THEN 0 ELSE \
+        nullif(list_position([({lower}(database_name) = {lower}(current_database()) \
+        AND {lower}(schema_name) = p) OR ({lower}(database_name) = p AND {lower}(schema_name) = 'main') \
+        OR {lower}(database_name) || '.' || {lower}(schema_name) = p FOR p IN {paths}], true), 0) END"
+    )
 }
 
 /// The position of a row's `database_name`, `schema_name` among `places` (NULL if none).
@@ -1027,10 +1048,10 @@ pub fn view_definition(
             schema.map_or_else(|| "DATABASE()".to_string(), s),
             s(name)
         ),
-        // The first place the name resolves in (`duckdb_places`): a temporary view hides
+        // The first place the name resolves in (`duckdb_name_rank`): a temporary view hides
         // a table of its name.
         DialectName::Duckdb => {
-            let rank = duckdb_rank(&duckdb_places(parts, context));
+            let rank = duckdb_name_rank(parts, context);
             format!(
                 "SELECT is_view, sql, database_name, schema_name FROM (\
                 SELECT {rank} AS r, 0 AS o, true AS is_view, sql, database_name, schema_name \
@@ -1128,11 +1149,14 @@ pub struct FunctionLookup {
 /// Whether any of the functions `names` (lower-cased) may return other values each time
 /// it runs, by the catalog's word: `None` where the dialect has no lookup, or it failed.
 /// A name the catalog doesn't list is taken to be a built-in function: the volatile ones
-/// sqlglot doesn't know are listed in `_VOLATILE_FUNCTIONS`.
+/// sqlglot doesn't know are listed in `_VOLATILE_FUNCTIONS`. `replaceable`, some of
+/// `names`, are built-ins the parser knows: only a user's function of the name counts
+/// (SQLite, DuckDB), which runs instead of the built-in.
 pub fn volatile_functions(
     session: &mut dyn DatabaseSession,
     dialect: DialectName,
     names: &[PlSmallStr],
+    replaceable: &[PlSmallStr],
 ) -> Option<FunctionLookup> {
     if names.is_empty() {
         return Some(FunctionLookup::default());
@@ -1142,6 +1166,15 @@ pub fn volatile_functions(
         .map(|n| dialect.quote_str(n))
         .collect::<Vec<_>>()
         .join(", ");
+    let builtins = if replaceable.is_empty() {
+        dialect.quote_str("")
+    } else {
+        replaceable
+            .iter()
+            .map(|n| dialect.quote_str(n))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let upper = names
         .iter()
         .map(|n| dialect.quote_str(&n.to_uppercase()))
@@ -1163,17 +1196,21 @@ pub fn volatile_functions(
             AND LOWER(ROUTINE_NAME) IN ({list}) AND IS_DETERMINISTIC <> 'YES'"
         ),
         // the connection's functions (a live one's own among them), with
-        // `SQLITE_DETERMINISTIC` (0x800) or not; one it doesn't have fails the read
+        // `SQLITE_DETERMINISTIC` (0x800) or not; one it doesn't have fails the read.
+        // Names compare by collation: the user's `lower()` may be what is being asked.
         DialectName::Sqlite => format!(
             "SELECT COUNT(*) FROM pragma_function_list \
-            WHERE lower(name) IN ({list}) AND (flags & 2048) = 0"
+            WHERE name COLLATE NOCASE IN ({list}) AND (flags & 2048) = 0 \
+            AND (builtin = 0 OR name COLLATE NOCASE NOT IN ({builtins}))"
         ),
         // macros have no stability: their bodies say
         DialectName::Duckdb => format!(
             "SELECT 0, macro_definition FROM duckdb_functions() \
-            WHERE lower(function_name) IN ({list}) AND function_type IN ('macro', 'table_macro') \
+            WHERE function_name COLLATE NOCASE IN ({list}) AND function_type IN ('macro', 'table_macro') \
+            AND (NOT internal OR function_name COLLATE NOCASE NOT IN ({builtins})) \
             UNION ALL SELECT COUNT(*), NULL FROM duckdb_functions() \
-            WHERE lower(function_name) IN ({list}) \
+            WHERE function_name COLLATE NOCASE IN ({list}) \
+            AND (NOT internal OR function_name COLLATE NOCASE NOT IN ({builtins})) \
             AND stability IN ('VOLATILE', 'CONSISTENT_WITHIN_QUERY')"
         ),
         // the user's executable functions may do anything; a SQL one is `f AS (x) -> body`
@@ -1305,11 +1342,7 @@ mod tests {
             "lower(current_schema())".to_string(),
         );
         let main = "'main'".to_string();
-        // a temporary relation first
-        assert_eq!(
-            places(&["t"], &[]),
-            [("'temp'".to_string(), main.clone()), current.clone()]
-        );
+        assert_eq!(places(&["t"], &[]), std::slice::from_ref(&current));
         // `a.t`: the schema `a`, else the (attached) database `a`
         assert_eq!(
             places(&["a", "t"], &[]),
@@ -1327,6 +1360,11 @@ mod tests {
             places(&["t"], &["d", "s"]),
             [("lower('d')".to_string(), "lower('s')".to_string())]
         );
+        // an unqualified name: `temp` first, then the whole search path
+        let rank = duckdb_name_rank(&["t".into()], &[]);
+        assert!(rank.contains("current_setting('search_path')"), "{rank}");
+        let rank = duckdb_name_rank(&["t".into()], &["d".into(), "s".into()]);
+        assert!(!rank.contains("search_path"), "{rank}");
         let rank = duckdb_rank(&places(&["a", "t"], &[]));
         assert!(
             rank.starts_with("CASE WHEN lower(database_name) = "),

@@ -132,8 +132,10 @@ impl Resolver {
                     if exact {
                         applied.push(i as u64);
                     }
+                    // those the translated predicate compares: a conjunct dropped from it
+                    // isn't compared in the database
                     let mut columns = vec![];
-                    node.columns(&mut columns);
+                    translator.pushed_columns(&node, &mut columns);
                     pushdown.filters.push(PushedFilter {
                         expr,
                         exact,

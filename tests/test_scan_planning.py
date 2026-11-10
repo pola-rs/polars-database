@@ -1109,6 +1109,14 @@ def test_unknown_functions_and_tables() -> None:
         "sqlite",
     )
     assert facts["unknown_functions"] == ["myrand", "other"]
+    # where a user's function may replace a built-in, the known ones are listed too
+    assert "abs" in facts["known_functions"]
+    # (also those as written: `instr` is `STRPOS` to sqlglot)
+    assert (
+        "instr"
+        in inspect_query("SELECT instr(a, b) FROM t", "sqlite")["known_functions"]
+    )
+    assert inspect_query("SELECT abs(x) FROM t", "postgres")["known_functions"] == []
     assert sorted(facts["tables"]) == [["s", "t"], ["v"]]
     # a CTE hides a table of its name only where it is in scope; unquoted names fold
     # as the dialect folds them; a table function may be a (parameterized) view

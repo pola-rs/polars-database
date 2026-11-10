@@ -2676,6 +2676,165 @@ def test_scan_duckdb_live_connection_sees_its_temporary_objects() -> None:
         conn.close()
 
 
+def test_scan_duckdb_connections_are_read_as_they_are(tmp_path: Path) -> None:
+    # The read ran on a cursor, a connection of its own: a live connection's uncommitted
+    # row wasn't read, and a factory's connection with a temporary table of the name of
+    # a stored one read the stored one
+    duckdb = pytest.importorskip("duckdb")
+    conn = duckdb.connect()
+    try:
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.execute("INSERT INTO t VALUES (1)")
+        conn.execute("BEGIN")
+        conn.execute("INSERT INTO t VALUES (2)")
+        assert sorted(pl.scan_database("t", conn).collect()["id"].to_list()) == [1, 2]
+        assert conn.execute("SELECT count(*) FROM t").fetchall() == [(2,)]
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as stored:
+        stored.execute("CREATE TABLE t AS SELECT 1 AS id")
+
+    def factory() -> Any:
+        c = duckdb.connect(path)
+        c.execute("CREATE TEMP TABLE t AS SELECT 99 AS id")
+        return c
+
+    assert pl.scan_database("t", factory).collect()["id"].to_list() == [99]
+
+
+def test_scan_duckdb_views_are_found_along_the_search_path() -> None:
+    # A name resolves in `temp`, then the current schema only: with a temporary object
+    # present and `search_path = 's1,s2'`, a view of `random()` in `s2` was taken for a
+    # table, and partitions of it returned other rows each (lost and duplicated ids)
+    duckdb = pytest.importorskip("duckdb")
+    conn = duckdb.connect()
+    try:
+        conn.execute("CREATE SCHEMA s1")
+        conn.execute("CREATE SCHEMA s2")
+        conn.execute("CREATE TABLE s2.ids AS SELECT range AS id FROM range(1000)")
+        conn.execute("CREATE VIEW s2.v AS SELECT id, random() AS r FROM s2.ids")
+        conn.execute("CREATE TEMP TABLE other AS SELECT 1 AS id")
+        conn.execute("SET search_path = 's1,s2'")
+        assert pl.scan_database("v", conn).collect().height == 1000
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+            pl.scan_database("v", conn, partition_on="id", partition_num=4).collect()
+        # a table of the name earlier in the path hides it
+        conn.execute("CREATE TABLE s1.v AS SELECT range AS id FROM range(10)")
+        lf = pl.scan_database("v", conn, partition_on="id", partition_num=2)
+        assert sorted(lf.collect()["id"].to_list()) == list(range(10))
+    finally:
+        conn.close()
+
+
+def test_scan_sqlite_user_function_replacing_a_built_in(tmp_path: Path) -> None:
+    # `abs` is a function sqlglot knows, but `create_function` replaces it: a query of
+    # it was taken as stable (partitions lost rows, a filter on it was run in the database,
+    # which calls it again)
+    import random
+
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path, check_same_thread=False)) as live:
+        live.execute("CREATE TABLE t (id INTEGER)")
+        live.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(200)])
+        live.commit()
+        live.execute("CREATE VIEW va AS SELECT id, abs(id) AS r FROM t")
+        live.execute("CREATE VIEW vl AS SELECT id, lower(id) AS r FROM t")
+        live.create_function("abs", 1, lambda _: random.uniform(-1, 1))
+        # (the lookup of functions by name doesn't call the user's `lower()` either)
+        live.create_function("lower", 1, lambda _: random.uniform(-1, 1))
+        for source in ["va", "vl"]:
+            with pytest.raises(
+                pl.exceptions.InvalidOperationError, match="partitioned"
+            ):
+                pl.scan_database(
+                    source, live, partition_on="id", partition_num=4
+                ).collect()
+        # a function sqlglot knows under another name, and an operator that calls one
+        live.create_function("instr", 2, lambda *_: random.uniform(-1, 1))
+        live.create_function("like", 2, lambda *_: random.randint(0, 1))
+        for source in [
+            "SELECT id, instr(id, 1) AS r FROM t",
+            "SELECT id, id LIKE '1%' AS r FROM t",
+        ]:
+            with pytest.raises(
+                pl.exceptions.InvalidOperationError, match="partitioned"
+            ):
+                pl.scan_database(
+                    source, live, partition_on="id", partition_num=4
+                ).collect()
+        query = "SELECT id, abs(id) AS r FROM t"
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="abs"):
+            pl.scan_database(query, live, partition_on="id", partition_num=4).collect()
+        df = pl.scan_database(query, live).filter(pl.col("r") > 0).collect()
+        assert (df["r"] > 0).all()
+    # the built-in one is as stable as before
+    lf = pl.scan_database(
+        "SELECT id, abs(id) AS d FROM t",
+        f"sqlite:///{path}",
+        partition_on="id",
+        partition_num=4,
+    )
+    assert sorted(lf.collect()["id"].to_list()) == list(range(200))
+
+
+def test_scan_duckdb_macro_replacing_a_built_in(tmp_path: Path) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE TABLE ids AS SELECT range AS id FROM range(300)")
+    uri = f"duckdb:///{path}"
+    query = "SELECT id, abs(id) AS a FROM ids"
+    lf = pl.scan_database(query, uri, partition_on="id", partition_num=4)
+    assert sorted(lf.collect()["id"].to_list()) == list(range(300))
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE MACRO abs(x) AS random()")
+    with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+        pl.scan_database(query, uri, partition_on="id", partition_num=4).collect()
+    # names sqlglot knows as another (`ltrim`), and `lower`, which the lookups call too
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE MACRO ltrim(x) AS random()::VARCHAR")
+        conn.execute("CREATE MACRO lower(x) AS random()::VARCHAR")
+    for query in [
+        "SELECT id, ltrim(id::VARCHAR) AS a FROM ids",
+        "SELECT id, lower(id::VARCHAR) AS a FROM ids",
+    ]:
+        lf = pl.scan_database(query, uri, partition_on="id", partition_num=4)
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+            lf.collect()
+
+
+def test_scan_sqlite_partly_pushed_filter_on_a_volatile_column_under_schema(
+    tmp_path: Path,
+) -> None:
+    # Only the stable `id` conditions of `(id < 10 & s.starts_with(..)) | id == 20` are
+    # pushed; the filter was rejected for the column `s` it names, which isn't compared
+    # in the database
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE ids (id INTEGER PRIMARY KEY)")
+        conn.executemany("INSERT INTO ids VALUES (?)", [(i,) for i in range(300)])
+        conn.execute(
+            "CREATE VIEW v AS SELECT id, printf('%d', random()) AS s, random() AS r FROM ids"
+        )
+        conn.commit()
+    lf = pl.scan_database(
+        "v",
+        f"sqlite:///{path}",
+        schema={"id": pl.Int64, "s": pl.String, "r": pl.Int64},
+    )
+    pred = ((pl.col("id") < 10) & pl.col("s").str.starts_with("-")) | (
+        pl.col("id") == 20
+    )
+    df = lf.filter(pred).collect()
+    assert set(df["id"].to_list()) <= set(range(10)) | {20}
+    assert (df.filter(pl.col("id") != 20)["s"].str.starts_with("-")).all()
+    # a filter on the column itself is still refused
+    with pytest.raises(pl.exceptions.InvalidOperationError, match="a filter on 'r'"):
+        lf.filter(pl.col("r") > 0).collect()
+
+
 def test_scan_duckdb_two_part_names_of_an_attached_database(tmp_path: Path) -> None:
     # `db.v` names the schema `db` of the current database, or else the attached
     # database `db` (its schema `main`), as DuckDB resolves it; it was only taken for a

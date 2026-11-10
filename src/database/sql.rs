@@ -310,6 +310,9 @@ pub struct QueryFacts {
     /// Lower-cased names of the functions the parser doesn't know: the database says
     /// whether they are volatile ([`volatile_functions`](super::catalog::volatile_functions)).
     pub unknown_functions: Vec<PlSmallStr>,
+    /// Lower-cased names of the functions it knows, on a database where a user's function
+    /// may replace one (SQLite, DuckDB): the database says whether one did.
+    pub known_functions: Vec<PlSmallStr>,
     /// The tables (or views) it reads, `[catalog.][schema.]name` as written; not its CTEs.
     pub tables: Vec<Vec<PlSmallStr>>,
     /// The query without the semicolons and comments after its last token, if it parses.

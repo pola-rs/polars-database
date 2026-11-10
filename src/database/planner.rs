@@ -2550,6 +2550,8 @@ fn source_volatility(
     let mut unknown: Vec<PlSmallStr> = facts
         .map(|f| f.unknown_functions.clone())
         .unwrap_or_default();
+    // the functions the parser knows, which a user's may have replaced
+    let mut known: Vec<PlSmallStr> = facts.map(|f| f.known_functions.clone()).unwrap_or_default();
     // (the relation, the qualifier of the view naming it, whether its columns are the
     // source's)
     let mut pending: Vec<(Vec<PlSmallStr>, Vec<PlSmallStr>, bool)> = match relation {
@@ -2648,6 +2650,7 @@ fn source_volatility(
                 _ => {},
             }
             unknown.extend(view.unknown_functions);
+            known.extend(view.known_functions);
             // its own unqualified names resolve where it was found
             pending.extend(
                 view.tables
@@ -2659,7 +2662,13 @@ fn source_volatility(
             unknown.drain(..).filter(|n| !checked.contains(n)).collect();
         functions.sort();
         functions.dedup();
-        if functions.is_empty() {
+        let mut replaceable: Vec<PlSmallStr> = known
+            .drain(..)
+            .filter(|n| !checked.contains(n) && functions.binary_search(n).is_err())
+            .collect();
+        replaceable.sort();
+        replaceable.dedup();
+        if functions.is_empty() && replaceable.is_empty() {
             break;
         }
         if round == MAX_FUNCTION_ROUNDS {
@@ -2667,8 +2676,10 @@ fn source_volatility(
             break;
         }
         round += 1;
-        checked.extend(functions.iter().cloned());
-        let Some(found) = catalog::volatile_functions(session, dialect, &functions) else {
+        checked.extend(functions.iter().chain(&replaceable).cloned());
+        functions.extend(replaceable.iter().cloned());
+        let Some(found) = catalog::volatile_functions(session, dialect, &functions, &replaceable)
+        else {
             // the values of such a column aren't compared in the database on SQLite only,
             // as without the lookup (`_volatile_columns`)
             out.volatile = Some(UNKNOWN_FUNCTIONS.into());
@@ -2693,6 +2704,7 @@ fn source_volatility(
                 Some(f) => {
                     volatile |= !f.repeatable;
                     unknown.extend(f.unknown_functions);
+                    known.extend(f.known_functions);
                     // the views it reads (a view's columns aren't the source's then)
                     pending.extend(f.tables.into_iter().map(|t| (t, vec![], false)));
                 },

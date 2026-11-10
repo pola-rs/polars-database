@@ -850,6 +850,37 @@ def _unknown_functions(stmt: Any, dialect: str | None) -> list[str]:
     )
 
 
+# Where the user can replace a built-in function (SQLite's `create_function`, a DuckDB
+# macro or Python function), so that the name sqlglot knows runs something else
+_OVERRIDABLE_DIALECTS = frozenset({"sqlite", "duckdb"})
+
+
+def _known_functions(stmt: Any, tokens: list[Any], dialect: str | None) -> list[str]:
+    """
+    Lower-cased names of the functions of the query that a user's function of the name
+    may replace (`_OVERRIDABLE_DIALECTS`): the database says if one does. Those sqlglot
+    knows under another name (`instr`, `ltrim`), as written, and `LIKE` / `GLOB`, which
+    SQLite runs as the functions of the name.
+    """
+    if dialect not in _OVERRIDABLE_DIALECTS:
+        return []
+    names: set[str] = set()
+    for f in stmt.find_all(exp.Func):
+        if not isinstance(f, exp.Anonymous):
+            names.update(n.lower() for n in f.sql_names() if n.isidentifier())
+    for t, nxt in zip(tokens, tokens[1:], strict=False):
+        if nxt.token_type == sqlglot.TokenType.L_PAREN and t.text.isidentifier():
+            names.add(t.text.lower())
+    if dialect == "sqlite":
+        if stmt.find(exp.Like, exp.ILike) is not None:
+            names.add("like")
+        if stmt.find(exp.Glob) is not None:
+            names.add("glob")
+    # syntax, not a function a user's can replace
+    names.discard("cast")
+    return sorted(names)
+
+
 def _volatile_columns(stmt: Any, calls: list[Any]) -> list[str] | None:
     """
     The output columns whose values come from volatile functions, `None` if that can't be
@@ -898,6 +929,7 @@ def _no_facts() -> dict[str, Any]:
         "volatile_columns": [],
         "all_columns_volatile": False,
         "unknown_functions": [],
+        "known_functions": [],
         "tables": [],
         "body": None,
     }
@@ -1050,6 +1082,7 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
     # The database says whether these are volatile (`catalog::volatile_functions`): a
     # user's function may be (`random()` inside), and each partition would run it again.
     facts["unknown_functions"] = _unknown_functions(stmt, dialect)
+    facts["known_functions"] = _known_functions(stmt, tokens, dialect)
     # A view among them may call a volatile function (`catalog::view_definition`).
     facts["tables"] = _tables(stmt, dialect)
     # anywhere in the query: a nested LIMIT without a unique ORDER BY picks rows too

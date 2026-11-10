@@ -94,6 +94,10 @@ impl SqlglotRenderer {
                 Some(v) if !v.is_none() => v.extract()?,
                 _ => vec![],
             };
+            let known_functions: Vec<String> = match d.get_item("known_functions")? {
+                Some(v) if !v.is_none() => v.extract()?,
+                _ => vec![],
+            };
             let tables: Vec<Vec<String>> = match d.get_item("tables")? {
                 Some(v) if !v.is_none() => v.extract()?,
                 _ => vec![],
@@ -113,6 +117,7 @@ impl SqlglotRenderer {
                 volatile_columns: volatile_columns.into_iter().map(Into::into).collect(),
                 all_columns_volatile: get("all_columns_volatile")?,
                 unknown_functions: unknown_functions.into_iter().map(Into::into).collect(),
+                known_functions: known_functions.into_iter().map(Into::into).collect(),
                 tables: tables
                     .into_iter()
                     .map(|t| t.into_iter().map(Into::into).collect())
