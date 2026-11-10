@@ -855,6 +855,22 @@ def _unknown_functions(stmt: Any, dialect: str | None) -> list[str]:
 _OVERRIDABLE_DIALECTS = frozenset({"sqlite", "duckdb"})
 
 
+# The functions that run for an operator the user can replace, by the operator's token
+_OPERATOR_FUNCTIONS = {
+    "sqlite": {"regexp": "regexp", "match": "match"},
+    "duckdb": {
+        "like": "~~",
+        "ilike": "~~*",
+        "glob": "~~~",
+        "similar": "regexp_full_match",
+        "extract": "date_part",
+        "//": "//",
+        "%": "%",
+        "-": "-",
+    },
+}
+
+
 def _known_functions(stmt: Any, tokens: list[Any], dialect: str | None) -> list[str]:
     """
     Lower-cased names of the functions of the query that a user's function of the name
@@ -868,9 +884,18 @@ def _known_functions(stmt: Any, tokens: list[Any], dialect: str | None) -> list[
     for f in stmt.find_all(exp.Func):
         if not isinstance(f, exp.Anonymous):
             names.update(n.lower() for n in f.sql_names() if n.isidentifier())
-    for t, nxt in zip(tokens, tokens[1:], strict=False):
-        if nxt.token_type == sqlglot.TokenType.L_PAREN and t.text.isidentifier():
-            names.add(t.text.lower())
+    operators = _OPERATOR_FUNCTIONS.get(dialect, {})
+    for i, t in enumerate(tokens):
+        word = t.text.lower()
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+        if nxt is not None and nxt.token_type == sqlglot.TokenType.L_PAREN:
+            if t.text.isidentifier():
+                names.add(word)
+            if word == "count" and dialect == "duckdb" and i + 2 < len(tokens):
+                if tokens[i + 2].token_type == sqlglot.TokenType.STAR:
+                    names.add("count_star")
+        if word in operators:
+            names.add(operators[word])
     if dialect == "sqlite":
         if stmt.find(exp.Like, exp.ILike) is not None:
             names.add("like")

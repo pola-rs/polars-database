@@ -1423,6 +1423,34 @@ def _cancel_target(conn: Any) -> Any:
     return conn
 
 
+def _duckdb_needs_connection(conn: Any) -> bool:
+    """
+    Whether a DuckDB connection has what its cursors (connections of their own) don't
+    see: temporary tables, views, macros or sequences, or an open transaction (its
+    uncommitted writes). False if it can't be told, as with a result of the user's left
+    unread: a cursor then.
+    """
+    temp = "database_name = 'temp'"
+    sql = (
+        f"SELECT EXISTS (SELECT 1 FROM duckdb_tables() WHERE {temp}) "
+        f"OR EXISTS (SELECT 1 FROM duckdb_views() WHERE {temp} AND NOT internal) "
+        f"OR EXISTS (SELECT 1 FROM duckdb_sequences() WHERE {temp}) "
+        f"OR EXISTS (SELECT 1 FROM duckdb_functions() WHERE {temp} "
+        "AND function_type IN ('macro', 'table_macro'))"
+    )
+    try:
+        # whole: DuckDB 2 refuses other work on a connection with a result left unread
+        rows = conn.execute(sql).fetchall()
+        if rows and rows[0][0]:
+            return True
+        # outside a transaction each statement is one of its own
+        first = conn.execute("SELECT txid_current()").fetchall()
+        second = conn.execute("SELECT txid_current()").fetchall()
+    except Exception:
+        return False
+    return first == second
+
+
 def _postgres_family(conn: Any) -> bool:
     """Whether a connection is a Postgres one, where a failed statement aborts the
     transaction it runs in."""
@@ -1889,13 +1917,15 @@ class _Session:
                 cx = ConnectionExecutor(cursor if cursor is not None else self.conn)
                 # A DuckDB cursor is a connection of its own: it sees neither the
                 # user's connection's temporary tables, views and macros nor its
-                # uncommitted writes (a factory's connection has the same). So the
-                # statement runs on that connection, and its result is read whole
-                # here (another statement on it, another scan's, would end it).
+                # uncommitted writes (a factory's connection has the same). Where it
+                # has any, the statement runs on that connection, and its result is
+                # read whole here (another statement on it, another scan's, would end
+                # it). (A failing statement then aborts an open transaction.)
                 on_connection = (
                     (not self.owned or self.factory)
                     and cx.driver_name == "duckdb"
                     and _module_of(self.conn) == "duckdb"
+                    and _duckdb_needs_connection(self.conn)
                 )
                 if on_connection:
                     with contextlib.suppress(Exception):

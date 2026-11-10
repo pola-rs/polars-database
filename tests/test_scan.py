@@ -2704,6 +2704,112 @@ def test_scan_duckdb_connections_are_read_as_they_are(tmp_path: Path) -> None:
     assert pl.scan_database("t", factory).collect()["id"].to_list() == [99]
 
 
+def test_scan_duckdb_live_connection_with_an_unread_result() -> None:
+    # Without temporary objects or a transaction the scan reads on a cursor, which works
+    # while the user's own result isn't read to the end (`fetchone()` of a count)
+    duckdb = pytest.importorskip("duckdb")
+    conn = duckdb.connect()
+    try:
+        conn.execute("CREATE TABLE t AS SELECT range AS id FROM range(100)")
+        conn.execute("SELECT id FROM t").fetchone()
+        assert pl.scan_database("t", conn).collect().height == 100
+        lf = pl.scan_database("t", conn, partition_on="id", partition_num=4)
+        assert lf.collect().height == 100
+    finally:
+        conn.close()
+
+
+def test_scan_duckdb_catalog_lookups_survive_macros_of_their_helpers() -> None:
+    # A user's macro named like a function the plugin's own lookups call must not make
+    # a view look like a table
+    duckdb = pytest.importorskip("duckdb")
+    for helper in [
+        "lower(x) AS NULL",
+        "list_position(l, x) AS 0",
+        "list_append(l, x) AS l",
+        "current_database() AS 'zzz'",
+        "nullif(a, b) AS NULL",
+    ]:
+        conn = duckdb.connect()
+        try:
+            conn.execute("CREATE TABLE t AS SELECT range AS id FROM range(1000)")
+            conn.execute("CREATE VIEW rv AS SELECT id, random() AS r FROM t")
+            conn.execute("CREATE TEMP TABLE o AS SELECT 1 AS id")
+            conn.execute(f"CREATE MACRO {helper}")
+            lf = pl.scan_database("rv", conn, partition_on="id", partition_num=3)
+            with pytest.raises(
+                pl.exceptions.InvalidOperationError, match="partitioned"
+            ):
+                lf.collect()
+        finally:
+            conn.close()
+
+
+def test_scan_duckdb_macros_of_operators_and_rewritten_functions(
+    tmp_path: Path,
+) -> None:
+    # sqlglot turns `LIKE`, `extract(…)`, `count(*)` into other calls than the user's
+    # macros of the names DuckDB runs for them (`~~`, `date_part`, `count_star`)
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE t AS SELECT range AS id, 'a' || range AS s, "
+            "DATE '2020-01-01' + range::INT AS dt FROM range(300)"
+        )
+        conn.execute('CREATE MACRO "~~"(a, b) AS (random() < 0.5)::BIGINT::BOOLEAN')
+        conn.execute("CREATE MACRO date_part(a, b) AS (random() * 10)::BIGINT")
+    uri = f"duckdb:///{path}"
+    for query in [
+        "SELECT id FROM t WHERE s LIKE 'a%'",
+        "SELECT id FROM t WHERE extract(year FROM dt) = 1",
+    ]:
+        lf = pl.scan_database(query, uri, partition_on="id", partition_num=4)
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+            lf.collect()
+
+
+def test_scan_sqlite_regexp_and_match_operators_call_the_users_functions(
+    tmp_path: Path,
+) -> None:
+    import random
+
+    path = tmp_path / "t.db"
+    with closing(sqlite3.connect(path, check_same_thread=False)) as live:
+        live.execute("CREATE TABLE t (id INTEGER, s TEXT)")
+        live.executemany("INSERT INTO t VALUES (?, 'a')", [(i,) for i in range(200)])
+        live.create_function("regexp", 2, lambda *_: random.randint(0, 1))
+        lf = pl.scan_database(
+            "SELECT id FROM t WHERE s REGEXP 'a'",
+            live,
+            partition_on="id",
+            partition_num=4,
+        )
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+            lf.collect()
+        # (a user's `count()` doesn't hijack the lookup of the functions)
+        live.create_aggregate(
+            "count",
+            0,
+            type(
+                "C",
+                (),
+                {
+                    "step": lambda self: None,
+                    "finalize": lambda self: random.randint(0, 1),
+                },
+            ),
+        )
+        lf = pl.scan_database(
+            "SELECT id FROM t WHERE s REGEXP 'a'",
+            live,
+            partition_on="id",
+            partition_num=4,
+        )
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+            lf.collect()
+
+
 def test_scan_duckdb_views_are_found_along_the_search_path() -> None:
     # A name resolves in `temp`, then the current schema only: with a temporary object
     # present and `search_path = 's1,s2'`, a view of `random()` in `s2` was taken for a

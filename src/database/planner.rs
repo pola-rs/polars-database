@@ -2522,7 +2522,7 @@ const UNKNOWN_FUNCTIONS: &str = "a function sqlglot doesn't know (it may be a us
 /// the rounds of SQL-defined functions it looks through, at most: one past this is taken to
 /// be volatile.
 const MAX_VIEW_LOOKUPS: usize = 32;
-const MAX_FUNCTION_ROUNDS: usize = 8;
+const MAX_FUNCTION_ROUNDS: usize = 32;
 
 /// Whether reading the source runs a volatile function that its SQL doesn't show: one in
 /// a view it reads (the database runs a view's query each time; SQLite and MySQL merge it
@@ -2677,9 +2677,15 @@ fn source_volatility(
         }
         round += 1;
         checked.extend(functions.iter().chain(&replaceable).cloned());
+        let only_replaceable = functions.is_empty();
         functions.extend(replaceable.iter().cloned());
         let Some(found) = catalog::volatile_functions(session, dialect, &functions, &replaceable)
         else {
+            if only_replaceable {
+                // built-ins as far as is known: a database that can't list its functions
+                // (an old SQLite) is no reason to refuse every query that calls one
+                continue;
+            }
             // the values of such a column aren't compared in the database on SQLite only,
             // as without the lookup (`_volatile_columns`)
             out.volatile = Some(UNKNOWN_FUNCTIONS.into());
