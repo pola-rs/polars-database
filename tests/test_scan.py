@@ -2759,9 +2759,13 @@ def test_scan_duckdb_macros_of_operators_and_rewritten_functions(
         )
         conn.execute('CREATE MACRO "~~"(a, b) AS (random() < 0.5)::BIGINT::BOOLEAN')
         conn.execute("CREATE MACRO date_part(a, b) AS (random() * 10)::BIGINT")
+        conn.execute('CREATE MACRO "!~~"(a, b) AS (random() < 0.5)')
+        conn.execute('CREATE MACRO "/"(a, b) AS (random() * 10)::BIGINT')
     uri = f"duckdb:///{path}"
     for query in [
         "SELECT id FROM t WHERE s LIKE 'a%'",
+        "SELECT id FROM t WHERE s NOT LIKE 'a%'",
+        "SELECT id FROM t WHERE id / 3 = 1",
         "SELECT id FROM t WHERE extract(year FROM dt) = 1",
     ]:
         lf = pl.scan_database(query, uri, partition_on="id", partition_num=4)

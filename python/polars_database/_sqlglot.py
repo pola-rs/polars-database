@@ -859,14 +859,28 @@ _OVERRIDABLE_DIALECTS = frozenset({"sqlite", "duckdb"})
 _OPERATOR_FUNCTIONS = {
     "sqlite": {"regexp": "regexp", "match": "match"},
     "duckdb": {
+        # (`NOT LIKE` runs `!~~`; `SIMILAR TO` is one token)
         "like": "~~",
         "ilike": "~~*",
         "glob": "~~~",
-        "similar": "regexp_full_match",
+        "similar to": "regexp_full_match",
         "extract": "date_part",
         "//": "//",
         "%": "%",
         "-": "-",
+        "^": "^",
+        "&": "&",
+        "<<": "<<",
+        "&&": "&&",
+        "->>": "->>",
+        "@": "@",
+        "||": "||",
+        "/": "/",
+        ">>": ">>",
+        "|": "|",
+        "**": "**",
+        "^@": "^@",
+        "@>": "@>",
     },
 }
 
@@ -889,13 +903,21 @@ def _known_functions(stmt: Any, tokens: list[Any], dialect: str | None) -> list[
         word = t.text.lower()
         nxt = tokens[i + 1] if i + 1 < len(tokens) else None
         if nxt is not None and nxt.token_type == sqlglot.TokenType.L_PAREN:
-            if t.text.isidentifier():
+            # (not a keyword: `IN (`, `FROM (`, `AS (`, `OVER (`)
+            if t.text.isidentifier() and t.token_type in (
+                sqlglot.TokenType.VAR,
+                sqlglot.TokenType.IDENTIFIER,
+            ):
                 names.add(word)
             if word == "count" and dialect == "duckdb" and i + 2 < len(tokens):
                 if tokens[i + 2].token_type == sqlglot.TokenType.STAR:
                     names.add("count_star")
         if word in operators:
             names.add(operators[word])
+            if dialect == "duckdb" and word in ("like", "ilike", "glob"):
+                names.add("!" + operators[word])
+        if dialect == "duckdb" and word == "escape":
+            names.update(("like_escape", "not_like_escape", "ilike_escape"))
     if dialect == "sqlite":
         if stmt.find(exp.Like, exp.ILike) is not None:
             names.add("like")

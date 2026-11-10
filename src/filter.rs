@@ -504,7 +504,6 @@ impl Translator<'_> {
         self.config.column(column).is_none_or(|c| c.comparable)
     }
 
-    /// A boolean expression as SQL, with its class. `None` when it can't be pushed.
     /// The columns [`translate`](Self::translate) compares in the database: not those of a
     /// conjunct it drops (a column it doesn't push, or an operand it can't translate).
     pub fn pushed_columns(&self, node: &Node, out: &mut Vec<PlSmallStr>) {
@@ -525,6 +524,7 @@ impl Translator<'_> {
         }
     }
 
+    /// A boolean expression as SQL, with its class. `None` when it can't be pushed.
     pub fn translate(&self, node: &Node) -> Option<(SqlExpr, Class)> {
         match node {
             Node::And(left, right) => match (self.translate(left), self.translate(right)) {

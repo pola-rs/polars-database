@@ -2720,8 +2720,13 @@ fn source_volatility(
         if volatile {
             out.volatile = Some(
                 format!(
-                    "one of the functions {} (volatile, by the catalog)",
-                    functions.join(", ")
+                    "one of the functions {} (volatile, by the catalog{})",
+                    functions.join(", "),
+                    if dialect == DialectName::Sqlite {
+                        "; register a deterministic user function with `deterministic=True`"
+                    } else {
+                        ""
+                    }
                 )
                 .into(),
             );
