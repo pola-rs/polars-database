@@ -1451,6 +1451,51 @@ def _duckdb_needs_connection(conn: Any) -> bool:
     return first == second
 
 
+def _duckdb_copy_session(conn: Any, cursor: Any) -> bool:
+    """
+    Copies the session state of a DuckDB connection onto a cursor of it, which starts
+    with the defaults: `search_path` (`USE`), `TimeZone`, `integer_division`, the
+    variables of `SET VARIABLE`, and the rest of `duckdb_settings()` that differs. (Not
+    by `scope`: a time zone set in the session is listed as global.) False if anything
+    fails to read or copy: the scan then runs on the connection itself, not with some of
+    its state.
+    """
+
+    def quote(v: Any) -> str:
+        return "'" + str(v).replace("'", "''") + "'"
+
+    def ident(v: Any) -> str:
+        return '"' + str(v).replace('"', '""') + '"'
+
+    skipped = {
+        "schema",
+        "enable_profiling",
+        "profiling_output",
+        "profiling_mode",
+        "log_query_path",
+    }
+    # (qualified: a user's macro of the name doesn't hijack it)
+    settings = "SELECT name, value FROM system.main.duckdb_settings()"
+    variables = "SELECT name, value::VARCHAR, type FROM system.main.duckdb_variables()"
+    try:
+        wanted = dict(conn.execute(settings).fetchall())
+        current = dict(cursor.execute(settings).fetchall())
+        for name, value in wanted.items():
+            # (`schema` can't be set: `search_path` has it; the profiling and log files
+            # are the user's, and none of it changes rows)
+            if name not in skipped and value != current.get(name):
+                cursor.execute(f"SET {ident(name)} = {quote(value)}")
+        for name, value, type_ in conn.execute(variables).fetchall():
+            if value is None or type_.strip('"').upper() == "NULL":
+                # (a NULL variable has the type `NULL`, which isn't a cast target)
+                cursor.execute(f"SET VARIABLE {ident(name)} = NULL")
+            else:
+                cursor.execute(f"SET VARIABLE {ident(name)} = {quote(value)}::{type_}")
+    except Exception:
+        return False
+    return True
+
+
 def _postgres_family(conn: Any) -> bool:
     """Whether a connection is a Postgres one, where a failed statement aborts the
     transaction it runs in."""
@@ -1921,11 +1966,17 @@ class _Session:
                 # has any, the statement runs on that connection, and its result is
                 # read whole here (another statement on it, another scan's, would end
                 # it). (A failing statement then aborts an open transaction.)
+                # Otherwise on a cursor, which gets the connection's session state
+                # first (`search_path`, time zone, variables), before any lookup of the
+                # catalog.
                 on_connection = (
                     (not self.owned or self.factory)
                     and cx.driver_name == "duckdb"
                     and _module_of(self.conn) == "duckdb"
-                    and _duckdb_needs_connection(self.conn)
+                    and (
+                        _duckdb_needs_connection(self.conn)
+                        or not _duckdb_copy_session(self.conn, cx.cursor)
+                    )
                 )
                 if on_connection:
                     with contextlib.suppress(Exception):

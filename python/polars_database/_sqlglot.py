@@ -885,19 +885,23 @@ _OPERATOR_FUNCTIONS = {
 }
 
 
-def _known_functions(stmt: Any, tokens: list[Any], dialect: str | None) -> list[str]:
+def _known_functions(
+    stmt: Any | None, tokens: list[Any], dialect: str | None
+) -> list[str]:
     """
     Lower-cased names of the functions of the query that a user's function of the name
     may replace (`_OVERRIDABLE_DIALECTS`): the database says if one does. Those sqlglot
     knows under another name (`instr`, `ltrim`), as written, and `LIKE` / `GLOB`, which
-    SQLite runs as the functions of the name.
+    SQLite runs as the functions of the name. `stmt` is `None` for a query sqlglot
+    doesn't parse: the names its tokens show only.
     """
     if dialect not in _OVERRIDABLE_DIALECTS:
         return []
     names: set[str] = set()
-    for f in stmt.find_all(exp.Func):
-        if not isinstance(f, exp.Anonymous):
-            names.update(n.lower() for n in f.sql_names() if n.isidentifier())
+    if stmt is not None:
+        for f in stmt.find_all(exp.Func):
+            if not isinstance(f, exp.Anonymous):
+                names.update(n.lower() for n in f.sql_names() if n.isidentifier())
     operators = _OPERATOR_FUNCTIONS.get(dialect, {})
     for i, t in enumerate(tokens):
         word = t.text.lower()
@@ -919,10 +923,15 @@ def _known_functions(stmt: Any, tokens: list[Any], dialect: str | None) -> list[
         if dialect == "duckdb" and word == "escape":
             names.update(("like_escape", "not_like_escape", "ilike_escape"))
     if dialect == "sqlite":
-        if stmt.find(exp.Like, exp.ILike) is not None:
-            names.add("like")
-        if stmt.find(exp.Glob) is not None:
-            names.add("glob")
+        if stmt is None:
+            names.update(
+                t.text.lower() for t in tokens if t.text.lower() in ("like", "glob")
+            )
+        else:
+            if stmt.find(exp.Like, exp.ILike) is not None:
+                names.add("like")
+            if stmt.find(exp.Glob) is not None:
+                names.add("glob")
     # syntax, not a function a user's can replace
     names.discard("cast")
     return sorted(names)
@@ -1063,6 +1072,22 @@ def _parse_query(sql: str, dialect: str | None) -> tuple[list[Any], list[Any]]:
     return statements, sqlglot.Dialect.get_or_raise(dialect).tokenize(sql)
 
 
+def _unparsed_facts(
+    facts: dict[str, Any], sql: str, dialect: str | None
+) -> dict[str, Any]:
+    """
+    The facts of a query sqlglot doesn't parse, with the functions its tokens call (a
+    user's volatile macro may be among them: the query is partitioned all the same). With
+    no tokens either, none.
+    """
+    try:
+        tokens = sqlglot.Dialect.get_or_raise(dialect).tokenize(sql)
+    except sqlglot.errors.SqlglotError:
+        return facts
+    facts["known_functions"] = _known_functions(None, tokens, dialect)
+    return facts
+
+
 def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
     """Facts about a user query that decide whether it can be wrapped."""
     facts = _no_facts()
@@ -1075,11 +1100,11 @@ def inspect_query(sql: str, dialect: str | None) -> dict[str, Any]:
         # it calls, would go unchecked)
         plain = _plain_placeholders(sql, dialect)
         if plain == sql:
-            return facts
+            return _unparsed_facts(facts, sql, dialect)
         try:
             statements, tokens = _parse_query(plain, dialect)
         except sqlglot.errors.SqlglotError:
-            return facts
+            return _unparsed_facts(facts, sql, dialect)
         sql = plain
     facts["parses"] = True
     # the query without the semicolons and comments after its last token, which can't

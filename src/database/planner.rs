@@ -324,7 +324,8 @@ pub fn resolve_scan(
     if let DatabaseRelation::Query { sql } = &options.relation {
         let sql = sql.clone();
         let facts = sql_renderer().and_then(|r| r.inspect_query(&sql, dialect));
-        query_facts = facts.as_ref().ok().filter(|f| f.parses).cloned();
+        // (one that doesn't parse still has the functions its tokens call)
+        query_facts = facts.as_ref().ok().cloned();
         let read_only_session =
             read_only_session(dialect, &backend.kind, options.connection.is_live());
         check_read_only(&sql, facts.as_ref().ok(), read_only_session)?;
@@ -968,8 +969,7 @@ fn unplanned_volatility(
     let facts = match &config.options.relation {
         DatabaseRelation::Query { sql } => sql_renderer()
             .and_then(|r| r.inspect_query(sql, config.dialect))
-            .ok()
-            .filter(|f| f.parses),
+            .ok(),
         DatabaseRelation::Table { .. } => None,
     };
     let names = config.schema.iter_names().cloned().collect::<Vec<_>>();
@@ -2570,6 +2570,26 @@ fn source_volatility(
     // Functions defined in SQL (DuckDB macros, ClickHouse functions) are as volatile as
     // their bodies, which may call others, and read views.
     let mut checked: PlHashSet<PlSmallStr> = PlHashSet::new();
+    // DuckDB macros of operators and built-ins' names run where the query doesn't name
+    // them (`a + 1`, `trim(LEADING ..)`): a volatile one makes every source on the
+    // connection volatile, however the query is written (see
+    // [`catalog::shadowing_macros`]). They are inspected in the first round.
+    let mut shadow = if dialect == DialectName::Duckdb {
+        match catalog::shadowing_macros(session) {
+            Some(macros) => macros,
+            None => {
+                // can't tell: as for the other lookups that fail
+                out.volatile = Some(
+                    "a macro the database couldn't list (one of an operator's or a built-in's                     name may be volatile)"
+                        .into(),
+                );
+                out.all_columns = true;
+                vec![]
+            },
+        }
+    } else {
+        vec![]
+    };
     let mut round = 0;
     'inspect: loop {
         while let Some((parts, context, own_columns)) = pending.pop() {
@@ -2668,7 +2688,7 @@ fn source_volatility(
             .collect();
         replaceable.sort();
         replaceable.dedup();
-        if functions.is_empty() && replaceable.is_empty() {
+        if functions.is_empty() && replaceable.is_empty() && shadow.is_empty() {
             break;
         }
         if round == MAX_FUNCTION_ROUNDS {
@@ -2679,20 +2699,25 @@ fn source_volatility(
         checked.extend(functions.iter().chain(&replaceable).cloned());
         let only_replaceable = functions.is_empty();
         functions.extend(replaceable.iter().cloned());
-        let Some(found) = catalog::volatile_functions(session, dialect, &functions, &replaceable)
-        else {
-            if only_replaceable {
-                // built-ins as far as is known: a database that can't list its functions
-                // (an old SQLite) is no reason to refuse every query that calls one
-                continue;
-            }
-            // the values of such a column aren't compared in the database on SQLite only,
-            // as without the lookup (`_volatile_columns`)
-            out.volatile = Some(UNKNOWN_FUNCTIONS.into());
-            break;
+        let found = match catalog::volatile_functions(session, dialect, &functions, &replaceable) {
+            Some(found) => found,
+            // built-ins as far as is known: a database that can't list its functions
+            // (an old SQLite) is no reason to refuse every query that calls one
+            None if only_replaceable => catalog::FunctionLookup::default(),
+            None => {
+                // the values of such a column aren't compared in the database on SQLite
+                // only, as without the lookup (`_volatile_columns`)
+                out.volatile = Some(UNKNOWN_FUNCTIONS.into());
+                break;
+            },
         };
+        let mut bodies: Vec<(Option<String>, String)> =
+            found.bodies.into_iter().map(|b| (None, b)).collect();
+        bodies.extend(shadow.drain(..).map(|(n, body)| (Some(n), body)));
         let mut volatile = found.volatile;
-        for body in &found.bodies {
+        // the shadowing macros whose bodies are volatile
+        let mut shadowing: Vec<String> = vec![];
+        for (macro_name, body) in &bodies {
             // a table macro's body is a query, a scalar one's an expression
             let first = body
                 .trim_start()
@@ -2709,23 +2734,41 @@ fn source_volatility(
             {
                 Some(f) => {
                     volatile |= !f.repeatable;
+                    if let (Some(n), false) = (macro_name, f.repeatable) {
+                        shadowing.push(n.clone());
+                    }
                     unknown.extend(f.unknown_functions);
                     known.extend(f.known_functions);
                     // the views it reads (a view's columns aren't the source's then)
                     pending.extend(f.tables.into_iter().map(|t| (t, vec![], false)));
                 },
-                None => volatile = true,
+                None => {
+                    volatile = true;
+                    shadowing.extend(macro_name.clone());
+                },
             }
         }
         if volatile {
             out.volatile = Some(
                 format!(
-                    "one of the functions {} (volatile, by the catalog{})",
-                    functions.join(", "),
+                    "one of the functions {} (volatile, by the catalog or its body{}{})",
+                    functions
+                        .iter()
+                        .map(|f| f.to_string())
+                        .chain(shadowing.iter().map(|m| format!("\"{m}\"")))
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     if dialect == DialectName::Sqlite {
                         "; register a deterministic user function with `deterministic=True`"
                     } else {
                         ""
+                    },
+                    if shadowing.is_empty() {
+                        ""
+                    } else {
+                        "; a macro of an operator's or a built-in's name, volatile by its body, \
+                        runs wherever the query uses it, so every source on this connection \
+                        counts as volatile"
                     }
                 )
                 .into(),

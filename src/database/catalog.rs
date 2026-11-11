@@ -226,7 +226,12 @@ pub fn table_info(
 ) -> CatalogInfo {
     let verbose = polars_core::config::verbose();
     let mut info = CatalogInfo::default();
-    let Some(queries) = CatalogQueries::new(dialect, parts) else {
+    let search = if dialect == DialectName::Duckdb && parts.len() == 1 {
+        duckdb_search_places(session)
+    } else {
+        vec![]
+    };
+    let Some(queries) = CatalogQueries::new(dialect, parts, &search) else {
         return info;
     };
 
@@ -604,7 +609,11 @@ struct CatalogQueries {
 }
 
 impl CatalogQueries {
-    fn new(dialect: DialectName, parts: &[PlSmallStr]) -> Option<Self> {
+    fn new(
+        dialect: DialectName,
+        parts: &[PlSmallStr],
+        search: &[(String, String)],
+    ) -> Option<Self> {
         let name = parts.last()?.as_str();
         let schema = (parts.len() >= 2).then(|| parts[parts.len() - 2].as_str());
         let s = |v: &str| dialect.quote_str(v);
@@ -841,7 +850,7 @@ impl CatalogQueries {
             },
             DialectName::Duckdb => {
                 // DuckDB resolves names case-insensitively, where `duckdb_name_rank` says.
-                let rank = duckdb_name_rank(parts, &[]);
+                let rank = duckdb_name_rank(parts, &[], search);
                 let n = s(name);
                 let duck_filter = format!(
                     "system.main.lower(table_name) = system.main.lower({n}) \
@@ -911,27 +920,133 @@ fn duckdb_places(parts: &[PlSmallStr], context: &[PlSmallStr]) -> Vec<(String, S
 
 /// The position of a row's `database_name`, `schema_name` where DuckDB resolves `parts`
 /// (NULL if nowhere), as SQL. An unqualified name, outside a view's own context, follows
-/// the whole `search_path` (`SET search_path = 's1,s2'`; an entry is a schema of the
-/// current database, an attached database's `main`, or `database.schema`) after `temp`,
-/// then the current schema and `main`; the rest is [`duckdb_places`].
-fn duckdb_name_rank(parts: &[PlSmallStr], context: &[PlSmallStr]) -> String {
+/// `search` ([`duckdb_search_places`]: `temp`, the whole `search_path`, the current schema,
+/// `main`); the rest is [`duckdb_places`].
+fn duckdb_name_rank(
+    parts: &[PlSmallStr],
+    context: &[PlSmallStr],
+    search: &[(String, String)],
+) -> String {
     if parts.len() != 1 || !context.is_empty() {
         return duckdb_rank(&duckdb_places(parts, context));
     }
-    // (`system.main.lower`: a user's macro named `lower` doesn't hijack the lookup; list
-    // comprehensions, as the lambda syntax differs before DuckDB 1.3)
-    let lower = "system.main.lower";
-    let paths = format!(
-        "system.main.list_append(system.main.list_append([{lower}(system.main.trim(e, ' \"')) FOR e IN \
-        system.main.string_split(system.main.current_setting('search_path'), ',')], \
-        {lower}(system.main.current_database() || '.' || system.main.current_schema())), 'main')"
+    duckdb_rank(search)
+}
+
+/// The places (lower-cased database and schema, as SQL) where DuckDB looks for an
+/// unqualified name, in order: `temp`, each entry of the session's `search_path`
+/// (`SET search_path = 's1,s2'`, `USE`: a schema of the current database, an attached
+/// database's `main`, or `database.schema`), the current schema, `main`.
+///
+/// The path is read once, and parsed here, where DuckDB's own parsing is followed (quotes,
+/// `""`, dots, blanks around an entry): the lookup holds only literals, so no function a
+/// user's macro can replace (a list comprehension is one) runs in it. If the read fails,
+/// the current schema and `main` after `temp`.
+fn duckdb_search_places(session: &mut dyn DatabaseSession) -> Vec<(String, String)> {
+    let s = |v: &str| format!("system.main.lower({})", DialectName::Duckdb.quote_str(v));
+    let read = session.catalog_query(
+        "SELECT system.main.current_setting('search_path'), system.main.current_database(), \
+        system.main.current_schema()",
     );
-    format!(
-        "CASE WHEN {lower}(database_name) = 'temp' AND {lower}(schema_name) = 'main' THEN 0 ELSE \
-        system.main.nullif(system.main.list_position([({lower}(database_name) = {lower}(system.main.current_database()) \
-        AND {lower}(schema_name) = p) OR ({lower}(database_name) = p AND {lower}(schema_name) = 'main') \
-        OR {lower}(database_name) || '.' || {lower}(schema_name) = p FOR p IN {paths}], true), 0) END"
-    )
+    let mut places = vec![("'temp'".to_string(), "'main'".to_string())];
+    let state = match &read {
+        Ok(df) => (cell_str(df, 0, 0), cell_str(df, 1, 0), cell_str(df, 2, 0)),
+        Err(e) => {
+            if polars_core::config::verbose() {
+                eprintln!("[scan_database]: reading DuckDB's search path failed: {e}");
+            }
+            (None, None, None)
+        },
+    };
+    let (db, schema) = match (state.1, state.2) {
+        (Some(db), Some(schema)) => (s(&db), s(&schema)),
+        _ => (
+            "system.main.lower(system.main.current_database())".to_string(),
+            "system.main.lower(system.main.current_schema())".to_string(),
+        ),
+    };
+    for entry in state
+        .0
+        .as_deref()
+        .map(parse_search_path)
+        .unwrap_or_default()
+    {
+        match entry.as_slice() {
+            [name] => {
+                places.push((db.clone(), s(name)));
+                places.push((s(name), "'main'".to_string()));
+            },
+            [.., catalog, schema] => places.push((s(catalog), s(schema))),
+            [] => {},
+        }
+    }
+    places.push((db.clone(), schema));
+    places.push((db, "'main'".to_string()));
+    places.push(("'main'".to_string(), "'main'".to_string()));
+    places
+}
+
+/// The entries of DuckDB's `search_path` setting, each as its names (`schema`, or
+/// `database.schema`): separated by commas, and their parts by dots, outside double quotes;
+/// `""` inside quotes is a quote; blanks around a part are none; empty entries are left out.
+fn parse_search_path(path: &str) -> Vec<Vec<String>> {
+    let mut entries: Vec<Vec<String>> = vec![];
+    let mut parts: Vec<String> = vec![];
+    let mut cur = String::new();
+    // blanks after unquoted text: kept only if more text follows (`a b`)
+    let mut blanks = String::new();
+    let mut quoted = false;
+    let mut in_quotes = false;
+    let mut chars = path.chars().peekable();
+    let finish_part =
+        |parts: &mut Vec<String>, cur: &mut String, quoted: &mut bool, blanks: &mut String| {
+            if !cur.is_empty() || *quoted {
+                parts.push(std::mem::take(cur));
+            }
+            blanks.clear();
+            *quoted = false;
+        };
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            match c {
+                '"' if chars.peek() == Some(&'"') => {
+                    chars.next();
+                    cur.push('"');
+                },
+                '"' => in_quotes = false,
+                _ => cur.push(c),
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_quotes = true;
+                quoted = true;
+                blanks.clear();
+            },
+            '.' => finish_part(&mut parts, &mut cur, &mut quoted, &mut blanks),
+            ',' => {
+                finish_part(&mut parts, &mut cur, &mut quoted, &mut blanks);
+                if !parts.is_empty() {
+                    entries.push(std::mem::take(&mut parts));
+                }
+            },
+            c if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    blanks.push(c);
+                }
+            },
+            c => {
+                cur.push_str(&std::mem::take(&mut blanks));
+                cur.push(c);
+            },
+        }
+    }
+    finish_part(&mut parts, &mut cur, &mut quoted, &mut blanks);
+    if !parts.is_empty() {
+        entries.push(parts);
+    }
+    entries
 }
 
 /// The position of a row's `database_name`, `schema_name` among `places` (NULL if none).
@@ -981,6 +1096,11 @@ pub fn view_definition(
     context: &[PlSmallStr],
 ) -> ViewLookup {
     let verbose = polars_core::config::verbose();
+    let search = if dialect == DialectName::Duckdb && parts.len() == 1 && context.is_empty() {
+        duckdb_search_places(session)
+    } else {
+        vec![]
+    };
     let mut run = |sql: &str| match session.catalog_query(sql) {
         Ok(df) => Some(df),
         Err(e) => {
@@ -1056,7 +1176,7 @@ pub fn view_definition(
         // The first place the name resolves in (`duckdb_name_rank`): a temporary view hides
         // a table of its name.
         DialectName::Duckdb => {
-            let rank = duckdb_name_rank(parts, context);
+            let rank = duckdb_name_rank(parts, context, &search);
             format!(
                 "SELECT is_view, sql, database_name, schema_name FROM (\
                 SELECT {rank} AS r, 0 AS o, true AS is_view, sql, database_name, schema_name \
@@ -1263,6 +1383,37 @@ pub fn volatile_functions(
     Some(out)
 }
 
+/// The user's DuckDB macros that run where the query doesn't name them: those of an
+/// operator (`+`, `*`, `<->`), which the parser writes as a call or a keyword, and those of
+/// a built-in's name, which it may rewrite to (`trim(LEADING ..)` is `ltrim`,
+/// `x IN [..]` is `contains`). Each as `(name, body)`; `None` if the lookup fails.
+///
+/// The queries' functions are looked up by name ([`volatile_functions`]), but the names
+/// these syntaxes run aren't all known to the parser. A volatile one of these makes every
+/// source on the connection volatile (no partitioning), not only the queries that call it.
+pub fn shadowing_macros(session: &mut dyn DatabaseSession) -> Option<Vec<(String, String)>> {
+    // (qualified: a user's macro of the name doesn't hijack the lookup)
+    let sql = "SELECT function_name, macro_definition FROM system.main.duckdb_functions() \
+        WHERE function_type IN ('macro', 'table_macro') AND NOT internal \
+        AND (NOT system.main.regexp_matches(function_name, '^[A-Za-z_][A-Za-z0-9_]*$') \
+        OR system.main.lower(function_name) IN (SELECT system.main.lower(function_name) \
+        FROM system.main.duckdb_functions() WHERE internal))";
+    let df = match session.catalog_query(sql) {
+        Ok(df) => df,
+        Err(e) => {
+            if polars_core::config::verbose() {
+                eprintln!("[scan_database]: catalog lookup of shadowing macros failed: {e}");
+            }
+            return None;
+        },
+    };
+    Some(
+        (0..df.height())
+            .filter_map(|row| Some((cell_str(&df, 0, row)?, cell_str(&df, 1, row)?)))
+            .collect(),
+    )
+}
+
 fn cell(df: &DataFrame, col: usize, row: usize) -> Option<AnyValue<'_>> {
     let c = df.columns().get(col)?;
     (row < c.len()).then(|| c.get(row).ok()).flatten()
@@ -1375,16 +1526,39 @@ mod tests {
             ]
         );
         // an unqualified name: `temp` first, then the whole search path
-        let rank = duckdb_name_rank(&["t".into()], &[]);
-        assert!(rank.contains("current_setting('search_path')"), "{rank}");
-        let rank = duckdb_name_rank(&["t".into()], &["d".into(), "s".into()]);
-        assert!(!rank.contains("search_path"), "{rank}");
+        let search = vec![
+            ("'temp'".to_string(), "'main'".to_string()),
+            ("'d'".to_string(), "'s1'".to_string()),
+        ];
+        let rank = duckdb_name_rank(&["t".into()], &[], &search);
+        assert_eq!(rank, duckdb_rank(&search));
+        let rank = duckdb_name_rank(&["t".into()], &["d".into(), "s".into()], &search);
+        assert!(!rank.contains("'s1'"), "{rank}");
         let rank = duckdb_rank(&places(&["a", "t"], &[]));
         assert!(
             rank.starts_with("CASE WHEN system.main.lower(database_name) = "),
             "{rank}"
         );
         assert!(rank.ends_with("THEN 1 END"), "{rank}");
+    }
+
+    #[test]
+    fn duckdb_search_path_is_parsed_like_its_own() {
+        let parse = |p: &str| parse_search_path(p);
+        let v = |e: &[&[&str]]| -> Vec<Vec<String>> {
+            e.iter()
+                .map(|p| p.iter().map(|s| s.to_string()).collect())
+                .collect()
+        };
+        assert_eq!(parse("s1,s2"), v(&[&["s1"], &["s2"]]));
+        assert_eq!(parse(" s1 , s2 "), v(&[&["s1"], &["s2"]]));
+        // a comma inside quotes, an escaped quote, dotted parts
+        assert_eq!(parse(r#"s1,"s,2""#), v(&[&["s1"], &["s,2"]]));
+        assert_eq!(parse(r#""a""b""#), v(&[&["a\"b"]]));
+        assert_eq!(parse(r#"memory."a.b",x"#), v(&[&["memory", "a.b"], &["x"]]));
+        assert_eq!(parse(r#"" x ""#), v(&[&[" x "]]));
+        assert_eq!(parse(",,"), Vec::<Vec<String>>::new());
+        assert_eq!(parse(""), Vec::<Vec<String>>::new());
     }
 
     #[test]

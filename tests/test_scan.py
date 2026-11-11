@@ -2838,6 +2838,244 @@ def test_scan_duckdb_views_are_found_along_the_search_path() -> None:
         conn.close()
 
 
+def test_scan_duckdb_cursor_has_the_connections_session_state(tmp_path: Path) -> None:
+    # A cursor starts with the defaults: `SET search_path`, `USE`, `SET TimeZone`,
+    # `integer_division`, `SET VARIABLE` were lost, and the scan read `main.t` where the
+    # connection's own `SELECT * FROM t` reads `s.t`
+    duckdb = pytest.importorskip("duckdb")
+    cases = [
+        (["SET search_path = 's'"], "SELECT id FROM t"),
+        (["USE s"], "SELECT id FROM t"),
+        (["USE memory.s"], "SELECT id FROM t"),
+        (
+            ["SET TimeZone = 'Asia/Tokyo'"],
+            "SELECT CAST(TIMESTAMPTZ '2020-01-01 00:00:00+00' AS VARCHAR) AS x",
+        ),
+        (["SET integer_division = true"], "SELECT 7 / 2 AS x"),
+        (["SET VARIABLE v = 42"], "SELECT getvariable('v') AS x"),
+        (["SET VARIABLE w = 'it''s'"], "SELECT getvariable('w') AS x"),
+        (["SET VARIABLE k = NULL"], "SELECT getvariable('k') IS NULL AS x"),
+    ]
+    for setup, query in cases:
+        conn = duckdb.connect()
+        try:
+            conn.execute("CREATE TABLE main.t AS SELECT 1 AS id")
+            conn.execute("CREATE SCHEMA s")
+            conn.execute("CREATE TABLE s.t AS SELECT 99 AS id")
+            default_zone = conn.execute("SELECT current_setting('TimeZone')").fetchone()
+            for statement in setup:
+                conn.execute(statement)
+            native = conn.execute(query).fetchall()
+            settings = "SELECT name, value FROM duckdb_settings() ORDER BY name"
+            before = conn.execute(settings).fetchall()
+            assert pl.scan_database(query, conn).collect().rows() == native, setup
+            if setup[0].startswith(("SET search_path", "USE")):
+                table = pl.scan_database("t", conn).collect()
+                assert table["id"].to_list() == [99], setup
+            # the cursor's settings don't reach the connection, nor its other cursors
+            assert conn.execute(settings).fetchall() == before
+            assert (
+                conn.cursor().execute("SELECT current_setting('TimeZone')").fetchone()
+                == default_zone
+            )
+        finally:
+            conn.close()
+    # a factory that sets the search path itself
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as stored:
+        stored.execute("CREATE TABLE t AS SELECT 1 AS id")
+        stored.execute("CREATE SCHEMA s")
+        stored.execute("CREATE TABLE s.t AS SELECT 99 AS id")
+
+    def factory() -> Any:
+        c = duckdb.connect(path)
+        c.execute("SET search_path = 's'")
+        return c
+
+    assert pl.scan_database("t", factory).collect()["id"].to_list() == [99]
+
+
+def test_scan_duckdb_session_copy_handles_null_variables() -> None:
+    # `SET VARIABLE k = NULL` lists a variable of the type `NULL`, no cast target: the
+    # copy failed and the scan fell back to the user's connection
+    duckdb = pytest.importorskip("duckdb")
+    from polars_database._bridge import _duckdb_copy_session
+
+    conn = duckdb.connect()
+    try:
+        conn.execute("SET VARIABLE k = NULL")
+        conn.execute("SET VARIABLE v = 1")
+        cursor = conn.cursor()
+        assert _duckdb_copy_session(conn, cursor)
+        assert cursor.execute("SELECT getvariable('k') IS NULL").fetchall() == [(True,)]
+        assert cursor.execute("SELECT getvariable('v')").fetchall() == [(1,)]
+    finally:
+        conn.close()
+
+
+def test_scan_duckdb_volatile_shadow_message_names_only_the_volatile_macros(
+    tmp_path: Path,
+) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE TABLE ids AS SELECT range AS id FROM range(300)")
+        conn.execute('CREATE MACRO "+"(a, b) AS a - (0 - b)')
+        conn.execute('CREATE MACRO "-"(a, b) AS random()')
+    lf = pl.scan_database(
+        "SELECT id FROM ids", f"duckdb:///{path}", partition_on="id", partition_num=2
+    )
+    with pytest.raises(pl.exceptions.InvalidOperationError, match='"-"') as e:
+        lf.collect()
+    assert '"+"' not in str(e.value)
+
+
+def test_scan_duckdb_search_path_with_quoted_entries_and_a_list_apply_macro() -> None:
+    # The search path was split at every comma, and read with a list comprehension, which
+    # DuckDB runs as the user's `list_apply`: a `random()` view in a schema `"s,2"`, or
+    # with such a macro in the way, was taken for a table (partitions lost rows)
+    duckdb = pytest.importorskip("duckdb")
+    for temp, macro, path in [
+        (True, False, "'s1,\"s,2\"'"),
+        (False, False, "'s1,\"s,2\"'"),
+        (True, False, "'S1,\"S,2\"'"),
+        (True, True, "'s1,\"s,2\"'"),
+        (False, True, "'s1,\"s,2\"'"),
+    ]:
+        conn = duckdb.connect()
+        try:
+            conn.execute("CREATE SCHEMA s1")
+            conn.execute('CREATE SCHEMA "s,2"')
+            conn.execute("CREATE TABLE ids AS SELECT range AS id FROM range(1000)")
+            conn.execute(
+                'CREATE VIEW "s,2".v AS SELECT id, random() AS r FROM main.ids'
+            )
+            if temp:
+                conn.execute("CREATE TEMP TABLE other AS SELECT 1 AS id")
+            if macro:
+                conn.execute("CREATE MACRO list_apply(l, f) AS [false]")
+            conn.execute(f"SET search_path = {path}")
+            lf = pl.scan_database("v", conn, partition_on="id", partition_num=4)
+            with pytest.raises(
+                pl.exceptions.InvalidOperationError, match="partitioned"
+            ):
+                lf.collect()
+            # a table earlier on the path hides the view
+            conn.execute("CREATE TABLE s1.v AS SELECT range AS id FROM range(10)")
+            lf = pl.scan_database("v", conn, partition_on="id", partition_num=2)
+            assert sorted(lf.collect()["id"].to_list()) == list(range(10))
+        finally:
+            conn.close()
+
+
+def test_scan_duckdb_macros_of_operators_and_built_ins_the_query_doesnt_name(
+    tmp_path: Path,
+) -> None:
+    # `id + 1`, `id * 2`, `trim(LEADING ..)` (`ltrim`) and `[e FOR e IN l]` (`list_apply`)
+    # run the user's macros of those names: a volatile one makes the sources of the
+    # database volatile, where the parser can't say which names a query runs
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE TABLE ids AS SELECT range AS id FROM range(300)")
+    uri = f"duckdb:///{path}"
+    queries = {
+        "+": "SELECT id, id + 1 AS r FROM ids",
+        "*": "SELECT id, id * 2 AS r FROM ids",
+        "ltrim": "SELECT id, trim(id::VARCHAR, '0') AS a, "
+        "trim(LEADING '0' FROM id::VARCHAR) AS b FROM ids",
+        "list_apply": "SELECT id, [e + 1 FOR e IN [1, 2]] AS l FROM ids",
+    }
+
+    def partitioned(query: str) -> list[int]:
+        lf = pl.scan_database(query, uri, partition_on="id", partition_num=4)
+        return sorted(lf.collect()["id"].to_list())
+
+    # no such macro: the sources are as repeatable as before (`SELECT *` too)
+    for query in [*queries.values(), "SELECT * FROM ids"]:
+        assert partitioned(query) == list(range(300))
+    # a macro that is stable doesn't matter
+    with duckdb.connect(path) as conn:
+        conn.execute('CREATE MACRO "+"(a, b) AS a - (0 - b)')
+    assert partitioned(queries["+"]) == list(range(300))
+    bodies = {
+        "+": 'CREATE OR REPLACE MACRO "+"(a, b) AS random()',
+        "*": 'CREATE MACRO "*"(a, b) AS random()::BIGINT',
+        "ltrim": "CREATE MACRO ltrim(a, b) AS random()::VARCHAR",
+        "list_apply": "CREATE MACRO list_apply(l, f) AS [random()]",
+    }
+    for name, create in bodies.items():
+        with duckdb.connect(path) as conn:
+            conn.execute(create)
+        for query in queries.values():
+            # (the macro of `name` reaches every query of the database)
+            with pytest.raises(
+                pl.exceptions.InvalidOperationError, match="partitioned"
+            ):
+                partitioned(query)
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+            partitioned("SELECT * FROM ids")
+        # a read without partitions is as it was
+        assert pl.scan_database(queries[name], uri).collect().height == 300
+        with duckdb.connect(path) as conn:
+            conn.execute(f'DROP MACRO "{name}"')
+    assert partitioned("SELECT * FROM ids") == list(range(300))
+
+
+def test_scan_duckdb_query_sqlglot_cant_parse_still_checks_its_functions(
+    tmp_path: Path,
+) -> None:
+    # `(3 !)` (the factorial postfix) isn't parsed: the functions the query calls by name
+    # went unchecked, and a volatile macro of one was partitioned
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE TABLE ids AS SELECT range AS id FROM range(300)")
+        conn.execute("CREATE MACRO myrand(x) AS random()::BIGINT")
+    uri = f"duckdb:///{path}"
+    query = "SELECT id FROM ids WHERE (3 !) = 6 AND myrand(id) >= 0"
+    assert pl.scan_database(query, uri).collect().height == 300
+    lf = pl.scan_database(query, uri, partition_on="id", partition_num=4)
+    with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+        lf.collect()
+    # a query that parses and calls no volatile macro is partitioned
+    with duckdb.connect(path) as conn:
+        conn.execute("DROP MACRO myrand")
+        conn.execute("CREATE MACRO myrand(x) AS x")
+    lf = pl.scan_database(query, uri, partition_on="id", partition_num=4)
+    assert sorted(lf.collect()["id"].to_list()) == list(range(300))
+
+
+def test_scan_duckdb_python_functions_with_side_effects_are_volatile() -> None:
+    # A Python function registered without `side_effects=True` is CONSISTENT in the
+    # catalog and counts as repeatable; with it, VOLATILE, and a partitioned read of
+    # a query calling it is refused
+    duckdb = pytest.importorskip("duckdb")
+    import random
+
+    try:
+        from duckdb.sqltypes import BIGINT, DOUBLE
+    except ImportError:  # DuckDB before 1.4
+        from duckdb.typing import BIGINT, DOUBLE  # type: ignore[no-redef]
+
+    conn = duckdb.connect()
+    try:
+        conn.execute("CREATE TABLE ids AS SELECT range AS id FROM range(300)")
+        conn.create_function(
+            "py_rand", lambda x: random.random(), [BIGINT], DOUBLE, side_effects=True
+        )
+        lf = pl.scan_database(
+            "SELECT id, py_rand(id) AS r FROM ids",
+            conn,
+            partition_on="id",
+            partition_num=4,
+        )
+        with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
+            lf.collect()
+    finally:
+        conn.close()
+
+
 def test_scan_sqlite_user_function_replacing_a_built_in(tmp_path: Path) -> None:
     # `abs` is a function sqlglot knows, but `create_function` replaces it: a query of
     # it was taken as stable (partitions lost rows, a filter on it was run in the database,
