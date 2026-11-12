@@ -5259,3 +5259,61 @@ def test_clickhouse_block_and_query_functions() -> None:
         )
         with pytest.raises(pl.exceptions.InvalidOperationError, match="partitioned"):
             lf.collect()
+
+
+@needs_postgres
+@pytest.mark.parametrize("during_fetch", [False, True])
+def test_psycopg_cancel_stops_later_server_fetch(
+    monkeypatch: pytest.MonkeyPatch, during_fetch: bool
+) -> None:
+    import threading
+
+    psycopg = pytest.importorskip("psycopg")
+    from polars.io.database._executor import ConnectionExecutor
+    from polars_database._bridge import _Session
+
+    entered = threading.Event()
+    original = ConnectionExecutor.to_polars
+
+    def delayed_batches(self: Any, *args: Any, **kwargs: Any) -> Any:
+        batches = iter(original(self, *args, **kwargs))
+        yield next(batches)
+        entered.set()
+        time.sleep(1.6)  # a later FETCH starts after the former retry deadline
+        yield from batches
+
+    if during_fetch:
+        monkeypatch.setattr(ConnectionExecutor, "to_polars", delayed_batches)
+    conn = psycopg.connect(POSTGRES)
+    conn.execute("SET statement_timeout = '5s'")
+    session = _Session(conn, owned=True, execute_options={})
+    frames = session.execute(
+        "SELECT i, CASE WHEN i > 1 THEN pg_sleep(2) END AS pause "
+        "FROM generate_series(1,3) i",
+        1,
+    )
+    thread = None
+    try:
+        assert next(frames)["i"].to_list() == [1]
+        assert not session._issuing
+        started = time.monotonic()
+        if during_fetch:
+
+            def cancel() -> None:
+                assert entered.wait(5)
+                session.cancel()
+
+            thread = threading.Thread(target=cancel)
+            thread.start()
+        else:
+            session.cancel()
+        with pytest.raises(Exception, match="cancelled|canceling statement"):
+            next(frames)
+        assert time.monotonic() - started < 3.5
+        assert not session._issuing
+    finally:
+        if thread is not None:
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+        frames.close()
+        session.close()

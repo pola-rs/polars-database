@@ -1487,11 +1487,18 @@ def _duckdb_copy_session(conn: Any, cursor: Any) -> bool:
             if name not in skipped and value != current.get(name):
                 cursor.execute(f"SET {ident(name)} = {quote(value)}")
         for name, value, type_ in conn.execute(variables).fetchall():
-            if value is None or type_.strip('"').upper() == "NULL":
-                # (a NULL variable has the type `NULL`, which isn't a cast target)
+            # DuckDB 2's catalog wraps typed NULLs in a VARIANT: its value is not
+            # SQL NULL and casts to the text 'NULL', also a valid non-null VARCHAR.
+            # getvariable requires a constant name, so inspect each variable itself.
+            is_null = conn.execute(
+                f"SELECT system.main.getvariable({quote(name)}) IS NULL"
+            ).fetchone()[0]
+            if type_.strip('"').upper() == "NULL":
+                # an untyped NULL has no valid cast target
                 cursor.execute(f"SET VARIABLE {ident(name)} = NULL")
             else:
-                cursor.execute(f"SET VARIABLE {ident(name)} = {quote(value)}::{type_}")
+                literal = "NULL" if is_null else quote(value)
+                cursor.execute(f"SET VARIABLE {ident(name)} = {literal}::{type_}")
     except Exception:
         return False
     return True
@@ -1860,8 +1867,6 @@ def _live_state(conn: Any) -> _ConnectionState:
 
 
 _CANCELLED = "the database read was cancelled"
-# how long `_Session.cancel` repeats itself for a statement that is starting
-_CANCEL_RETRY_SECONDS = 1.0
 
 
 class _Session:
@@ -2095,12 +2100,19 @@ class _Session:
                     savepoint = None
             empty = True
             while True:
-                with state.lock:
-                    df = next(frames, None)
-                # Server-side cursors only declare the statement in `execute`: it runs at
-                # the first fetch, so a cancel is repeated until that returns.
+                # Every server-side fetch may issue another statement. Register it
+                # before entering the driver: cancellation is sticky and is repeated
+                # through delayed startup until this fetch returns.
                 with self._cancel_lock:
-                    self._issuing = False
+                    if self._cancelled:
+                        raise RuntimeError(_CANCELLED)
+                    self._issuing = True
+                try:
+                    with state.lock:
+                        df = next(frames, None)
+                finally:
+                    with self._cancel_lock:
+                        self._issuing = False
                 if df is None:
                     break
                 empty = False
@@ -2270,7 +2282,6 @@ class _Session:
                 break
         else:
             return
-        deadline = time.monotonic() + _CANCEL_RETRY_SECONDS
         delay = 0.02
         while True:
             try:
@@ -2283,7 +2294,7 @@ class _Session:
             # A statement past the check of `_cancelled` but not yet at the driver isn't
             # there to stop: asked again until the driver call returns (the stopped
             # statement ends it).
-            if not self._issuing or time.monotonic() >= deadline:
+            if not self._issuing:
                 return
             # a cursor's cancel may open a connection of its own: backing off
             time.sleep(delay)
@@ -2619,7 +2630,6 @@ class _AdbcSession:
 
         with self._lock:
             self._cancelled = True
-        deadline = time.monotonic() + _CANCEL_RETRY_SECONDS
         delay = 0.02
         while True:
             with self._lock:
@@ -2644,7 +2654,7 @@ class _AdbcSession:
                 # nothing running (yet): asked again while the statement is executing
                 if getattr(e, "status_code", None) != AdbcStatusCode.INVALID_STATE:
                     raise
-            if not issuing or time.monotonic() >= deadline:
+            if not issuing:
                 return
             time.sleep(delay)
             delay = min(delay * 2, 0.25)

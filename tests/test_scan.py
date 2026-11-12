@@ -2896,20 +2896,48 @@ def test_scan_duckdb_cursor_has_the_connections_session_state(tmp_path: Path) ->
     assert pl.scan_database("t", factory).collect()["id"].to_list() == [99]
 
 
-def test_scan_duckdb_session_copy_handles_null_variables() -> None:
-    # `SET VARIABLE k = NULL` lists a variable of the type `NULL`, no cast target: the
-    # copy failed and the scan fell back to the user's connection
+@pytest.mark.parametrize("shadow", [False, True])
+def test_scan_duckdb_session_copy_handles_null_variables(shadow: bool) -> None:
     duckdb = pytest.importorskip("duckdb")
     from polars_database._bridge import _duckdb_copy_session
 
     conn = duckdb.connect()
     try:
-        conn.execute("SET VARIABLE k = NULL")
-        conn.execute("SET VARIABLE v = 1")
+        variables = {
+            "untyped": "NULL",
+            "text_null": "NULL::VARCHAR",
+            "integer_null": "NULL::INTEGER",
+            "list_null": "NULL::INTEGER[]",
+            "text": "'NULL'",
+            "number": "1",
+        }
+        for name, expression in variables.items():
+            conn.execute(f"SET VARIABLE {name} = {expression}")
+        if shadow:
+            conn.execute("CREATE MACRO getvariable(x) AS 'not-null'")
         cursor = conn.cursor()
-        assert _duckdb_copy_session(conn, cursor)
-        assert cursor.execute("SELECT getvariable('k') IS NULL").fetchall() == [(True,)]
-        assert cursor.execute("SELECT getvariable('v')").fetchall() == [(1,)]
+        try:
+            assert _duckdb_copy_session(conn, cursor)
+            for name in variables:
+                query = (
+                    f"SELECT system.main.getvariable('{name}'), "
+                    f"typeof(system.main.getvariable('{name}')), system.main.getvariable('{name}') IS NULL"
+                )
+                assert (
+                    cursor.execute(query).fetchall() == conn.execute(query).fetchall()
+                )
+                assert (
+                    pl.scan_database(
+                        f"SELECT system.main.getvariable('{name}') IS NULL AS x", conn
+                    )
+                    .collect()
+                    .rows()
+                    == conn.execute(
+                        f"SELECT system.main.getvariable('{name}') IS NULL"
+                    ).fetchall()
+                )
+        finally:
+            cursor.close()
     finally:
         conn.close()
 
@@ -3812,7 +3840,8 @@ def _fake_adbc_session(stmt: Any) -> Any:
     return session
 
 
-def test_adbc_cancel_is_repeated_until_the_statement_runs() -> None:
+@pytest.mark.parametrize("startup_delay", [0.15, 1.6])
+def test_adbc_cancel_is_repeated_until_the_statement_runs(startup_delay: float) -> None:
     # before the driver sent the query a cancel was refused (INVALID_STATE) and lost
     import threading
 
@@ -3826,11 +3855,13 @@ def test_adbc_cancel_is_repeated_until_the_statement_runs() -> None:
 
         def cancel(self) -> None:
             if not self.running:
-                raise ProgrammingError("no query", status_code=AdbcStatusCode.INVALID_STATE)
+                raise ProgrammingError(
+                    "no query", status_code=AdbcStatusCode.INVALID_STATE
+                )
             self.stopped.set()
 
         def execute_query(self) -> Any:
-            sleep(0.15)  # the driver is not yet running the query
+            sleep(startup_delay)  # the driver is not yet running the query
             self.running = True
             if not self.stopped.wait(5):
                 raise AssertionError("the cancel was lost")
@@ -3870,3 +3901,66 @@ def test_adbc_cancelled_statement_closes_after_its_handle_is_gone() -> None:
     with pytest.raises(RuntimeError, match="cancelled"):
         session.execute("SELECT 1", None)
     assert closed == [True]
+
+
+def test_cancel_is_repeated_through_delayed_sqlite_execute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from polars.io.database._executor import ConnectionExecutor
+    from polars_database._bridge import _Session
+
+    entered = threading.Event()
+    original = ConnectionExecutor.execute
+
+    def delayed_execute(self: Any, *args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        sleep(1.6)  # longer than the former cancellation retry deadline
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ConnectionExecutor, "execute", delayed_execute)
+    with closing(sqlite3.connect(":memory:", check_same_thread=False)) as conn:
+        # Bound a regression's runtime even if every interrupt misses query startup.
+        started = monotonic()
+        conn.set_progress_handler(lambda: monotonic() - started > 6, 10000)
+        session = _Session(conn, owned=True, execute_options={})
+
+        def cancel() -> None:
+            assert entered.wait(5)
+            session.cancel()
+
+        thread = threading.Thread(target=cancel)
+        thread.start()
+        try:
+            with pytest.raises(Exception, match="interrupted|cancelled"):
+                list(
+                    session.execute(
+                        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n "
+                        "WHERE x < 100000000) SELECT sum(x) FROM n",
+                        None,
+                    )
+                )
+        finally:
+            thread.join(timeout=10)
+        assert not thread.is_alive()
+        assert monotonic() - started < 4
+        assert not session._issuing
+
+
+def test_unsupported_adbc_cancel_returns_while_issuing() -> None:
+    pytest.importorskip("adbc_driver_manager")
+    from adbc_driver_manager import NotSupportedError
+
+    class Unsupported:
+        def cancel(self) -> None:
+            raise NotSupportedError("cancel is unsupported")
+
+    session = _fake_adbc_session(Unsupported())
+    session._conn = Unsupported()
+    session._open = [session._statement("", None)]
+    session._issuing = True
+    started = monotonic()
+    session.cancel()
+    assert monotonic() - started < 1
+    assert session._cancelled

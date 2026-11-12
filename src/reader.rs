@@ -613,6 +613,7 @@ impl PartitionStream {
 
     /// The next non-empty batch, cast to the planned schema; `None` at the end.
     fn next_batch(&mut self) -> PolarsResult<Option<DataFrame>> {
+        self.check_cancelled()?;
         if let Some(df) = self.counted_rows.take() {
             self.complete = true;
             self.sent = true;
@@ -634,6 +635,7 @@ impl PartitionStream {
             }
         }
         loop {
+            self.check_cancelled()?;
             let Some(batch) = self.batches.as_mut().unwrap().next() else {
                 self.complete = true;
                 return Ok(None);
@@ -660,6 +662,7 @@ impl PartitionStream {
 
     fn next_array(&mut self) -> PolarsResult<Option<Box<dyn Array>>> {
         loop {
+            self.check_cancelled()?;
             if let Some(a) = self.pending.pop_front() {
                 return Ok(Some(a));
             }
