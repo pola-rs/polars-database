@@ -3695,7 +3695,10 @@ def test_duckdb_dropped_batches_dont_abort_the_exit(tmp_path: Path) -> None:
         f"""
         import polars as pl
         lf = pl.scan_database(
-            "t", "duckdb:///{path}", partition_predicates={preds!r}, max_connections=4
+            "t",
+            {f"duckdb:///{path}"!r},
+            partition_predicates={preds!r},
+            max_connections=4,
         )
         it = lf.collect_batches()
         next(it)
