@@ -782,7 +782,9 @@ def _cte_in_scope(table: Any, dialect: str | None) -> bool:
     """
     if table.args.get("db"):
         return False
-    name = table.name.lower()
+    # _tables has already normalized identifiers according to the dialect, including
+    # its treatment of quoted names. Folding again would conflate Postgres v and "V".
+    name = table.name
     path: list[Any] = [table]
     node = table.parent
     while node is not None:
@@ -797,7 +799,7 @@ def _cte_in_scope(table: Any, dialect: str | None) -> bool:
                 visible = next(
                     (ctes[: i + own] for i, c in enumerate(ctes) if c is inside), ctes
                 )
-            if any(c.alias_or_name.lower() == name for c in visible):
+            if any(c.alias_or_name == name for c in visible):
                 return True
         path.append(node)
         node = node.parent

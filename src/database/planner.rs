@@ -2565,7 +2565,7 @@ fn source_volatility(
             })
             .unwrap_or_default(),
     };
-    let mut seen: PlHashSet<Vec<PlSmallStr>> = PlHashSet::new();
+    let mut seen: PlHashSet<(Vec<PlSmallStr>, Vec<PlSmallStr>)> = PlHashSet::new();
     let renderer = sql_renderer().ok();
     // Functions defined in SQL (DuckDB macros, ClickHouse functions) are as volatile as
     // their bodies, which may call others, and read views.
@@ -2593,11 +2593,9 @@ fn source_volatility(
     let mut round = 0;
     'inspect: loop {
         while let Some((parts, context, own_columns)) = pending.pop() {
-            let key = context
-                .iter()
-                .chain(&parts)
-                .map(|p| p.to_lowercase().into())
-                .collect();
+            // Names are already dialect-normalized or catalog-resolved. Keep their
+            // case and resolution context: Postgres v and "V" can be different views.
+            let key = (context.clone(), parts.clone());
             if !seen.insert(key) {
                 continue;
             }

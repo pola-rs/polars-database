@@ -1134,6 +1134,61 @@ def test_unknown_functions_and_tables() -> None:
 
 
 @pytest.mark.parametrize(
+    ("dialect", "cte", "reference", "tables"),
+    [
+        ("postgres", '"V"', "v", [["v"]]),
+        ("postgres", "v", '"V"', [["V"]]),
+        ("postgres", "V", "v", []),
+        ("postgres", '"v"', "V", []),
+        ("postgres", '"V"', '"V"', []),
+        ("oracle", '"v"', "v", [["V"]]),
+        ("oracle", "v", '"v"', [["v"]]),
+        ("oracle", "v", "V", []),
+        ("oracle", '"V"', "v", []),
+        ("oracle", '"v"', '"v"', []),
+        ("sqlite", '"V"', "v", []),
+        ("sqlite", "v", '"V"', []),
+        ("duckdb", '"V"', "v", []),
+        ("duckdb", "v", '"V"', []),
+        ("clickhouse", '"V"', "v", [["v"]]),
+        ("clickhouse", "V", "v", [["v"]]),
+        ("clickhouse", '"V"', '"V"', []),
+        ("mysql", "V", "v", [["v"]]),
+        ("mysql", "`V`", "v", [["v"]]),
+        ("mysql", "v", "`V`", [["V"]]),
+        ("mysql", "`V`", "`V`", []),
+    ],
+)
+def test_cte_identifier_case(
+    dialect: str, cte: str, reference: str, tables: list[list[str]]
+) -> None:
+    from polars_database._sqlglot import inspect_query
+
+    facts = inspect_query(
+        f"WITH {cte} AS (SELECT 1) SELECT * FROM {reference}", dialect
+    )
+    assert facts["parses"]
+    assert facts["tables"] == tables
+
+
+@pytest.mark.parametrize("recursive", [False, True])
+def test_cte_identifier_case_preserves_scope(recursive: bool) -> None:
+    from polars_database._sqlglot import inspect_query
+
+    keyword = "RECURSIVE " if recursive else ""
+    facts = inspect_query(
+        f'WITH {keyword}"V" AS (SELECT * FROM "V") SELECT * FROM "V"', "postgres"
+    )
+    assert facts["tables"] == ([] if recursive else [["V"]])
+    # A prior CTE is visible in the next definition; a later one is not.
+    facts = inspect_query(
+        'WITH "V" AS (SELECT * FROM v), v AS (SELECT * FROM "V") SELECT * FROM v',
+        "postgres",
+    )
+    assert facts["tables"] == [["v"]]
+
+
+@pytest.mark.parametrize(
     ("view", "dialect", "outputs", "columns", "all_columns", "repeatable"),
     [
         (

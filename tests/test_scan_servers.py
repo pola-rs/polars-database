@@ -5317,3 +5317,41 @@ def test_psycopg_cancel_stops_later_server_fetch(
             assert not thread.is_alive()
         frames.close()
         session.close()
+
+
+@needs_postgres
+@pytest.mark.parametrize("kind", ["cte", "join"])
+def test_postgres_distinct_quoted_view_names_are_inspected(kind: str) -> None:
+    # Lowercasing the CTE names hid the real view; lowercasing the seen-view key
+    # skipped it after the stable uppercase view. Both allowed wrong-row partitions.
+    view = f"review_r20_{kind}_case_v"
+    _execute(
+        "postgres17",
+        [
+            (
+                f"CREATE OR REPLACE VIEW {view} AS "
+                "SELECT id, random() AS r FROM generate_series(1, 1000) AS id"
+            ),
+            f'CREATE OR REPLACE VIEW "{view.upper()}" AS SELECT 1 AS dummy',
+        ],
+    )
+    if kind == "cte":
+        query = f'WITH "{view.upper()}" AS (SELECT 1) SELECT * FROM {view}'
+    else:
+        query = f'SELECT v.* FROM {view} v CROSS JOIN "{view.upper()}" s'
+    for driver in ["live", *_runnable_drivers("postgres17", ["psycopg", "adbc"])]:
+        assert _scan("postgres17", driver, query).collect().height == 1000
+        for schema in [None, {"id": pl.Int32, "r": pl.Float64}]:
+            lf = _scan(
+                "postgres17",
+                driver,
+                query,
+                schema=schema,
+                partition_on="r",
+                partition_num=2,
+                partition_range=(0, 1),
+            )
+            with pytest.raises(
+                pl.exceptions.InvalidOperationError, match="partitioned"
+            ):
+                lf.collect()
