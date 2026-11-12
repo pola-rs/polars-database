@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import threading
+import time
 import weakref
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _dist_version
@@ -1858,6 +1859,11 @@ def _live_state(conn: Any) -> _ConnectionState:
             return _LIVE_STATES_BY_ID.setdefault(id(conn), _ConnectionState())
 
 
+_CANCELLED = "the database read was cancelled"
+# how long `_Session.cancel` repeats itself for a statement that is starting
+_CANCEL_RETRY_SECONDS = 1.0
+
+
 class _Session:
     """A connection used by one partition reader at a time."""
 
@@ -1891,6 +1897,16 @@ class _Session:
         self._restore: list[str] | None = None
         # stopped by `cancel` through its socket: the connection is unusable
         self._aborted = False
+        # `cancel` is sticky: a statement not yet issued then never is (a cancel before
+        # it started had nothing to stop). A cancelled session is never given back to a
+        # pool, so the flag can't reach another scan.
+        self._cancel_lock = threading.Lock()
+        self._cancelled = False
+        # what runs the statement where that isn't the connection: a DuckDB cursor
+        # (a connection of its own, which `interrupt` on `conn` doesn't reach)
+        self._running: Any = None
+        # between the check of `_cancelled` and the driver call's return
+        self._issuing = False
         module = _module_of(conn)
         # PyMySQL and pg8000 have no cancel, and closing PyMySQL's unbuffered cursor
         # reads the rest of the result; a cancelled session is never reused, so its
@@ -2014,6 +2030,16 @@ class _Session:
                 if params is not None:
                     # each driver names the parameters argument of `execute()` itself
                     options[_params_keyword(cx)] = params
+                runner = (
+                    cx.cursor
+                    if cx.driver_name == "duckdb" and cx.cursor is not self.conn
+                    else None
+                )
+                with self._cancel_lock:
+                    if self._cancelled:
+                        raise RuntimeError(_CANCELLED)
+                    self._running = runner
+                    self._issuing = True
                 exec_driver_sql = (
                     _exec_driver_sql(cx.cursor)
                     if raw_sqlalchemy
@@ -2071,6 +2097,10 @@ class _Session:
             while True:
                 with state.lock:
                     df = next(frames, None)
+                # Server-side cursors only declare the statement in `execute`: it runs at
+                # the first fetch, so a cancel is repeated until that returns.
+                with self._cancel_lock:
+                    self._issuing = False
                 if df is None:
                     break
                 empty = False
@@ -2094,6 +2124,9 @@ class _Session:
             # Polars may do after `collect()` returned: on a live connection, nothing
             # here may then send a statement that could fail in, or end, a transaction
             # of the user's.
+            with self._cancel_lock:
+                self._running = None
+                self._issuing = False
             with state.lock:
                 if (
                     self._aborted
@@ -2224,15 +2257,37 @@ class _Session:
         if not self.owned:
             # see `can_cancel`
             return
+        with self._cancel_lock:
+            self._cancelled = True
+            running = self._running
         if self._abort_socket:
             self._aborted = True
             _shutdown_socket(self.conn)
             return
-        target = _cancel_target(self.conn)
+        target = running if running is not None else _cancel_target(self.conn)
         for m in ("cancel", "interrupt"):
             if callable(f := getattr(target, m, None)):
+                break
+        else:
+            return
+        deadline = time.monotonic() + _CANCEL_RETRY_SECONDS
+        delay = 0.02
+        while True:
+            try:
                 f()
+            except Exception:
+                # the statement ended, and its cursor with it, meanwhile
+                if running is None or self._running is running:
+                    raise
                 return
+            # A statement past the check of `_cancelled` but not yet at the driver isn't
+            # there to stop: asked again until the driver call returns (the stopped
+            # statement ends it).
+            if not self._issuing or time.monotonic() >= deadline:
+                return
+            # a cursor's cancel may open a connection of its own: backing off
+            time.sleep(delay)
+            delay = min(delay * 2, 0.25)
 
     def close(self) -> None:
         if self._setup_ran and self._close is None:
@@ -2484,6 +2539,11 @@ class _AdbcSession:
         # the last one
         self._open: list[Any] = []
         self._closed = False
+        # `cancel` is sticky (see `_Session`): no statement starts after it
+        self._cancelled = False
+        # a statement is being executed: a cancel may find the driver not running it yet
+        # (before the query is sent, or between its round trips), so it is repeated
+        self._issuing = False
 
     def _statement(self, sql: str, hint: tuple[str, str] | None) -> Any:
         from adbc_driver_manager import AdbcStatement
@@ -2505,29 +2565,47 @@ class _AdbcSession:
     def execute(self, sql: str, hint: tuple[str, str] | None) -> tuple[Any, Any]:
         """Run a query: `(Arrow C stream capsule, statement)`; see `release`."""
         stmt = self._statement(sql, hint)
-        with self._lock:
-            self._open.append(stmt)
+        self._begin(stmt)
         try:
             handle, _ = stmt.execute_query()
+            with self._lock:
+                self._issuing = False
+            # a cancel that came as the statement started may have found it not running;
+            # the handle goes before the statement is closed
+            if self._cancelled:
+                del handle
+                raise RuntimeError(_CANCELLED)
             return handle.__arrow_c_stream__(), stmt
         except BaseException:
+            with self._lock:
+                self._issuing = False
             self.release(stmt)
             raise
 
     def execute_update(self, sql: str) -> None:
         stmt = self._statement(sql, None)
-        with self._lock:
-            self._open.append(stmt)
+        self._begin(stmt)
         try:
             stmt.execute_update()
         finally:
             self.release(stmt)
+
+    def _begin(self, stmt: Any) -> None:
+        """Registers a statement about to run, unless the session was cancelled."""
+        with self._lock:
+            if not self._cancelled:
+                self._open.append(stmt)
+                self._issuing = True
+                return
+        stmt.close()
+        raise RuntimeError(_CANCELLED)
 
     def release(self, stmt: Any) -> None:
         """Close a statement once its result stream is released."""
         with self._lock:
             with contextlib.suppress(ValueError):
                 self._open.remove(stmt)
+            self._issuing = False
             close_conn = self._closed and not self._open
         try:
             with self._handle_lock:
@@ -2540,26 +2618,36 @@ class _AdbcSession:
         from adbc_driver_manager import AdbcStatusCode, NotSupportedError
 
         with self._lock:
-            stmt = self._open[-1] if self._open else None
-        if stmt is None:
-            return
-        try:
-            with self._handle_lock:
-                # released meanwhile: nothing to cancel
-                if stmt not in self._open:
-                    return
-                try:
-                    stmt.cancel()
-                except NotSupportedError:
-                    try:
-                        self._conn.cancel()
-                    except NotSupportedError:
-                        # an ADBC 1.0 driver: it can't cancel
+            self._cancelled = True
+        deadline = time.monotonic() + _CANCEL_RETRY_SECONDS
+        delay = 0.02
+        while True:
+            with self._lock:
+                stmt = self._open[-1] if self._open else None
+                issuing = self._issuing
+            if stmt is None:
+                return
+            try:
+                with self._handle_lock:
+                    # released meanwhile: nothing to cancel
+                    if stmt not in self._open:
                         return
-        except Exception as e:
-            # nothing running: nothing to cancel
-            if getattr(e, "status_code", None) != AdbcStatusCode.INVALID_STATE:
-                raise
+                    try:
+                        stmt.cancel()
+                    except NotSupportedError:
+                        try:
+                            self._conn.cancel()
+                        except NotSupportedError:
+                            # an ADBC 1.0 driver: it can't cancel
+                            return
+            except Exception as e:
+                # nothing running (yet): asked again while the statement is executing
+                if getattr(e, "status_code", None) != AdbcStatusCode.INVALID_STATE:
+                    raise
+            if not issuing or time.monotonic() >= deadline:
+                return
+            time.sleep(delay)
+            delay = min(delay * 2, 0.25)
 
     def close(self) -> None:
         with self._lock:

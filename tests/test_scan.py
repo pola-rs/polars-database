@@ -9,6 +9,7 @@ import textwrap
 from contextlib import closing
 from datetime import date, datetime, time
 from decimal import Decimal
+from time import monotonic, sleep
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote
 
@@ -3644,3 +3645,225 @@ def test_datetime_read_as_time_is_refused(tmp_path: Path) -> None:
     lf = pl.scan_database("t", f"duckdb:///{path}", schema={"ts": pl.Time})
     with pytest.raises(Exception, match="would drop"):
         lf.collect()
+
+
+_DUCK_SLOW = (
+    "(SELECT count(*) FROM range(40000) a, range(40000) b "
+    "WHERE a.range + b.range < 0) >= 0"
+)
+
+
+def _duckdb_error_partitions() -> list[str]:
+    # partition 0 fails at once, the others run a statement of several seconds
+    return ["id < 10 AND error('boom') IS NULL"] + [
+        f"id >= {10 * i} AND id < {10 * (i + 1)} AND {_DUCK_SLOW}" for i in range(1, 4)
+    ]
+
+
+@pytest.mark.parametrize("kind", ["uri", "factory"])
+def test_duckdb_error_cancels_the_other_partitions(tmp_path: Path, kind: str) -> None:
+    # a DuckDB scan runs on a cursor (a connection of its own): the cancel interrupted
+    # the user's connection instead, so the error waited for the slowest partition
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE TABLE t AS SELECT range::INTEGER AS id FROM range(100)")
+    source: Any = f"duckdb:///{path}" if kind == "uri" else lambda: duckdb.connect(path)
+    lf = pl.scan_database(
+        "t",
+        source,
+        partition_predicates=_duckdb_error_partitions(),
+        max_connections=4,
+    )
+    start = monotonic()
+    with pytest.raises(Exception, match="boom"):
+        lf.collect()
+    assert monotonic() - start < 2.5
+
+
+def test_duckdb_dropped_batches_dont_abort_the_exit(tmp_path: Path) -> None:
+    # the exit cancel interrupted the wrong connection: DuckDB aborted the process
+    duckdb = pytest.importorskip("duckdb")
+    path = str(tmp_path / "t.duckdb")
+    with duckdb.connect(path) as conn:
+        conn.execute("CREATE TABLE t AS SELECT range::INTEGER AS id FROM range(100)")
+    slow = _DUCK_SLOW.replace("40000", "60000")
+    preds = ["id < 10"] + [
+        f"id >= {10 * i} AND id < {10 * (i + 1)} AND {slow}" for i in range(1, 4)
+    ]
+    code = textwrap.dedent(
+        f"""
+        import polars as pl
+        lf = pl.scan_database(
+            "t", "duckdb:///{path}", partition_predicates={preds!r}, max_connections=4
+        )
+        it = lf.collect_batches()
+        next(it)
+        del it
+        """
+    )
+    start = monotonic()
+    proc = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert monotonic() - start < 20
+
+
+def test_cancel_before_the_statement_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a cancel in the setup before the driver call found nothing to stop, and the
+    # statement then ran to its end
+    from polars_database import _bridge
+
+    path = str(tmp_path / "t.db")
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER)")
+        conn.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(100)])
+        conn.execute("CREATE TABLE w (x INTEGER)")
+        conn.executemany("INSERT INTO w VALUES (?)", [(i,) for i in range(30000)])
+        conn.commit()
+    slow = "(SELECT count(*) FROM w a, w b) > 0"
+    preds = ["id < 10 AND abs(-9223372036854775807-1) > 0"] + [
+        f"id >= {10 * i} AND id < {10 * (i + 1)} AND {slow}" for i in range(1, 4)
+    ]
+    original_cursor = _bridge._Session._server_cursor
+    original_execute = _bridge._Session.execute
+
+    def execute(self: Any, sql: str, batch_size: Any, bind: bool = True) -> Any:
+        # the planner's own lookups (`bind=False`) run at the normal speed
+        self.slow_setup = bind
+        return original_execute(self, sql, batch_size, bind)
+
+    def slow_setup(self: Any, batch_size: int) -> Any:
+        if getattr(self, "slow_setup", False):
+            sleep(0.5)
+        return original_cursor(self, batch_size)
+
+    monkeypatch.setattr(_bridge._Session, "execute", execute)
+    monkeypatch.setattr(_bridge._Session, "_server_cursor", slow_setup)
+    lf = pl.scan_database(
+        "t",
+        f"sqlite:///{path}",
+        driver="sqlite3",
+        partition_predicates=preds,
+        max_connections=4,
+    )
+    start = monotonic()
+    with pytest.raises(Exception, match="integer overflow"):
+        lf.collect()
+    assert monotonic() - start < 3
+
+
+def test_cancelled_session_starts_no_statement(tmp_path: Path) -> None:
+    # `cancel` is sticky: one that came before the statement had nothing to stop
+    from polars_database._bridge import _Session
+
+    path = str(tmp_path / "t.db")
+    with closing(sqlite3.connect(path, check_same_thread=False)) as conn:
+        session = _Session(conn, owned=True, execute_options={})
+        assert session.can_cancel
+        session.cancel()
+        with pytest.raises(RuntimeError, match="cancelled"):
+            list(session.execute("SELECT 1", None))
+
+
+def test_cancelled_adbc_session_starts_no_statement(tmp_path: Path) -> None:
+    adbc_sqlite = pytest.importorskip("adbc_driver_sqlite")
+    from polars_database._bridge import adbc_connect
+
+    session = adbc_connect(
+        adbc_sqlite._driver_path(), None, [("uri", f"file:{tmp_path}/a.db")], []
+    )
+    try:
+        session.cancel()
+        with pytest.raises(RuntimeError, match="cancelled"):
+            session.execute("SELECT 1", None)
+        with pytest.raises(RuntimeError, match="cancelled"):
+            session.execute_update("SELECT 1")
+        assert not session._open
+    finally:
+        session.close()
+
+
+class _FakeHandle:
+    def __arrow_c_stream__(self) -> Any:  # pragma: no cover
+        raise AssertionError("a cancelled statement's stream was taken")
+
+
+def _fake_adbc_session(stmt: Any) -> Any:
+    import threading
+
+    from polars_database._bridge import _AdbcSession
+
+    session = object.__new__(_AdbcSession)
+    session._lock = threading.Lock()
+    session._handle_lock = threading.Lock()
+    session._open = []
+    session._closed = False
+    session._cancelled = False
+    session._issuing = False
+    session._conn = None
+    session._statement = lambda sql, hint: stmt  # type: ignore[method-assign]
+    return session
+
+
+def test_adbc_cancel_is_repeated_until_the_statement_runs() -> None:
+    # before the driver sent the query a cancel was refused (INVALID_STATE) and lost
+    import threading
+
+    pytest.importorskip("adbc_driver_manager")
+    from adbc_driver_manager import AdbcStatusCode, ProgrammingError
+
+    class Stmt:
+        def __init__(self) -> None:
+            self.running = False
+            self.stopped = threading.Event()
+
+        def cancel(self) -> None:
+            if not self.running:
+                raise ProgrammingError("no query", status_code=AdbcStatusCode.INVALID_STATE)
+            self.stopped.set()
+
+        def execute_query(self) -> Any:
+            sleep(0.15)  # the driver is not yet running the query
+            self.running = True
+            if not self.stopped.wait(5):
+                raise AssertionError("the cancel was lost")
+            return _FakeHandle(), 0
+
+        def close(self) -> None:
+            pass
+
+    stmt = Stmt()
+    session = _fake_adbc_session(stmt)
+    thread = threading.Thread(target=lambda: (sleep(0.05), session.cancel()))
+    thread.start()
+    with pytest.raises(RuntimeError, match="cancelled"):
+        session.execute("SELECT 1", None)
+    thread.join()
+    assert stmt.stopped.is_set()
+
+
+def test_adbc_cancelled_statement_closes_after_its_handle_is_gone() -> None:
+    import weakref
+
+    pytest.importorskip("adbc_driver_manager")
+    refs: list[Any] = []
+    closed: list[bool] = []
+
+    class Stmt:
+        def execute_query(self) -> Any:
+            session._cancelled = True
+            handle = _FakeHandle()
+            refs.append(weakref.ref(handle))
+            return handle, 0
+
+        def close(self) -> None:
+            closed.append(refs[0]() is None)
+
+    session = _fake_adbc_session(Stmt())
+    with pytest.raises(RuntimeError, match="cancelled"):
+        session.execute("SELECT 1", None)
+    assert closed == [True]

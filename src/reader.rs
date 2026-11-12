@@ -419,6 +419,10 @@ impl PartitionReader {
             drop(session);
         }
         let n = r.map_err(|e| out_of_range_date_hint(e).context(self.context().into()))?;
+        // A cancel that came as the statement started may have found nothing to stop.
+        if cancelled {
+            polars_bail!(ComputeError: "the database read was cancelled");
+        }
         *self.n_rows.lock().unwrap() = Some(n);
         Ok(n)
     }
@@ -571,7 +575,9 @@ impl PartitionStream {
         let batches = session.execute(&self.sql, self.batch_size);
         self.session = Some(session);
         self.batches = Some(batches?);
-        Ok(())
+        // A cancel between publishing the handle and the statement running had nothing to
+        // stop (the session also refuses to start one once cancelled).
+        self.check_cancelled()
     }
 
     /// Nothing was sent: retries on a new session, in the same pool slot.
@@ -595,7 +601,7 @@ impl PartitionStream {
             polars_bail!(ComputeError: "the database read was cancelled");
         }
         self.batches = Some(session.execute(&self.sql, self.batch_size)?);
-        Ok(())
+        self.check_cancelled()
     }
 
     fn cast(&self, df: &DataFrame) -> PolarsResult<DataFrame> {
@@ -632,6 +638,9 @@ impl PartitionStream {
                 self.complete = true;
                 return Ok(None);
             };
+            // The first `next` is where a Python statement starts: a cancel that landed
+            // before it is stopped here, if the session didn't refuse the statement.
+            self.check_cancelled()?;
             let batch = match batch {
                 Ok(b) => b,
                 Err(e) if self.retryable(&e) => {
