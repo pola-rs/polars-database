@@ -583,6 +583,18 @@ impl DialectName {
         format!("'{out}'")
     }
 
+    /// Quotes a string literal that may hold any Unicode text: SQL Server reads a plain
+    /// literal in the database's code page, turning what it lacks into `?`, so it takes
+    /// the `N` prefix.
+    pub fn quote_nstr(self, s: &str) -> String {
+        let lit = self.quote_str(s);
+        if self == Self::Mssql {
+            format!("N{lit}")
+        } else {
+            lit
+        }
+    }
+
     /// Quotes an identifier for the fixed metadata and partitioning queries.
     pub fn quote_ident(self, s: &str) -> String {
         match self {
@@ -748,6 +760,8 @@ mod tests {
     fn quoting() {
         assert_eq!(DialectName::Mysql.quote_str("a'b\\c"), "'a''b\\\\c'");
         assert_eq!(DialectName::Postgresql.quote_str("a'b"), "'a''b'");
+        assert_eq!(DialectName::Mssql.quote_nstr("\u{e9}'"), "N'\u{e9}'''");
+        assert_eq!(DialectName::Postgresql.quote_nstr("\u{e9}"), "'\u{e9}'");
         assert_eq!(DialectName::Postgresql.quote_str("a'b\\c"), "E'a''b\\\\c'");
         assert_eq!(DialectName::Postgresql.quote_ident("a\"b"), "\"a\"\"b\"");
         assert_eq!(DialectName::Mssql.quote_ident("a]b"), "[a]]b]");

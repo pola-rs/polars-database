@@ -1231,15 +1231,46 @@ pub fn view_definition(
             "SELECT CASE WHEN o.type = 'V' THEN 1 ELSE 0 END, \
             CASE WHEN o.type = 'V' THEN OBJECT_DEFINITION(o.object_id) END \
             FROM sys.objects o WHERE o.object_id = OBJECT_ID({})",
-            dialect.quote_str(&qualified)
+            dialect.quote_nstr(&qualified)
         ),
         _ => return ViewLookup::Unknown,
     };
-    let Some(df) = run(&sql) else {
+    let Some(mut df) = run(&sql) else {
         return ViewLookup::Failed;
     };
     if df.height() == 0 {
-        return ViewLookup::NotAView;
+        if dialect != DialectName::Mssql {
+            return ViewLookup::NotAView;
+        }
+        // The name may be folded: sqlglot lower-cases every SQL Server name, quoted
+        // ones too, which `OBJECT_ID` doesn't find on a case-sensitive collation.
+        // Anything of the name in any case is taken for what it is; where several are,
+        // or the name is another database's, the lookup fails (a view may be hiding).
+        if name.starts_with('#') {
+            return ViewLookup::NotAView;
+        }
+        if parts.len() >= 3 {
+            return ViewLookup::Failed;
+        }
+        let in_schema = schema.map_or_else(String::new, |sc| {
+            format!(
+                " AND LOWER(SCHEMA_NAME(o.schema_id)) = LOWER({})",
+                dialect.quote_nstr(sc)
+            )
+        });
+        let Some(found) = run(&format!(
+            "SELECT TOP 2 CASE WHEN o.type = 'V' THEN 1 ELSE 0 END, \
+            CASE WHEN o.type = 'V' THEN OBJECT_DEFINITION(o.object_id) END \
+            FROM sys.objects o WHERE LOWER(o.name) = LOWER({}){in_schema}",
+            dialect.quote_nstr(name)
+        )) else {
+            return ViewLookup::Failed;
+        };
+        match found.height() {
+            0 => return ViewLookup::NotAView,
+            1 => df = found,
+            _ => return ViewLookup::Failed,
+        }
     }
     let is_view = match cell(&df, 0, 0) {
         Some(AnyValue::Boolean(b)) => b,
@@ -1288,21 +1319,21 @@ pub fn volatile_functions(
     }
     let list = names
         .iter()
-        .map(|n| dialect.quote_str(n))
+        .map(|n| dialect.quote_nstr(n))
         .collect::<Vec<_>>()
         .join(", ");
     let builtins = if replaceable.is_empty() {
-        dialect.quote_str("")
+        dialect.quote_nstr("")
     } else {
         replaceable
             .iter()
-            .map(|n| dialect.quote_str(n))
+            .map(|n| dialect.quote_nstr(n))
             .collect::<Vec<_>>()
             .join(", ")
     };
     let upper = names
         .iter()
-        .map(|n| dialect.quote_str(&n.to_uppercase()))
+        .map(|n| dialect.quote_nstr(&n.to_uppercase()))
         .collect::<Vec<_>>()
         .join(", ");
     // `(volatile count[, body[, stable count]])` rows
@@ -1484,6 +1515,151 @@ mod tests {
         assert_eq!(lookup, ViewLookup::Failed);
         let lookup = view_definition(&mut Fake { fail: "\0" }, pg, &parts, &[]);
         assert_eq!(lookup, ViewLookup::NotAView);
+    }
+
+    /// Records the lookups; answers each with the frame `answer` builds from its SQL.
+    struct Recorder<F: FnMut(&str) -> DataFrame + Send> {
+        log: Vec<String>,
+        answer: F,
+    }
+
+    impl<F: FnMut(&str) -> DataFrame + Send> DatabaseSession for Recorder<F> {
+        fn execute(&mut self, sql: &str, _: Option<usize>) -> PolarsResult<BatchIter> {
+            self.log.push(sql.to_string());
+            let df = (self.answer)(sql);
+            Ok(Box::new(std::iter::once(Ok(df))))
+        }
+    }
+
+    fn rows(views: &[bool]) -> DataFrame {
+        let def = views
+            .iter()
+            .map(|v| v.then_some("SELECT 1"))
+            .collect::<Vec<_>>();
+        let flags = views.iter().map(|&v| i32::from(v)).collect::<Vec<_>>();
+        DataFrame::new(
+            views.len(),
+            vec![Column::new("a".into(), flags), Column::new("b".into(), def)],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mssql_lookups_use_unicode_literals() {
+        let ms = DialectName::Mssql;
+        let mut s = Recorder {
+            log: vec![],
+            answer: |_: &str| rows(&[true]),
+        };
+        let lookup = view_definition(&mut s, ms, &["dbo".into(), "v\u{e9}'".into()], &[]);
+        assert!(matches!(lookup, ViewLookup::View { .. }));
+        assert!(
+            s.log[0].contains("OBJECT_ID(N'[dbo].[v\u{e9}'']')"),
+            "{}",
+            s.log[0]
+        );
+        let mut s = Recorder {
+            log: vec![],
+            answer: |_: &str| rows(&[]),
+        };
+        let names = ["f\u{e9}".into()];
+        volatile_functions(&mut s, ms, &names, &["l\u{e9}".into()]);
+        assert!(s.log[0].contains("IN (N'f\u{e9}')"), "{}", s.log[0]);
+        // not another dialect
+        let mut s = Recorder {
+            log: vec![],
+            answer: |_: &str| rows(&[]),
+        };
+        volatile_functions(&mut s, DialectName::Postgresql, &names, &[]);
+        assert!(!s.log[0].contains("N'"), "{}", s.log[0]);
+    }
+
+    #[test]
+    fn mssql_view_lookup_survives_folded_names() {
+        let ms = DialectName::Mssql;
+        let parts = ["dbo".into(), "v".into()];
+        // `OBJECT_ID` finds nothing (a case-sensitive collation, `V` folded to `v`): the
+        // search in any case finds the view
+        let answer = |sql: &str| {
+            if sql.contains("OBJECT_ID") {
+                rows(&[])
+            } else {
+                rows(&[true])
+            }
+        };
+        let mut s = Recorder {
+            log: vec![],
+            answer,
+        };
+        let lookup = view_definition(&mut s, ms, &parts, &[]);
+        assert_eq!(s.log.len(), 2);
+        assert!(
+            s.log[1].contains("LOWER(o.name) = LOWER(N'v')"),
+            "{}",
+            s.log[1]
+        );
+        assert!(s.log[1].contains("LOWER(SCHEMA_NAME(o.schema_id)) = LOWER(N'dbo')"));
+        assert_eq!(
+            lookup,
+            ViewLookup::View {
+                sql: "SELECT 1".into(),
+                qualifier: vec![]
+            }
+        );
+        // a table of the name in another case is a table
+        let answer = |sql: &str| {
+            if sql.contains("OBJECT_ID") {
+                rows(&[])
+            } else {
+                rows(&[false])
+            }
+        };
+        let mut s = Recorder {
+            log: vec![],
+            answer,
+        };
+        assert_eq!(
+            view_definition(&mut s, ms, &parts, &[]),
+            ViewLookup::NotAView
+        );
+        // several: it may be any of them
+        let answer = |sql: &str| {
+            if sql.contains("OBJECT_ID") {
+                rows(&[])
+            } else {
+                rows(&[false, true])
+            }
+        };
+        let mut s = Recorder {
+            log: vec![],
+            answer,
+        };
+        assert_eq!(view_definition(&mut s, ms, &parts, &[]), ViewLookup::Failed);
+        // nothing of the name in any case; another database's name cannot be searched
+        let mut s = Recorder {
+            log: vec![],
+            answer: |_: &str| rows(&[]),
+        };
+        assert_eq!(
+            view_definition(&mut s, ms, &parts, &[]),
+            ViewLookup::NotAView
+        );
+        let mut s = Recorder {
+            log: vec![],
+            answer: |_: &str| rows(&[]),
+        };
+        let three = ["db".into(), "dbo".into(), "v".into()];
+        assert_eq!(view_definition(&mut s, ms, &three, &[]), ViewLookup::Failed);
+        // a table `OBJECT_ID` finds takes one lookup
+        let mut s = Recorder {
+            log: vec![],
+            answer: |_: &str| rows(&[false]),
+        };
+        assert_eq!(
+            view_definition(&mut s, ms, &parts, &[]),
+            ViewLookup::NotAView
+        );
+        assert_eq!(s.log.len(), 1);
     }
 
     #[test]

@@ -1157,6 +1157,13 @@ def test_unknown_functions_and_tables() -> None:
         ("mysql", "`V`", "v", [["v"]]),
         ("mysql", "v", "`V`", [["V"]]),
         ("mysql", "`V`", "`V`", []),
+        # SQL Server's collation may be case-sensitive: names stay as written, and a CTE
+        # hides only the exact name
+        ("tsql", "V", "v", [["v"]]),
+        ("tsql", "[V]", "v", [["v"]]),
+        ("tsql", "v", "[V]", [["V"]]),
+        ("tsql", "V", "V", []),
+        ("tsql", "[V]", "[V]", []),
     ],
 )
 def test_cte_identifier_case(
@@ -1169,6 +1176,19 @@ def test_cte_identifier_case(
     )
     assert facts["parses"]
     assert facts["tables"] == tables
+
+
+def test_tsql_names_keep_their_case() -> None:
+    from polars_database._sqlglot import inspect_query
+
+    assert inspect_query("SELECT * FROM Orders", "tsql")["tables"] == [["Orders"]]
+    facts = inspect_query("SELECT * FROM [Dbo].[Orders] o JOIN v ON 1 = 1", "tsql")
+    assert sorted(facts["tables"]) == [["Dbo", "Orders"], ["v"]]
+    # a nested reference too: the view's query is inspected as written
+    facts = inspect_query(
+        "SELECT * FROM [Dbo].[V] WHERE id IN (SELECT id FROM W)", "tsql"
+    )
+    assert sorted(facts["tables"]) == [["Dbo", "V"], ["W"]]
 
 
 @pytest.mark.parametrize("recursive", [False, True])

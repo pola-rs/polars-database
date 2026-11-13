@@ -391,6 +391,8 @@ fn _at_exit(py: Python<'_>) {
     use std::time::Duration;
     let ended = py.detach(|| {
         crate::reader::wait_for_scans(Duration::from_secs(2)) || {
+            // (a driver call that ignores the interrupt is asked for two seconds, not forever)
+            bridge::begin_exit_cancel();
             crate::reader::cancel_running_statements();
             crate::reader::wait_for_scans(Duration::from_secs(2))
         }

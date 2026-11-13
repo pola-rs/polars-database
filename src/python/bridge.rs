@@ -67,6 +67,15 @@ pub(crate) fn take_stream(capsule: &Bound<'_, PyAny>) -> PyResult<Box<ArrowArray
 /// which aborts the process inside Rust frames.
 pub(crate) static EXITING: AtomicBool = AtomicBool::new(false);
 
+/// Bounds the retries of the cancels that follow (`_at_exit`): a driver call that ignores the
+/// interrupt must not hold the exit.
+pub(crate) fn begin_exit_cancel() {
+    let _ = Python::attach(|py| -> PyResult<()> {
+        bridge_module(py)?.call_method0("begin_exit_cancel")?;
+        Ok(())
+    });
+}
+
 fn exiting() -> bool {
     EXITING.load(Ordering::Acquire)
 }

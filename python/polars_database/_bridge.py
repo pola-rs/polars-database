@@ -1868,6 +1868,25 @@ def _live_state(conn: Any) -> _ConnectionState:
 
 _CANCELLED = "the database read was cancelled"
 
+# A cancel asks again until its driver call returns (the stopped statement ends it), however
+# long that takes: a statement past the check of `_cancelled` but not yet at the driver isn't
+# there to stop. At interpreter exit every cancel stops asking after this long, together:
+# a driver call that ignores the interrupt must not hold the exit.
+_EXIT_CANCEL_SECONDS = 2.0
+_exit_cancel_deadline: float | None = None
+
+
+def begin_exit_cancel() -> None:
+    """Ends the retries of every cancel `_EXIT_CANCEL_SECONDS` from now (`_at_exit`)."""
+    global _exit_cancel_deadline
+    if _exit_cancel_deadline is None:
+        _exit_cancel_deadline = time.monotonic() + _EXIT_CANCEL_SECONDS
+
+
+def _cancel_expired() -> bool:
+    deadline = _exit_cancel_deadline
+    return deadline is not None and time.monotonic() >= deadline
+
 
 class _Session:
     """A connection used by one partition reader at a time."""
@@ -2294,7 +2313,7 @@ class _Session:
             # A statement past the check of `_cancelled` but not yet at the driver isn't
             # there to stop: asked again until the driver call returns (the stopped
             # statement ends it).
-            if not self._issuing:
+            if not self._issuing or _cancel_expired():
                 return
             # a cursor's cancel may open a connection of its own: backing off
             time.sleep(delay)
@@ -2654,7 +2673,7 @@ class _AdbcSession:
                 # nothing running (yet): asked again while the statement is executing
                 if getattr(e, "status_code", None) != AdbcStatusCode.INVALID_STATE:
                     raise
-            if not issuing:
+            if not issuing or _cancel_expired():
                 return
             time.sleep(delay)
             delay = min(delay * 2, 0.25)

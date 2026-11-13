@@ -3988,6 +3988,36 @@ def test_cancel_is_repeated_through_delayed_sqlite_execute(
         assert not session._issuing
 
 
+def test_cancel_at_exit_gives_up_on_a_driver_call_that_ignores_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from polars_database import _bridge
+
+    pytest.importorskip("adbc_driver_manager")
+    from adbc_driver_manager import AdbcStatusCode, ProgrammingError
+
+    class Ignoring:
+        def cancel(self) -> None:
+            raise ProgrammingError("no query", status_code=AdbcStatusCode.INVALID_STATE)
+
+    monkeypatch.setattr(_bridge, "_EXIT_CANCEL_SECONDS", 0.3)
+    monkeypatch.setattr(_bridge, "_exit_cancel_deadline", None)
+    adbc = _fake_adbc_session(Ignoring())
+    adbc._open = [adbc._statement("", None)]
+    adbc._issuing = True
+    with closing(sqlite3.connect(":memory:", check_same_thread=False)) as conn:
+        session = _bridge._Session(conn, owned=True, execute_options={})
+        session._issuing = True
+        _bridge.begin_exit_cancel()
+        started = monotonic()
+        for s in (session, adbc):
+            s.cancel()
+            assert s._cancelled
+        # the deadline is shared: the second cancel found it expired
+        assert monotonic() - started < 2
+        assert _bridge._cancel_expired()
+
+
 def test_unsupported_adbc_cancel_returns_while_issuing() -> None:
     pytest.importorskip("adbc_driver_manager")
     from adbc_driver_manager import NotSupportedError

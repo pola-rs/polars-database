@@ -783,7 +783,8 @@ def _cte_in_scope(table: Any, dialect: str | None) -> bool:
     if table.args.get("db"):
         return False
     # _tables has already normalized identifiers according to the dialect, including
-    # its treatment of quoted names. Folding again would conflate Postgres v and "V".
+    # its treatment of quoted names (SQL Server's stay as written). Folding again would
+    # conflate Postgres v and "V".
     name = table.name
     path: list[Any] = [table]
     node = table.parent
@@ -815,7 +816,15 @@ def _tables(stmt: Any, dialect: str | None) -> list[list[str]]:
     """
     from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 
-    stmt = normalize_identifiers(stmt.copy(), dialect=dialect)
+    # SQL Server's names fold by the collation of the database, case-sensitive on some:
+    # sqlglot lower-cases them all, quoted ones too, so `V` (a view) and `v` (a CTE)
+    # would conflate, and the catalog would look up `v`. They stay as written: the
+    # catalog lookup compares them as the database does, and a CTE hides only a name
+    # of its exact case (a case-insensitive database may look up a name its CTE hides).
+    if dialect == "tsql":
+        stmt = stmt.copy()
+    else:
+        stmt = normalize_identifiers(stmt.copy(), dialect=dialect)
     tables: list[list[str]] = []
     for t in stmt.find_all(exp.Table):
         if isinstance(t.this, exp.Identifier):
