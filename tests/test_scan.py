@@ -3991,6 +3991,8 @@ def test_cancel_is_repeated_through_delayed_sqlite_execute(
 def test_cancel_at_exit_gives_up_on_a_driver_call_that_ignores_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import threading
+
     from polars_database import _bridge
 
     pytest.importorskip("adbc_driver_manager")
@@ -4016,6 +4018,24 @@ def test_cancel_at_exit_gives_up_on_a_driver_call_that_ignores_it(
         # the deadline is shared: the second cancel found it expired
         assert monotonic() - started < 2
         assert _bridge._cancel_expired()
+        # after the exit, cancels retry until the driver call returns again
+        _bridge.end_exit_cancel()
+        assert not _bridge._cancel_expired()
+        calls = 0
+
+        class Slow:
+            def cancel(self) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    sleep(0.5)  # past the former deadline: still asked again
+
+        adbc = _fake_adbc_session(Slow())
+        adbc._open = [adbc._statement("", None)]
+        adbc._issuing = True
+        threading.Timer(1.0, lambda: setattr(adbc, "_issuing", False)).start()
+        adbc.cancel()
+        assert calls > 2
 
 
 def test_unsupported_adbc_cancel_returns_while_issuing() -> None:

@@ -1883,6 +1883,12 @@ def begin_exit_cancel() -> None:
         _exit_cancel_deadline = time.monotonic() + _EXIT_CANCEL_SECONDS
 
 
+def end_exit_cancel() -> None:
+    """Lifts the bound: a scan in a user's `atexit` hook after `_at_exit` cancels as usual."""
+    global _exit_cancel_deadline
+    _exit_cancel_deadline = None
+
+
 def _cancel_expired() -> bool:
     deadline = _exit_cancel_deadline
     return deadline is not None and time.monotonic() >= deadline

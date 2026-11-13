@@ -1229,7 +1229,9 @@ pub fn view_definition(
         },
         DialectName::Mssql => format!(
             "SELECT CASE WHEN o.type = 'V' THEN 1 ELSE 0 END, \
-            CASE WHEN o.type = 'V' THEN OBJECT_DEFINITION(o.object_id) END \
+            CASE WHEN o.type = 'V' THEN OBJECT_DEFINITION(o.object_id) END, \
+            CASE WHEN o.type = 'SN' THEN (SELECT s.base_object_name FROM sys.synonyms s \
+            WHERE s.object_id = o.object_id) END \
             FROM sys.objects o WHERE o.object_id = OBJECT_ID({})",
             dialect.quote_nstr(&qualified)
         ),
@@ -1260,7 +1262,9 @@ pub fn view_definition(
         });
         let Some(found) = run(&format!(
             "SELECT TOP 2 CASE WHEN o.type = 'V' THEN 1 ELSE 0 END, \
-            CASE WHEN o.type = 'V' THEN OBJECT_DEFINITION(o.object_id) END \
+            CASE WHEN o.type = 'V' THEN OBJECT_DEFINITION(o.object_id) END, \
+            CASE WHEN o.type = 'SN' THEN (SELECT s.base_object_name FROM sys.synonyms s \
+            WHERE s.object_id = o.object_id) END \
             FROM sys.objects o WHERE LOWER(o.name) = LOWER({}){in_schema}",
             dialect.quote_nstr(name)
         )) else {
@@ -1271,6 +1275,29 @@ pub fn view_definition(
             1 => df = found,
             _ => return ViewLookup::Failed,
         }
+    }
+    // A synonym is what it names, one hop: a name in another database or on another
+    // server, one that doesn't resolve, or another synonym, may hide a view.
+    if dialect == DialectName::Mssql
+        && df.width() > 2
+        && let Some(base) = cell_str(&df, 2, 0)
+    {
+        if mssql_name_parts(&base) > 2 {
+            return ViewLookup::Failed;
+        }
+        let Some(target) = run(&format!(
+            "SELECT CASE WHEN o.type = 'V' THEN 1 ELSE 0 END, \
+            CASE WHEN o.type = 'V' THEN OBJECT_DEFINITION(o.object_id) END, \
+            CASE WHEN o.type = 'SN' THEN o.name END \
+            FROM sys.objects o WHERE o.object_id = OBJECT_ID({})",
+            dialect.quote_nstr(&base)
+        )) else {
+            return ViewLookup::Failed;
+        };
+        if target.height() != 1 || cell_str(&target, 2, 0).is_some() {
+            return ViewLookup::Failed;
+        }
+        df = target;
     }
     let is_view = match cell(&df, 0, 0) {
         Some(AnyValue::Boolean(b)) => b,
@@ -1286,6 +1313,27 @@ pub fn view_definition(
         sql: cell_str(&df, 1, 0).unwrap_or_default(),
         qualifier,
     }
+}
+
+/// The number of parts of a SQL Server object name (`[a].[b]`, `a.b`).
+fn mssql_name_parts(name: &str) -> usize {
+    let (mut parts, mut bracket) = (1, false);
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '[' if !bracket => bracket = true,
+            ']' if bracket => {
+                if chars.peek() == Some(&']') {
+                    chars.next();
+                } else {
+                    bracket = false;
+                }
+            },
+            '.' if !bracket => parts += 1,
+            _ => {},
+        }
+    }
+    parts
 }
 
 /// What the catalog says of the functions sqlglot doesn't know ([`volatile_functions`]).
@@ -1542,6 +1590,87 @@ mod tests {
             vec![Column::new("a".into(), flags), Column::new("b".into(), def)],
         )
         .unwrap()
+    }
+
+    /// `(is_view, definition, synonym base)` rows.
+    fn syn_rows(rows: &[(bool, Option<&str>)]) -> DataFrame {
+        let flags = rows.iter().map(|r| i32::from(r.0)).collect::<Vec<_>>();
+        let def = rows
+            .iter()
+            .map(|r| r.0.then_some("SELECT 1"))
+            .collect::<Vec<_>>();
+        let base = rows.iter().map(|r| r.1).collect::<Vec<_>>();
+        DataFrame::new(
+            rows.len(),
+            vec![
+                Column::new("a".into(), flags),
+                Column::new("b".into(), def),
+                Column::new("c".into(), base),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mssql_synonyms_are_looked_up_through() {
+        let ms = DialectName::Mssql;
+        let parts = ["dbo".into(), "syn".into()];
+        // the synonym answers with its base object; the base's own lookup follows
+        let lookup = |base: &'static str, target: DataFrame| {
+            let mut target = Some(target);
+            let mut s = Recorder {
+                log: vec![],
+                answer: move |sql: &str| {
+                    if sql.contains("OBJECT_ID(N'[dbo].[syn]')") {
+                        syn_rows(&[(false, Some(base))])
+                    } else {
+                        target.take().unwrap_or_else(|| rows(&[]))
+                    }
+                },
+            };
+            let out = view_definition(&mut s, ms, &parts, &[]);
+            (out, s.log)
+        };
+        let view = ViewLookup::View {
+            sql: "SELECT 1".into(),
+            qualifier: vec![],
+        };
+        let (out, log) = lookup("[dbo].[v]", syn_rows(&[(true, None)]));
+        assert_eq!(out, view);
+        assert!(log[1].contains("OBJECT_ID(N'[dbo].[v]')"), "{}", log[1]);
+        let (out, _) = lookup("[dbo].[t]", syn_rows(&[(false, None)]));
+        assert_eq!(out, ViewLookup::NotAView);
+        // unresolved, or another synonym
+        let (out, _) = lookup("[dbo].[gone]", rows(&[]));
+        assert_eq!(out, ViewLookup::Failed);
+        let (out, _) = lookup("[dbo].[s2]", syn_rows(&[(false, Some("[dbo].[v]"))]));
+        assert_eq!(out, ViewLookup::Failed);
+        // another database or server: not searched
+        for base in [
+            "[other].[dbo].[v]",
+            "[srv].[other].[dbo].[v]",
+            "other.dbo.v",
+        ] {
+            let (out, log) = lookup(base, syn_rows(&[(true, None)]));
+            assert_eq!(out, ViewLookup::Failed, "{base}");
+            assert_eq!(log.len(), 1);
+        }
+        // a dot inside brackets is part of the name
+        assert_eq!(mssql_name_parts("[a.b].[c]]d]"), 2);
+        // the search in any case follows a synonym too
+        let mut s = Recorder {
+            log: vec![],
+            answer: |sql: &str| {
+                if sql.contains("LOWER(o.name)") {
+                    syn_rows(&[(false, Some("[dbo].[v]"))])
+                } else if sql.contains("OBJECT_ID(N'[dbo].[v]')") {
+                    syn_rows(&[(true, None)])
+                } else {
+                    rows(&[])
+                }
+            },
+        };
+        assert_eq!(view_definition(&mut s, ms, &parts, &[]), view);
     }
 
     #[test]

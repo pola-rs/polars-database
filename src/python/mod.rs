@@ -394,6 +394,8 @@ fn _at_exit(py: Python<'_>) {
             // (a driver call that ignores the interrupt is asked for two seconds, not forever)
             bridge::begin_exit_cancel();
             crate::reader::cancel_running_statements();
+            // (every cancel has returned: the bound ends with them)
+            bridge::end_exit_cancel();
             crate::reader::wait_for_scans(Duration::from_secs(2))
         }
     });

@@ -76,6 +76,15 @@ pub(crate) fn begin_exit_cancel() {
     });
 }
 
+/// Lifts the bound of `begin_exit_cancel`: a scan in a user's `atexit` hook that runs after
+/// `_at_exit` cancels as usual.
+pub(crate) fn end_exit_cancel() {
+    let _ = Python::attach(|py| -> PyResult<()> {
+        bridge_module(py)?.call_method0("end_exit_cancel")?;
+        Ok(())
+    });
+}
+
 fn exiting() -> bool {
     EXITING.load(Ordering::Acquire)
 }
