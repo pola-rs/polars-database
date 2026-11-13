@@ -3681,32 +3681,72 @@ _DUCK_SLOW = (
 )
 
 
-def _duckdb_error_partitions() -> list[str]:
-    # partition 0 fails at once, the others run a statement of several seconds
-    return ["id < 10 AND error('boom') IS NULL"] + [
-        f"id >= {10 * i} AND id < {10 * (i + 1)} AND {_DUCK_SLOW}" for i in range(1, 4)
-    ]
-
-
 @pytest.mark.parametrize("kind", ["uri", "factory"])
-def test_duckdb_error_cancels_the_other_partitions(tmp_path: Path, kind: str) -> None:
-    # a DuckDB scan runs on a cursor (a connection of its own): the cancel interrupted
-    # the user's connection instead, so the error waited for the slowest partition
+def test_duckdb_error_cancels_the_other_partitions(
+    tmp_path: Path, kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from threading import Event
+
+    from polars.io.database._executor import ConnectionExecutor
+
     duckdb = pytest.importorskip("duckdb")
     path = str(tmp_path / "t.duckdb")
     with duckdb.connect(path) as conn:
         conn.execute("CREATE TABLE t AS SELECT range::INTEGER AS id FROM range(100)")
+
+    running = Event()
+    release = Event()
+    interrupted = Event()
+    slow_cursor: Any = None
+    execute = ConnectionExecutor.execute
+    interrupt = duckdb.DuckDBPyConnection.interrupt
+
+    def wait_for_interrupt() -> bool:
+        running.set()
+        assert release.wait(15), "the running DuckDB cursor was never interrupted"
+        return True
+
+    def interrupt_cursor(cursor: Any) -> None:
+        interrupt(cursor)
+        if cursor is slow_cursor:
+            release.set()
+
+    def execute_partition(self: Any, query: str, **kwargs: Any) -> Any:
+        nonlocal slow_cursor
+        if "error('boom')" in query:
+            assert running.wait(15), "the other DuckDB partition never started"
+        if "wait_for_interrupt()" in query:
+            slow_cursor = self.cursor
+            slow_cursor.create_function(
+                "wait_for_interrupt",
+                wait_for_interrupt,
+                return_type="BOOLEAN",
+                side_effects=True,
+            )
+            # Execute eagerly so the interrupt is observed here on the actual cursor.
+            try:
+                slow_cursor.execute(query)
+            except duckdb.InterruptException:
+                interrupted.set()
+                raise
+            raise AssertionError("the DuckDB statement completed without interruption")
+        return execute(self, query, **kwargs)
+
+    monkeypatch.setattr(duckdb.DuckDBPyConnection, "interrupt", interrupt_cursor)
+    monkeypatch.setattr(ConnectionExecutor, "execute", execute_partition)
     source: Any = f"duckdb:///{path}" if kind == "uri" else lambda: duckdb.connect(path)
     lf = pl.scan_database(
         "t",
         source,
-        partition_predicates=_duckdb_error_partitions(),
-        max_connections=4,
+        partition_predicates=[
+            "id < 10 AND error('boom') IS NULL",
+            "id >= 10 AND wait_for_interrupt()",
+        ],
+        max_connections=2,
     )
-    start = monotonic()
     with pytest.raises(Exception, match="boom"):
         lf.collect()
-    assert monotonic() - start < 2.5
+    assert interrupted.is_set(), "the DuckDB statement did not report an interrupt"
 
 
 def test_duckdb_dropped_batches_dont_abort_the_exit(tmp_path: Path) -> None:
